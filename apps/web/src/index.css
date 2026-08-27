@@ -103,6 +103,24 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --glass-blur: 12px;
   --glass-opacity: 80%;
   --glass-saturation: 1.14;
+  /* Shared liquid-glass contract for app-level surfaces. The base glass
+     values remain appearance-controlled; these aliases give new surfaces a
+     stable semantic API and a deterministic opaque fallback. */
+  --app-liquid-glass-opacity: var(--glass-opacity);
+  --app-liquid-glass-blur: var(--glass-blur);
+  --app-liquid-glass-saturation: var(--glass-saturation);
+  --app-liquid-glass-surface: color-mix(
+    in srgb,
+    var(--background) var(--app-liquid-glass-opacity),
+    transparent
+  );
+  --app-liquid-glass-border: color-mix(in srgb, var(--contrast-foreground) 10%, transparent);
+  --app-liquid-glass-fallback: var(--background);
+  /* Shell glass is opaque unless the Electron macOS shell opts in below. */
+  --app-shell-glass-surface: var(--app-liquid-glass-fallback);
+  --app-shell-glass-border: var(--app-liquid-glass-border);
+  --app-shell-glass-blur: 0px;
+  --app-shell-glass-saturation: 1;
   --desktop-window-right-resize-inset: 0px;
   --workspace-topbar-height: 52px;
   --workspace-controls-top: 0px;
@@ -277,6 +295,47 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   }
 }
 
+@utility liquid-glass {
+  /* Web and non-macOS shells keep a deterministic opaque surface. */
+  background: var(--app-liquid-glass-fallback);
+  border-color: var(--app-liquid-glass-border);
+}
+
+/* Native vibrancy is an Electron macOS shell enhancement. The platform class
+   is installed by main.tsx, so browser/Windows/Linux surfaces stay opaque. */
+html.electron-macos .liquid-glass {
+  background: var(--app-liquid-glass-surface);
+  -webkit-backdrop-filter: blur(var(--app-liquid-glass-blur))
+    saturate(var(--app-liquid-glass-saturation));
+  backdrop-filter: blur(var(--app-liquid-glass-blur)) saturate(var(--app-liquid-glass-saturation));
+
+  @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+    background: var(--app-liquid-glass-fallback) !important;
+  }
+}
+
+html.electron-macos {
+  --app-shell-glass-surface: var(--app-liquid-glass-surface);
+  --app-shell-glass-border: var(--app-liquid-glass-border);
+  --app-shell-glass-blur: var(--app-liquid-glass-blur);
+  --app-shell-glass-saturation: var(--app-liquid-glass-saturation);
+}
+
+/* Apply the same native surface to the real app shell, sidebar, and cloud
+   inspector. These selectors deliberately require the macOS Electron class. */
+html.electron-macos [data-slot="sidebar-wrapper"],
+html.electron-macos [data-app-sidebar],
+html.electron-macos [data-app-shell-inset],
+html.electron-macos [data-app-shell-content],
+html.electron-macos [data-app-shell-header],
+html.electron-macos [data-cloud-desktop-inspector] {
+  background: var(--app-shell-glass-surface);
+  border-color: var(--app-shell-glass-border);
+  -webkit-backdrop-filter: blur(var(--app-shell-glass-blur))
+    saturate(var(--app-shell-glass-saturation));
+  backdrop-filter: blur(var(--app-shell-glass-blur)) saturate(var(--app-shell-glass-saturation));
+}
+
 @utility alert-glass {
   --alert-glass-tint: transparent;
   background:
@@ -350,6 +409,42 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
 
   @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
     background: var(--popover) !important;
+  }
+}
+
+/* Transparency is an enhancement, not a readability requirement. Keep every
+   app glass surface opaque when the user asks macOS to reduce transparency. */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-opacity: 100%;
+    --glass-blur: 0px;
+    --glass-saturation: 1;
+    --app-liquid-glass-opacity: 100%;
+    --app-liquid-glass-blur: 0px;
+    --app-liquid-glass-saturation: 1;
+    --app-liquid-glass-surface: var(--app-liquid-glass-fallback);
+  }
+
+  .liquid-glass,
+  .surface-glass,
+  .alert-glass,
+  .dialog-glass,
+  .dropdown-glass,
+  html.electron-macos [data-slot="sidebar-wrapper"],
+  html.electron-macos [data-app-sidebar],
+  html.electron-macos [data-app-shell-inset],
+  html.electron-macos [data-app-shell-content],
+  html.electron-macos [data-app-shell-header],
+  html.electron-macos [data-cloud-desktop-inspector] {
+    background: var(--app-liquid-glass-fallback) !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
+  html.electron-macos {
+    --app-shell-glass-surface: var(--app-liquid-glass-fallback);
+    --app-shell-glass-blur: 0px;
+    --app-shell-glass-saturation: 1;
   }
 }
 

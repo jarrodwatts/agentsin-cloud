@@ -1,5 +1,7 @@
 export const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
-export const THREAD_SIDEBAR_DEFAULT_WIDTH = 16 * 16;
+// The focus-canvas layout gives the timeline more room while keeping the
+// repository/thread rail wide enough for the common project names.
+export const THREAD_SIDEBAR_DEFAULT_WIDTH = 236;
 export const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16;
 export const THREAD_MAIN_CONTENT_MIN_WIDTH = 40 * 16;
 

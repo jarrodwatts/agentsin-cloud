@@ -6,6 +6,7 @@ import {
   Files,
   GitPullRequest,
   Globe2,
+  MonitorUp,
   Plus,
   TerminalSquare,
   Volume2,
@@ -42,6 +43,8 @@ import { FaviconImage } from "./preview/PreviewFaviconIcon";
 import { previewBridge } from "./preview/previewBridge";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 
+const NOOP = () => undefined;
+
 interface RightPanelTabsProps {
   mode: PreviewPanelMode;
   maximized?: boolean;
@@ -74,12 +77,14 @@ interface RightPanelTabsProps {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
+  onAddCloudDesktop?: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
+  cloudDesktopAvailable?: boolean;
   pullRequestStatuses?: Readonly<Record<string, PullRequestTabStatus>>;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
   liveAgentCount: number;
@@ -101,6 +106,7 @@ const SURFACE_DISABLED_REASONS = {
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
   agents: "Agents are only available from a thread.",
+  cloudDesktop: "Cloud desktop is only available for managed environments.",
 } as const;
 
 /** Overlays that must win over the launcher's letter shortcuts. */
@@ -123,6 +129,7 @@ const SURFACE_UNAVAILABLE_HINTS = {
   diff: "Available for Git repositories.",
   pullRequest: "No pull request on this branch yet.",
   agents: "Available from a thread.",
+  cloudDesktop: "Available for managed environments.",
 } as const;
 
 type TabContextMenuAction =
@@ -243,7 +250,8 @@ function SurfaceMenuItem(props: {
  * without palette chrome: a surface's letter opens it directly from anywhere
  * outside a typing context, and arrows plus Enter work while the launcher is
  * focused. The highlight only appears on hover or arrow use. Unavailable
- * surfaces stay visible with a one-line reason.
+ * built-in surfaces stay visible with a one-line reason; cloud desktop is
+ * capability-gated.
  */
 function RightPanelEmptyState(props: {
   onAddBrowser: () => void;
@@ -252,12 +260,14 @@ function RightPanelEmptyState(props: {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
+  onAddCloudDesktop: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
+  cloudDesktopAvailable: boolean;
   liveAgentCount: number;
 }) {
   // -1 means no highlight: it only appears on hover or arrow use.
@@ -324,6 +334,20 @@ function RightPanelEmptyState(props: {
       onClick: props.onAddAgents,
       badgeCount: props.liveAgentCount,
     },
+    ...(props.cloudDesktopAvailable
+      ? [
+          {
+            label: "Desktop",
+            description: "Inspect the managed cloud workspace.",
+            icon: MonitorUp,
+            shortcut: "C",
+            available: true,
+            disabledReason: SURFACE_UNAVAILABLE_HINTS.cloudDesktop,
+            onClick: props.onAddCloudDesktop,
+            badgeCount: 0,
+          },
+        ]
+      : []),
   ] as const;
 
   type SurfaceAction = (typeof actions)[number];
@@ -508,6 +532,8 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "agents":
       return "Agents";
+    case "cloud-desktop":
+      return "Desktop";
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -593,6 +619,8 @@ function SurfaceIcon({
     }
     case "agents":
       return <Bot className="size-3 shrink-0" />;
+    case "cloud-desktop":
+      return <MonitorUp className="size-3 shrink-0" />;
   }
 }
 
@@ -651,6 +679,18 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.agents,
       onClick: props.onAddAgents,
     },
+    ...(props.cloudDesktopAvailable
+      ? [
+          {
+            label: "Desktop",
+            icon: MonitorUp,
+            shortcut: "C",
+            available: true,
+            disabledReason: SURFACE_DISABLED_REASONS.cloudDesktop,
+            onClick: props.onAddCloudDesktop ?? NOOP,
+          },
+        ]
+      : []),
   ] as const;
 
   const handleAddSurfaceMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -771,6 +811,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
   return (
     <PreviewPanelShell
+      // Switching between Browser and the cloud inspector must remount the
+      // resizable shell so each surface starts from its own persisted width.
+      key={props.widthStorageKey ?? "default"}
       mode={props.mode}
       {...(props.maximized !== undefined ? { maximized: props.maximized } : {})}
       {...(props.widthStorageKey !== undefined ? { widthStorageKey: props.widthStorageKey } : {})}
@@ -938,12 +981,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
             onAddAgents={props.onAddAgents}
+            onAddCloudDesktop={props.onAddCloudDesktop ?? NOOP}
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}
             filesAvailable={props.filesAvailable}
             pullRequestAvailable={props.pullRequestAvailable}
             agentsAvailable={props.agentsAvailable}
+            cloudDesktopAvailable={props.cloudDesktopAvailable ?? false}
             liveAgentCount={props.liveAgentCount}
           />
         ) : (

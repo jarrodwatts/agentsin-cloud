@@ -136,7 +136,11 @@ import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
 import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
-import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
+import {
+  CLOUD_DESKTOP_INSPECTOR_DEFAULT_WIDTH,
+  CLOUD_DESKTOP_INSPECTOR_WIDTH_STORAGE_KEY,
+  RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
+} from "../rightPanelLayout";
 import {
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
@@ -166,6 +170,7 @@ import { PullRequestDetailPanel } from "./pullRequest/PullRequestDetailPanel";
 import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
+import { CloudDesktopInspector } from "./cloud/CloudDesktopInspector";
 import { AgentsPanel } from "./AgentsPanel";
 import {
   deriveAgentPanelModel,
@@ -560,6 +565,13 @@ function formatOutgoingPrompt(params: {
 const SCRIPT_TERMINAL_COLS = 120;
 const SCRIPT_TERMINAL_ROWS = 30;
 
+export interface CloudDesktopCapability {
+  /** Explicit provider capability; absent capability keeps the surface hidden. */
+  readonly enabled: boolean;
+}
+
+const DEFAULT_CLOUD_DESKTOP_CAPABILITY: CloudDesktopCapability = { enabled: false };
+
 type ChatViewProps =
   | {
       environmentId: EnvironmentId;
@@ -568,6 +580,7 @@ type ChatViewProps =
       reserveTitleBarControlInset?: boolean;
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: ThreadSyncPhase | null;
+      cloudDesktopCapability?: CloudDesktopCapability;
       routeKind: "server";
       draftId?: never;
     }
@@ -578,6 +591,7 @@ type ChatViewProps =
       reserveTitleBarControlInset?: boolean;
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: never;
+      cloudDesktopCapability?: CloudDesktopCapability;
       routeKind: "draft";
       draftId: DraftId;
     };
@@ -1267,7 +1281,11 @@ function ChatViewContent(props: ChatViewProps) {
     onDiffPanelOpen,
     reserveTitleBarControlInset = true,
     forceExpandedMobileComposer = false,
+    cloudDesktopCapability = DEFAULT_CLOUD_DESKTOP_CAPABILITY,
   } = props;
+  // This is intentionally an explicit capability input. Relay-managed is a
+  // connection mode, not proof that a cloud desktop lease or stream exists.
+  const cloudDesktopAvailable = cloudDesktopCapability.enabled;
   const draftId = routeKind === "draft" ? props.draftId : null;
   const threadSyncPhase = routeKind === "server" ? (props.threadSyncPhase ?? null) : null;
   const threadDetailLoading = threadSyncPhase === "loading";
@@ -1747,6 +1765,14 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const previewPanelOpen = activeRightPanelKind === "preview" && isPreviewSupportedInRuntime();
   const rightPanelOpen = rightPanelState.isOpen;
+  const rightPanelWidthStorageKey =
+    activeRightPanelSurface?.kind === "cloud-desktop"
+      ? CLOUD_DESKTOP_INSPECTOR_WIDTH_STORAGE_KEY
+      : undefined;
+  const rightPanelSheetNonModal =
+    shouldUseRightPanelSheet &&
+    activeRightPanelSurface?.kind === "cloud-desktop" &&
+    cloudDesktopAvailable;
   const canMaximizeRightPanel = rightPanelOpen && !shouldUseRightPanelSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
@@ -3466,6 +3492,10 @@ function ChatViewContent(props: ChatViewProps) {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().open(activeThreadRef, "agents");
   }, [activeThreadRef]);
+  const addCloudDesktopSurface = useCallback(() => {
+    if (!activeThreadRef || !cloudDesktopAvailable) return;
+    useRightPanelStore.getState().open(activeThreadRef, "cloud-desktop");
+  }, [activeThreadRef, cloudDesktopAvailable]);
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
@@ -6714,6 +6744,8 @@ function ChatViewContent(props: ChatViewProps) {
           }}
         />
       </Suspense>
+    ) : activeRightPanelSurface?.kind === "cloud-desktop" && cloudDesktopAvailable ? (
+      <CloudDesktopInspector />
     ) : activeRightPanelSurface?.kind === "terminal" ? (
       <PersistentThreadTerminalPanel
         threadRef={activeThreadRef}
@@ -6820,7 +6852,10 @@ function ChatViewContent(props: ChatViewProps) {
     composerBannerItems.length > 0 || Boolean(threadSyncPhase && !activeEnvironmentUnavailable);
 
   return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
+    <div
+      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
+      data-app-shell-content
+    >
       {rightPanelOpen && !shouldUseRightPanelSheet ? panelLayoutControls : null}
       <div
         className={cn(
@@ -6835,6 +6870,7 @@ function ChatViewContent(props: ChatViewProps) {
           electron={isElectron}
           reserveNativeControls={reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar}
           className="relative bg-background"
+          data-app-shell-header
         >
           {!rightPanelOpen ? panelLayoutControls : null}
           <ChatHeader
@@ -7260,6 +7296,14 @@ function ChatViewContent(props: ChatViewProps) {
           onAddFiles={addFilesSurface}
           onAddPullRequest={addPullRequestSurface}
           onAddAgents={addAgentsSurface}
+          onAddCloudDesktop={addCloudDesktopSurface}
+          cloudDesktopAvailable={cloudDesktopAvailable}
+          {...(rightPanelWidthStorageKey
+            ? {
+                widthStorageKey: rightPanelWidthStorageKey,
+                defaultWidth: CLOUD_DESKTOP_INSPECTOR_DEFAULT_WIDTH,
+              }
+            : {})}
           browserAvailable={isPreviewSupportedInRuntime()}
           terminalAvailable={activeProject !== null}
           diffAvailable={isServerThread && isGitRepo}
@@ -7273,7 +7317,12 @@ function ChatViewContent(props: ChatViewProps) {
         </RightPanelTabs>
       ) : null}
       {shouldUseRightPanelSheet && rightPanelOpen && activeThreadRef ? (
-        <RightPanelSheet open onClose={closePreviewPanel}>
+        <RightPanelSheet
+          open
+          onClose={closePreviewPanel}
+          bottomInset={isDraftHeroState ? 0 : composerOverlayHeight}
+          nonModal={rightPanelSheetNonModal}
+        >
           <RightPanelTabs
             mode="sheet"
             // Same effective inset as the closed-state titlebar controls
@@ -7300,6 +7349,14 @@ function ChatViewContent(props: ChatViewProps) {
             onAddFiles={addFilesSurface}
             onAddPullRequest={addPullRequestSurface}
             onAddAgents={addAgentsSurface}
+            onAddCloudDesktop={addCloudDesktopSurface}
+            cloudDesktopAvailable={cloudDesktopAvailable}
+            {...(rightPanelWidthStorageKey
+              ? {
+                  widthStorageKey: rightPanelWidthStorageKey,
+                  defaultWidth: CLOUD_DESKTOP_INSPECTOR_DEFAULT_WIDTH,
+                }
+              : {})}
             browserAvailable={isPreviewSupportedInRuntime()}
             terminalAvailable={activeProject !== null}
             diffAvailable={isServerThread && isGitRepo}

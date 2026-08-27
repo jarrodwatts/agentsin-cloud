@@ -35,10 +35,13 @@ function SheetViewport({
   className,
   side,
   variant = "default",
+  nonModal = false,
   ...props
 }: SheetPrimitive.Viewport.Props & {
   side?: "right" | "left" | "top" | "bottom";
   variant?: "default" | "inset";
+  /** Leave the viewport click-through when a surface must not intercept the composer. */
+  nonModal?: boolean;
 }) {
   return (
     <SheetPrimitive.Viewport
@@ -49,6 +52,7 @@ function SheetViewport({
         side === "left" && "flex justify-start",
         side === "right" && "flex justify-end",
         variant === "inset" && "sm:p-4",
+        nonModal && "pointer-events-none",
         className,
       )}
       data-slot="sheet-viewport"
@@ -64,17 +68,22 @@ function SheetPopup({
   keepMounted = false,
   side = "right",
   variant = "default",
+  showBackdrop = true,
+  nonModal = false,
   ...props
 }: SheetPrimitive.Popup.Props & {
   showCloseButton?: boolean;
   keepMounted?: boolean;
   side?: "right" | "left" | "top" | "bottom";
   variant?: "default" | "inset";
+  /** Omit the modal backdrop and let the viewport pass pointer events through. */
+  showBackdrop?: boolean;
+  nonModal?: boolean;
 }) {
   return (
     <SheetPortal keepMounted={keepMounted}>
-      <SheetBackdrop />
-      <SheetViewport side={side} variant={variant}>
+      {showBackdrop ? <SheetBackdrop /> : null}
+      <SheetViewport side={side} variant={variant} nonModal={nonModal}>
         <SheetPrimitive.Popup
           className={cn(
             "relative flex max-h-full min-h-0 w-full min-w-0 flex-col bg-popover not-dark:bg-clip-padding text-popover-foreground shadow-lg/5 transition-[opacity,translate] duration-200 ease-in-out will-change-transform before:pointer-events-none before:absolute before:inset-0 before:shadow-[0_1px_--theme(--color-black/4%)] data-ending-style:opacity-0 data-starting-style:opacity-0 max-sm:before:hidden dark:before:shadow-[0_-1px_--theme(--color-white/6%)]",
@@ -88,9 +97,11 @@ function SheetPopup({
               "col-start-2 w-[calc(100%-(--spacing(12)))] max-w-md border-s data-ending-style:translate-x-8 data-starting-style:translate-x-8",
             variant === "inset" &&
               "before:hidden sm:rounded-2xl sm:border sm:before:rounded-[calc(var(--radius-2xl)-1px)] sm:**:data-[slot=sheet-footer]:rounded-b-[calc(var(--radius-2xl)-1px)]",
+            nonModal && "pointer-events-auto",
             className,
           )}
           data-slot="sheet-popup"
+          data-sheet-modal={nonModal ? "false" : "true"}
           {...props}
         >
           {children}

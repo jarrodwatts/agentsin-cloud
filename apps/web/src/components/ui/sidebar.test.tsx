@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  SidebarInset,
   SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuSubButton,
@@ -37,6 +38,17 @@ describe("sidebar interactive cursors", () => {
     );
 
     expect(html).toContain('data-sidebar-state="collapsed"');
+  });
+
+  it("marks the app shell inset for platform-scoped vibrancy", () => {
+    const html = renderToStaticMarkup(
+      <SidebarProvider>
+        <SidebarInset>content</SidebarInset>
+      </SidebarProvider>,
+    );
+
+    expect(html).toContain('data-slot="sidebar-inset"');
+    expect(html).toContain("data-app-shell-inset");
   });
 
   it("keeps the sidebar trigger interactive inside Electron drag regions", () => {

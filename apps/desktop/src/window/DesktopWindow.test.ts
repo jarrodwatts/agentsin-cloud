@@ -394,6 +394,17 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
   });
 
 describe("DesktopWindow", () => {
+  it("uses macOS vibrancy with an inset titlebar and transparent app canvas", () => {
+    assert.deepEqual(DesktopWindow.getWindowTitleBarOptions(false, "darwin"), {
+      titleBarStyle: "hiddenInset",
+      trafficLightPosition: { x: 16, y: 18 },
+      vibrancy: "under-window",
+      visualEffectState: "active",
+    });
+    assert.equal(DesktopWindow.getWindowBackgroundColor(false, "darwin"), "#00000000");
+    assert.equal(DesktopWindow.getWindowBackgroundColor(true, "linux"), "#0a0a0a");
+  });
+
   it("restores bounds only when the window fits within a connected display", () => {
     const persistedBounds = { x: 2040, y: 80, width: 1320, height: 880 };
     const displays = [
@@ -457,6 +468,7 @@ describe("DesktopWindow", () => {
         assert.isUndefined(createdWindowOptions[0]?.x);
         assert.isUndefined(createdWindowOptions[0]?.y);
         assert.isTrue(createdWindowOptions[0]?.disableAutoHideCursor);
+        assert.isTrue(createdWindowOptions[0]?.transparent);
         assert.isFalse(createdWindowOptions[0]?.webPreferences?.backgroundThrottling);
         assert.deepEqual(fakeWindow.setAutoHideCursor.mock.calls, [[false]]);
         assert.deepEqual(fakeWindow.loadURL.mock.calls[0], ["t3code-dev://app/"]);

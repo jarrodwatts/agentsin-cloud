@@ -11,6 +11,10 @@ import {
 } from "./threadSidebarWidth";
 
 describe("thread sidebar width", () => {
+  it("uses the focus-canvas default width", () => {
+    expect(THREAD_SIDEBAR_DEFAULT_WIDTH).toBe(236);
+  });
+
   it("uses the default width when no preference is stored", () => {
     expect(resolveInitialThreadSidebarWidth(null, 1200)).toBe(THREAD_SIDEBAR_DEFAULT_WIDTH);
   });

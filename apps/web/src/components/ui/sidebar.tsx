@@ -637,6 +637,7 @@ function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
         className,
       )}
       data-slot="sidebar-inset"
+      data-app-shell-inset
       {...props}
     />
   );
