@@ -1,0 +1,30 @@
+{
+  "name": "@agentsin-cloud/control-plane",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/main.ts",
+    "start": "node src/main.ts",
+    "migrate": "node src/migrate.ts",
+    "typecheck": "tsgo --noEmit",
+    "test": "vp test run"
+  },
+  "dependencies": {
+    "@better-auth/passkey": "catalog:",
+    "@effect/platform-node": "catalog:",
+    "@t3tools/contracts": "workspace:*",
+    "better-auth": "catalog:",
+    "effect": "catalog:",
+    "pg": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "@types/pg": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": ">=24.13.1"
+  }
+}

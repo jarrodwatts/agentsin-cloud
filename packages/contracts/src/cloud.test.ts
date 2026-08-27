@@ -19,6 +19,8 @@ import {
   AutomationTrigger,
   CloudThreadCommand,
   CloudThreadEvent,
+  DesktopAuthExchangeRequest,
+  DesktopAuthInitiateRequest,
   DesktopLease,
   EnvironmentRevision,
   LedgerEntry,
@@ -47,6 +49,38 @@ const PAYER_ADDRESS = "0x3333333333333333333333333333333333333333";
 const MERCHANT_ADDRESS = "0x4444444444444444444444444444444444444444";
 const RECEIPT_TX_HASH = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SETTLEMENT_TX_HASH = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+describe("desktop auth handoff contracts", () => {
+  it("accepts canonical S256 PKCE inputs", () => {
+    expect(
+      Schema.decodeUnknownSync(DesktopAuthInitiateRequest)({
+        codeChallenge: "a".repeat(43),
+        state: "s".repeat(32),
+      }),
+    ).toEqual({ codeChallenge: "a".repeat(43), state: "s".repeat(32) });
+    expect(
+      Schema.decodeUnknownSync(DesktopAuthExchangeRequest)({
+        handoff: "signed-handoff",
+        codeVerifier: "v".repeat(64),
+      }),
+    ).toEqual({ handoff: "signed-handoff", codeVerifier: "v".repeat(64) });
+  });
+
+  it("rejects padded, short, or empty handoff inputs", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(DesktopAuthInitiateRequest)({
+        codeChallenge: `${"a".repeat(42)}=`,
+        state: "short",
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(DesktopAuthExchangeRequest)({
+        handoff: "",
+        codeVerifier: "short",
+      }),
+    ).toThrow();
+  });
+});
 
 const blueprint = {
   schemaVersion: 1,

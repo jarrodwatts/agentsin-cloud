@@ -39,6 +39,38 @@ import { ProviderDriverKind, ProviderInstanceRef } from "./providerInstance.ts";
 const makeCloudEntityId = <Brand extends string>(brand: Brand) =>
   TrimmedNonEmptyString.pipe(Schema.brand(brand));
 
+const PkceBase64Url = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]+$/));
+
+/** SHA-256 PKCE challenge used to bind a desktop deep-link callback. */
+export const DesktopAuthCodeChallenge = PkceBase64Url.check(Schema.isLengthBetween(43, 43));
+export type DesktopAuthCodeChallenge = typeof DesktopAuthCodeChallenge.Type;
+
+/** RFC 7636 verifier length accepted by the hosted desktop auth exchange. */
+export const DesktopAuthCodeVerifier = PkceBase64Url.check(Schema.isLengthBetween(43, 128));
+export type DesktopAuthCodeVerifier = typeof DesktopAuthCodeVerifier.Type;
+
+/** Client correlation value returned unchanged after the system-browser ceremony. */
+export const DesktopAuthState = PkceBase64Url.check(Schema.isLengthBetween(32, 128));
+export type DesktopAuthState = typeof DesktopAuthState.Type;
+
+export const DesktopAuthInitiateRequest = Schema.Struct({
+  codeChallenge: DesktopAuthCodeChallenge,
+  state: DesktopAuthState,
+});
+export type DesktopAuthInitiateRequest = typeof DesktopAuthInitiateRequest.Type;
+
+export const DesktopAuthInitiateResult = Schema.Struct({
+  browserUrl: Schema.String,
+  expiresAt: IsoDateTime,
+});
+export type DesktopAuthInitiateResult = typeof DesktopAuthInitiateResult.Type;
+
+export const DesktopAuthExchangeRequest = Schema.Struct({
+  handoff: TrimmedNonEmptyString,
+  codeVerifier: DesktopAuthCodeVerifier,
+});
+export type DesktopAuthExchangeRequest = typeof DesktopAuthExchangeRequest.Type;
+
 export const SandboxId = makeCloudEntityId("SandboxId");
 export type SandboxId = typeof SandboxId.Type;
 export const SandboxSnapshotId = makeCloudEntityId("SandboxSnapshotId");
