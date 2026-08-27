@@ -36,6 +36,9 @@ the task commands.
   Protocol, used by ACP-speaking provider drivers.
 - `packages/effect-codex-app-server` (`effect-codex-app-server`): Effect client for the
   `codex app-server` JSON-RPC protocol.
+- `packages/e2b-sandbox` (`@t3tools/e2b-sandbox`): the hosted E2B sandbox adapter. Owns the
+  provider SDK boundary, immutable base-template assets, lifecycle mapping, and artifact handoff;
+  it does not own thread orchestration or the cloud worker.
 
 ## infra
 

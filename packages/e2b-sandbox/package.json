@@ -1,0 +1,35 @@
+{
+  "name": "@t3tools/e2b-sandbox",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./sdk": {
+      "types": "./src/E2bSdkClient.ts",
+      "import": "./src/E2bSdkClient.ts"
+    },
+    "./template": {
+      "types": "./src/template.ts",
+      "import": "./src/template.ts"
+    }
+  },
+  "scripts": {
+    "test": "vp test run",
+    "typecheck": "tsgo --noEmit",
+    "template:build": "node --experimental-strip-types ./template/build.ts"
+  },
+  "dependencies": {
+    "@t3tools/contracts": "workspace:*",
+    "e2b": "catalog:",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
