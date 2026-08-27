@@ -131,7 +131,7 @@ jobs:
           cache: true
           run-install: true
 
-      - name: Exercise the real Valkey adapter
+      - name: Exercise the real Valkey and PostgreSQL adapters
         working-directory: apps/control-plane
         env:
           AGENTSIN_TEST_VALKEY_URL: redis://127.0.0.1:6379/15
@@ -140,6 +140,7 @@ jobs:
           vp test run
           src/valkeyCoordination.integration.test.ts
           src/workerRouteGeneration.postgres.test.ts
+          src/artifactRepository.postgres.test.ts
 
   # apps/server sets `fileParallelism: false`, so its 239 files run strictly
   # one at a time. Sharding spreads them over separate runners instead of

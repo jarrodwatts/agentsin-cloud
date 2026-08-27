@@ -38,6 +38,7 @@ const migrate = async () => {
       // 0007 is reserved for D1 in the integration branch.
       "0008-thread-route-generation.sql",
       "0009-github-worker-route-binding.sql",
+      "0010-artifact-storage.sql",
     ];
     for (const filename of applicationMigrations) {
       const migration = await NodeFSP.readFile(

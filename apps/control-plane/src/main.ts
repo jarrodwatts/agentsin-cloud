@@ -8,6 +8,10 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { makeAuth } from "./auth.ts";
+import { r2ArtifactConfigLayer } from "./artifactConfig.ts";
+import { makeArtifactOutboxProcessor, startArtifactOutboxDrain } from "./artifactOutbox.ts";
+import { makePostgresArtifactRepository } from "./artifactRepository.ts";
+import { ArtifactStorage, productionArtifactStorageLayer } from "./artifactStorage.ts";
 import { makeCloudRpc, type ThreadEventSignalHub } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import { ControlPlaneConfig, layer as controlPlaneConfigLayer } from "./config.ts";
@@ -359,10 +363,16 @@ const closeWorkerMtls = (workerMtls: ReturnType<typeof createWorkerMtlsServer>) 
 const persistenceLayer = Layer.merge(workspaceRepositoryLayer, threadEventStoreLayer).pipe(
   Layer.provideMerge(databaseLayer),
 );
-
-export const runtimeLayer = Layer.merge(persistenceLayer, valkeyProductionLayer).pipe(
-  Layer.provideMerge(controlPlaneConfigLayer),
+const artifactStorageLayer = productionArtifactStorageLayer.pipe(
+  Layer.provideMerge(databaseLayer),
+  Layer.provideMerge(r2ArtifactConfigLayer),
 );
+
+export const runtimeLayer = Layer.mergeAll(
+  persistenceLayer,
+  valkeyProductionLayer,
+  artifactStorageLayer,
+).pipe(Layer.provideMerge(controlPlaneConfigLayer));
 
 export interface ControlPlaneApplicationDependencies {
   readonly config: import("./config.ts").ControlPlaneConfigShape;
@@ -443,6 +453,13 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
     const database = yield* Database;
     const workspaces = yield* WorkspaceRepository;
     const threadEvents = yield* ThreadEventStore;
+    const artifactStorage = yield* ArtifactStorage;
+    const artifactOutbox = makeArtifactOutboxProcessor({
+      repository: makePostgresArtifactRepository(database),
+      storage: artifactStorage,
+      leaseMs: Math.max(180_000, config.requestTimeoutMs * 2),
+    });
+    yield* startArtifactOutboxDrain(artifactOutbox);
     const coordination = yield* EphemeralCoordination;
     yield* coordination.ping;
     const worker = yield* makeWorkerControlPlaneRuntime({

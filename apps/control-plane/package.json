@@ -11,6 +11,7 @@
     "test": "vp test run"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1118.0",
     "@better-auth/passkey": "catalog:",
     "@effect/platform-node": "catalog:",
     "@t3tools/contracts": "workspace:*",
