@@ -22,18 +22,26 @@ it.effect("selects the concrete Node mTLS relay only in fail-closed hosted mode"
       relay: injectedRelay,
       github: injectedGitHub,
     } as CloudWorkerDependencies;
-    const hosted = yield* selectWorkerProcessDependencies(dependencies, {
-      [WORKER_EXECUTION_MODE_ENV]: "hosted",
-      [WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV]: "/run/agentsin/mtls",
-    });
+    const hosted = yield* selectWorkerProcessDependencies(
+      dependencies,
+      {
+        [WORKER_EXECUTION_MODE_ENV]: "hosted",
+        [WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV]: "/run/agentsin/mtls",
+      },
+      0,
+    );
     expect(hosted.relay).not.toBe(injectedRelay);
     expect(hosted.github).toBeDefined();
     expect(hosted.github).not.toBe(injectedGitHub);
 
     const missingDirectory = yield* Effect.result(
-      selectWorkerProcessDependencies(dependencies, {
-        [WORKER_EXECUTION_MODE_ENV]: "hosted",
-      }),
+      selectWorkerProcessDependencies(
+        dependencies,
+        {
+          [WORKER_EXECUTION_MODE_ENV]: "hosted",
+        },
+        0,
+      ),
     );
     expect(missingDirectory._tag).toBe("Failure");
   }),
@@ -51,6 +59,7 @@ it.effect("interrupts provider work and scrubs leased credentials on termination
         connect: () =>
           Deferred.succeed(relayConnected, undefined).pipe(
             Effect.as({
+              credentialChannelKey: new Uint8Array(32),
               receive: Effect.never.pipe(Effect.as(Option.none())),
               claimCommand: () => Effect.succeed("execute" as const),
               send: () => Effect.void,
@@ -109,12 +118,32 @@ it.effect("interrupts provider work and scrubs leased credentials on termination
         ),
     };
     yield* runWorkerMain(dependencies, {
-      env: { [WORKER_BOOTSTRAP_FILE_ENV]: "/run/secrets/bootstrap.json" },
+      env: {
+        [WORKER_EXECUTION_MODE_ENV]: "injected",
+        [WORKER_BOOTSTRAP_FILE_ENV]: "/run/secrets/bootstrap.json",
+      },
+      currentUid: 501,
       bootstrapSource: source,
       termination: Effect.all([Deferred.await(providerStarted), Deferred.await(relayConnected)]),
     });
     expect(providerStops).toBe(1);
     expect(relayCloses).toBe(1);
     expect(scrubs).toBe(1);
+  }),
+);
+
+it.effect("fails closed before startup for missing or root-injected execution modes", () =>
+  Effect.gen(function* () {
+    const dependencies = {} as CloudWorkerDependencies;
+    for (const env of [{}, { [WORKER_EXECUTION_MODE_ENV]: "injected" }]) {
+      const result = yield* Effect.result(selectWorkerProcessDependencies(dependencies, env, 0));
+      expect(result._tag).toBe("Failure");
+    }
+    const explicitNonRoot = yield* selectWorkerProcessDependencies(
+      dependencies,
+      { [WORKER_EXECUTION_MODE_ENV]: "injected" },
+      501,
+    );
+    expect(explicitNonRoot).toBe(dependencies);
   }),
 );

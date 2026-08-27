@@ -401,6 +401,55 @@ export const makePostgresWorkerIdentityRepository = (
           : Effect.succeed(leaseFromRow(rows[0])),
       ),
     ),
+  validateActiveLease: (lease) =>
+    query<LeaseRow>(
+      database,
+      "validate-active-worker-lease",
+      `SELECT lease.workspace_id::text, lease.thread_id, lease.environment_id,
+              lease.environment_revision_id, lease.sandbox_id, lease.reservation_id,
+              lease.worker_id, lease.provider_instance_id, lease.provider_driver,
+              lease.certificate_fingerprint, lease.certificate_generation::text,
+              lease.lease_generation::text, lease.route_generation::text,
+              lease.process_instance_id, lease.state, lease.connected_at::text,
+              lease.last_seen_at::text, lease.heartbeat_sequence::text,
+              lease.confirmed_event_cursor::text, lease.last_command_delivery_id
+         FROM cloud_worker_lease AS lease
+         JOIN cloud_worker_certificate AS certificate
+           ON certificate.workspace_id = lease.workspace_id
+          AND certificate.sandbox_id = lease.sandbox_id
+          AND certificate.certificate_fingerprint = lease.certificate_fingerprint
+        WHERE lease.workspace_id = $1 AND lease.sandbox_id = $2 AND lease.thread_id = $3
+          AND lease.environment_id = $4 AND lease.environment_revision_id = $5
+          AND lease.reservation_id = $6 AND lease.worker_id = $7
+          AND lease.provider_instance_id = $8 AND lease.provider_driver = $9
+          AND lease.certificate_fingerprint = $10 AND lease.certificate_generation = $11
+          AND lease.lease_generation = $12 AND lease.route_generation = $13
+          AND lease.process_instance_id = $14 AND lease.state = 'connected'
+          AND certificate.certificate_generation = lease.certificate_generation
+          AND certificate.revoked_at IS NULL`,
+      [
+        lease.workspaceId,
+        lease.sandboxId,
+        lease.threadId,
+        lease.environmentId,
+        lease.environmentRevisionId,
+        lease.reservationId,
+        lease.workerId,
+        lease.providerInstanceId,
+        lease.providerDriver,
+        lease.certificateFingerprint,
+        lease.certificateGeneration,
+        lease.leaseGeneration,
+        lease.routeGeneration,
+        lease.processInstanceId,
+      ],
+    ).pipe(
+      Effect.flatMap((rows) =>
+        rows[0] === undefined
+          ? Effect.fail(fail("validate-active-worker-lease", undefined, "leaseFenced"))
+          : Effect.succeed(leaseFromRow(rows[0])),
+      ),
+    ),
   disconnect: (lease, state, now) =>
     query(
       database,

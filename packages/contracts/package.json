@@ -19,6 +19,10 @@
       "types": "./src/worker.ts",
       "import": "./src/worker.ts"
     },
+    "./credential-binary": {
+      "types": "./src/credentialBinary.ts",
+      "import": "./src/credentialBinary.ts"
+    },
     "./settings": {
       "types": "./src/settings.ts",
       "import": "./src/settings.ts"

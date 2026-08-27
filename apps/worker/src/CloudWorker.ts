@@ -40,6 +40,10 @@ import type {
   WorkerSecretLeaseBroker,
 } from "./ports.ts";
 import {
+  WorkerProviderCredentialError,
+  type WorkerProviderCredentialExecutor,
+} from "./ProviderCredentialExecutor.ts";
+import {
   assertOutboundWithinLimit,
   commandMatchesBootstrap,
   decodeRelayFrame,
@@ -68,6 +72,8 @@ export interface CloudWorkerDependencies {
     readonly makeExecutor: (bootstrap: WorkerBootstrap) => GitHubGitExecutor;
   };
   readonly onCloudEvent?: (event: CloudThreadEvent) => Effect.Effect<void>;
+  /** Required by hosted production; omitted only by local legacy workers. */
+  readonly providerCredentials?: WorkerProviderCredentialExecutor;
   readonly options?: Partial<CloudWorkerOptions>;
 }
 
@@ -145,6 +151,11 @@ export const runCloudWorker = (
   Effect.scoped(
     Effect.gen(function* () {
       const options = { ...defaultOptions, ...dependencies.options };
+      if (dependencies.providerCredentials !== undefined) {
+        yield* Effect.addFinalizer(() =>
+          dependencies.providerCredentials!.cleanupAll.pipe(Effect.orDie),
+        );
+      }
       if (!Number.isSafeInteger(options.maxPendingEventProposals)) {
         return yield* new WorkerProtocolError({
           reason: "maxPendingEventProposals must be a safe integer",
@@ -232,6 +243,7 @@ export const runCloudWorker = (
         pendingAcks: new Map(),
       });
       const sendLock = yield* Semaphore.make(1);
+      const providerCredentialLock = yield* Semaphore.make(1);
       const proposalDrainLock = yield* Semaphore.make(1);
 
       const health = Effect.gen(function* () {
@@ -717,7 +729,7 @@ export const runCloudWorker = (
                 cause: "relay connection closed",
               });
             }
-            const message = yield* decodeRelayFrame(frame.value);
+            const message = yield* decodeRelayFrame(frame.value, connection.credentialChannelKey);
             switch (message.type) {
               case "thread.command":
                 yield* processCommand(connection, message);
@@ -748,6 +760,85 @@ export const runCloudWorker = (
                   threadId: bootstrap.threadId,
                   reason: message.reason,
                 });
+              case "provider.credentials.command": {
+                if (dependencies.providerCredentials === undefined) {
+                  return yield* new WorkerProtocolError({
+                    reason: "hosted provider credential executor is unavailable",
+                    retryable: false,
+                  });
+                }
+                yield* providerCredentialLock
+                  .withPermits(1)(
+                    dependencies.providerCredentials.execute(message, undefined, (result) =>
+                      send(result).pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new WorkerProviderCredentialError({
+                              code: "writeFailed",
+                              operation: "emit-result",
+                              cause,
+                            }),
+                        ),
+                      ),
+                    ),
+                  )
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new WorkerProviderError({
+                          operation: "provider-credentials",
+                          crashed: false,
+                          cause,
+                        }),
+                    ),
+                    Effect.forkScoped,
+                  );
+                break;
+              }
+              case "provider.credentials.binary": {
+                if (dependencies.providerCredentials === undefined) {
+                  message.credentialPayload.fill(0);
+                  return yield* new WorkerProtocolError({
+                    reason: "hosted provider credential executor is unavailable",
+                    retryable: false,
+                  });
+                }
+                yield* providerCredentialLock
+                  .withPermits(1)(
+                    dependencies.providerCredentials.execute(
+                      message.command,
+                      message.credentialPayload,
+                      (result) =>
+                        send(result).pipe(
+                          Effect.mapError(
+                            (cause) =>
+                              new WorkerProviderCredentialError({
+                                code: "writeFailed",
+                                operation: "emit-result",
+                                cause,
+                              }),
+                          ),
+                        ),
+                    ),
+                  )
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new WorkerProviderError({
+                          operation: "provider-credentials",
+                          crashed: false,
+                          cause,
+                        }),
+                    ),
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        message.credentialPayload.fill(0);
+                      }),
+                    ),
+                    Effect.forkScoped,
+                  );
+                break;
+              }
             }
             yield* heartbeat;
           }

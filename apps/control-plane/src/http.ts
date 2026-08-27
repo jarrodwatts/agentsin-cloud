@@ -64,6 +64,9 @@ export interface RequestHandlerDependencies {
       readonly command: GitHubThreadWorkflowSubmissionRequest["command"];
     }) => Effect.Effect<unknown, { readonly code: string }>;
   };
+  readonly providerCredentials?: {
+    readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
+  };
 }
 
 class RequestHandlerError extends Schema.TaggedErrorClass<RequestHandlerError>()(
@@ -314,6 +317,12 @@ const dispatch = (request: Request, dependencies: RequestHandlerDependencies) =>
     if (dependencies.cloudRpc !== undefined) {
       const cloudResponse = yield* dependencies.cloudRpc.handleHttp(request);
       if (cloudResponse !== undefined) return cloudResponse;
+    }
+
+    if (dependencies.providerCredentials !== undefined) {
+      const providerCredentialResponse =
+        yield* dependencies.providerCredentials.handleHttp(request);
+      if (providerCredentialResponse !== undefined) return providerCredentialResponse;
     }
 
     if (dependencies.workerBootstrap !== undefined) {

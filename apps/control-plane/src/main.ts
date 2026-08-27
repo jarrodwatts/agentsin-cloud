@@ -4,6 +4,7 @@ import * as NodeHttp from "node:http";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
@@ -33,11 +34,23 @@ import {
   type WorkspaceRepositoryService,
 } from "./workspaces.ts";
 import { createWorkerMtlsServer } from "./workerMtlsServer.ts";
+import { makePostgresCloudThreadLifecycleStore } from "./cloudThreadLifecycleStore.ts";
+import type { ProviderCredentialKeyEncryption } from "./providerCredentialEnvelope.ts";
+import type { ProviderCredentialLoginRunner } from "./providerCredentialLoginRunner.ts";
+import { makeProviderCredentialService } from "./providerCredentialService.ts";
+import { makePostgresProviderCredentialStore } from "./providerCredentialStore.ts";
+import {
+  makeB4ProviderCredentialWorkerTransport,
+  makeLifecycleProviderCredentialTargetAuthorizer,
+  makeProviderLoginCoordinator,
+} from "./providerCredentialProduction.ts";
+import { makeProviderCredentialRpc } from "./providerCredentialRpc.ts";
 import {
   makeWorkerControlPlaneRuntime,
   type WorkerControlPlaneRuntime,
   type WorkerProductionDependencies,
 } from "./workerProduction.ts";
+import { WorkerRelayServerError } from "./workerRelay.ts";
 import { loadWorkerMtlsTlsOptions } from "./workerTlsFiles.ts";
 import { productionLayer as valkeyProductionLayer } from "./valkeyCoordination.ts";
 import { makeGitHubWorkflowStore } from "./githubThreadWorkflowStore.ts";
@@ -383,6 +396,10 @@ export interface ControlPlaneApplicationDependencies {
   readonly worker?: WorkerControlPlaneRuntime;
   readonly coordination: EphemeralCoordinationService;
   readonly githubWorkflow?: ReturnType<typeof makeGitHubThreadWorkflow>;
+  readonly providerCredentialRuntime?: {
+    readonly service: ReturnType<typeof makeProviderCredentialService>;
+    readonly logins: ReturnType<typeof makeProviderLoginCoordinator>;
+  };
 }
 
 /**
@@ -399,6 +416,7 @@ export const makeApplication = ({
   worker,
   coordination,
   githubWorkflow,
+  providerCredentialRuntime,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
@@ -424,6 +442,16 @@ export const makeApplication = ({
     coordination,
     ...(threadEventSignals === undefined ? {} : { signals: threadEventSignals }),
   });
+  const providerCredentials =
+    providerCredentialRuntime === undefined
+      ? undefined
+      : makeProviderCredentialRpc({
+          auth,
+          hostedOrigin: config.betterAuthUrl.origin,
+          workspaces,
+          service: providerCredentialRuntime.service,
+          logins: providerCredentialRuntime.logins,
+        });
 
   return {
     auth,
@@ -436,6 +464,7 @@ export const makeApplication = ({
       cloudRpc,
       ...(worker === undefined ? {} : { workerBootstrap: worker.workerBootstrap }),
       ...(githubWorkflow === undefined ? {} : { githubWorkflow }),
+      ...(providerCredentials === undefined ? {} : { providerCredentials }),
     }),
   };
 };
@@ -443,11 +472,17 @@ export const makeApplication = ({
 /**
  * Railway production composition. The ordinary HTTPS health/RPC listener and
  * direct client-certificate TLS listener have independent ports and shutdown
- * lifecycles. The caller must inject the deployment KMS signer plus C1/C3
- * reservation/recovery boundaries; there is deliberately no development CA
- * or permissive fallback.
+ * lifecycles. The caller must inject the deployment KMS envelope adapter, a
+ * hardened credential-only login job runner, and the C1/C3 reservation and
+ * recovery boundaries; there is deliberately no development CA or permissive
+ * fallback.
  */
-export const makeProgram = (production: WorkerProductionDependencies) =>
+export interface HostedProductionDependencies extends WorkerProductionDependencies {
+  readonly providerCredentialKeyEncryption: ProviderCredentialKeyEncryption;
+  readonly providerCredentialLoginRunner: ProviderCredentialLoginRunner;
+}
+
+export const makeProgram = (production: HostedProductionDependencies) =>
   Effect.gen(function* () {
     const config = yield* ControlPlaneConfig;
     const database = yield* Database;
@@ -484,6 +519,105 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
       worker: worker.githubWorker,
       clock: { now: Date.now },
     });
+    if (
+      production.providerCredentialKeyEncryption.kmsKeyId.trim().length === 0 ||
+      production.providerCredentialKeyEncryption.activeKeyVersion.trim().length === 0
+    ) {
+      return yield* new ServerStartupError({
+        cause: "KMS-backed provider credential encryption is required",
+      });
+    }
+    const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+    yield* production.providerCredentialLoginRunner.validateConfiguration.pipe(
+      Effect.mapError(
+        (cause) =>
+          new ServerStartupError({
+            cause: {
+              message: "Provider credential login runner security validation failed",
+              error: cause,
+            },
+          }),
+      ),
+    );
+    const lifecycle = makePostgresCloudThreadLifecycleStore(database.pool);
+    const credentialTargets = makeLifecycleProviderCredentialTargetAuthorizer({
+      lifecycle,
+      relay: worker.relay,
+      now,
+    });
+    const credentialLogins = makeProviderLoginCoordinator({
+      pool: database.pool,
+      targets: credentialTargets,
+      runner: production.providerCredentialLoginRunner,
+      now,
+      keyEncryption: production.providerCredentialKeyEncryption,
+    });
+    yield* Effect.addFinalizer(() => credentialLogins.shutdown.pipe(Effect.orDie));
+    const providerCredentials = makeProviderCredentialService({
+      logins: credentialLogins,
+      store: makePostgresProviderCredentialStore(database.pool),
+      keyEncryption: production.providerCredentialKeyEncryption,
+      authorizer: credentialTargets,
+      worker: makeB4ProviderCredentialWorkerTransport(worker.relay),
+      now,
+    });
+    yield* Effect.forkScoped(
+      Effect.sleep("30 seconds").pipe(
+        Effect.andThen(providerCredentials.sweepExpired),
+        Effect.andThen(credentialLogins.sweepExpired),
+        Effect.catch((cause) => Effect.logError("Provider credential expiry sweep failed", cause)),
+        Effect.forever,
+      ),
+    );
+    yield* Effect.forkScoped(
+      credentialLogins.purgeTerminalHistory.pipe(
+        Effect.catch((cause) =>
+          Effect.logError("Provider credential login retention purge failed", cause),
+        ),
+        Effect.andThen(
+          Effect.sleep("24 hours").pipe(
+            Effect.andThen(credentialLogins.purgeTerminalHistory),
+            Effect.catch((cause) =>
+              Effect.logError("Provider credential login retention purge failed", cause),
+            ),
+            Effect.forever,
+          ),
+        ),
+      ),
+    );
+    const unsubscribeCredentialReconnect = worker.relay.onAuthenticatedReconnect(
+      (identity, reconnectTransport) =>
+        providerCredentials
+          .reconcileWorker({
+            workspaceId: identity.workspaceId,
+            sandboxId: identity.sandboxId,
+            workerOverride: makeB4ProviderCredentialWorkerTransport(reconnectTransport, identity),
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new WorkerRelayServerError({
+                  code: "internal",
+                  operation: "reconcile-provider-credentials",
+                  cause,
+                }),
+            ),
+          ),
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(unsubscribeCredentialReconnect));
+    const unsubscribeCredentialRouteLoss = worker.relay.onBeforeRouteLoss((input) =>
+      providerCredentials.cleanupLifecycle(input).pipe(
+        Effect.mapError(
+          (cause) =>
+            new WorkerRelayServerError({
+              code: "internal",
+              operation: "cleanup-provider-credentials-before-route-loss",
+              cause,
+            }),
+        ),
+      ),
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(unsubscribeCredentialRouteLoss));
 
     const workerTls = yield* loadWorkerMtlsTlsOptions(config);
     const workerMtls = createWorkerMtlsServer({
@@ -506,6 +640,7 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
       worker,
       coordination,
       githubWorkflow,
+      providerCredentialRuntime: { service: providerCredentials, logins: credentialLogins },
     });
     const server = yield* Effect.acquireRelease(
       listen(config, config.betterAuthUrl, handle),

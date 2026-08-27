@@ -23,8 +23,18 @@ export {
   WorkerStoppedError,
 } from "./errors.ts";
 export {
+  WORKER_AGENT_GID_ENV,
+  WORKER_AGENT_HOME_ENV,
+  WORKER_AGENT_PATH_ENV,
+  WORKER_AGENT_UID_ENV,
   WORKER_EXECUTION_MODE_ENV,
   WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV,
+  WORKER_NODE_INTERPRETER_PATH_ENV,
+  WORKER_NODE_INTERPRETER_SHA256_ENV,
+  WORKER_PROVIDER_CREDENTIAL_ROOT_ENV,
+  WORKER_PROVIDER_RUNTIME_MODULE_ENV,
+  WORKER_PROVIDER_RUNTIME_SHA256_ENV,
+  WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV,
   processTermination,
   runWorkerMain,
   selectWorkerProcessDependencies,
@@ -78,3 +88,12 @@ export {
   type WorkerGitHubTokenLeaseBroker,
   type WorkerGitHubTokenMaterialization,
 } from "./GitHubGitExecutor.ts";
+export {
+  makeNodeWorkerCredentialIdentityRuntime,
+  makeWorkerProviderCredentialExecutor,
+  RESTRICTED_PROCESS_LAUNCHER_SHA256,
+  WorkerProviderCredentialError,
+  type NodeWorkerCredentialIdentityRuntimeOptions,
+  type WorkerCredentialIdentityRuntime,
+  type WorkerProviderCredentialExecutor,
+} from "./ProviderCredentialExecutor.ts";

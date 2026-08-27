@@ -16,7 +16,7 @@ import {
   type WorkerIdentityService,
 } from "./workerIdentity.ts";
 import { createWorkerMtlsServer } from "./workerMtlsServer.ts";
-import type { WorkerRelay } from "./workerRelay.ts";
+import { type WorkerRelay, WorkerRelayServerError } from "./workerRelay.ts";
 
 const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
 const sanUri = "spiffe://agentsin.cloud/workers/test-binding";
@@ -218,11 +218,12 @@ const certificateRecord = (fixture: TlsFixture): WorkerCertificateRecord =>
     notAfter: "2026-08-28T00:00:00.000Z",
   }) as WorkerCertificateRecord;
 
-type IdentityMode = "accept" | "fingerprint" | "san" | "expired" | "revoked";
+type IdentityMode = "accept" | "fingerprint" | "san" | "expired" | "revoked" | "relay-failure";
 
 const startTlsBoundary = async (fixture: TlsFixture, mode: IdentityMode) => {
   let authenticationCalls = 0;
   let relayOpens = 0;
+  let failedRelayExporterKey: Uint8Array | undefined;
   const record = certificateRecord(fixture);
   const identities = {
     clock: { now: Effect.succeed("2026-08-27T12:00:00.000Z") },
@@ -255,9 +256,16 @@ const startTlsBoundary = async (fixture: TlsFixture, mode: IdentityMode) => {
   } as unknown as WorkerIdentityService;
   const relay = {
     limits: { maxFrameBytes: 64 * 1024 },
-    open: () =>
-      Effect.sync(() => {
+    open: (_certificate: WorkerCertificateRecord, socket: { credentialChannelKey: Uint8Array }) =>
+      Effect.gen(function* () {
         relayOpens += 1;
+        if (mode === "relay-failure") {
+          failedRelayExporterKey = socket.credentialChannelKey;
+          return yield* new WorkerRelayServerError({
+            code: "internal",
+            operation: "test-relay-open-failure",
+          });
+        }
         return { close: () => undefined };
       }),
     claimCommand: () => Effect.die("not used by the TLS boundary test"),
@@ -284,6 +292,7 @@ const startTlsBoundary = async (fixture: TlsFixture, mode: IdentityMode) => {
     url: `wss://localhost:${address.port}/api/v1/worker-relay`,
     authenticationCalls: () => authenticationCalls,
     relayOpens: () => relayOpens,
+    failedRelayExporterKey: () => failedRelayExporterKey,
   };
 };
 
@@ -305,6 +314,13 @@ const connect = (url: string, options: WebSocket.ClientOptions): Promise<"accept
       complete("rejected");
     });
     socket.once("error", () => complete("rejected"));
+  });
+
+const connectUntilServerClose = (url: string, options: WebSocket.ClientOptions): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const socket = new WebSocket(url, { ...options, handshakeTimeout: 2_000 });
+    socket.once("error", reject);
+    socket.once("close", () => resolve());
   });
 
 const withBoundary = async <A>(
@@ -408,4 +424,25 @@ it.effect(
       (directory) =>
         Effect.tryPromise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
     ),
+);
+
+it.effect("zeroizes the TLS exporter key when relay open fails before activation", () =>
+  Effect.acquireUseRelease(
+    Effect.tryPromise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "aic-mtls-e2e-"))),
+    (directory) =>
+      Effect.tryPromise(async () => {
+        const fixture = await generateTlsFixture(directory);
+        await withBoundary(fixture, "relay-failure", async (boundary) => {
+          await connectUntilServerClose(boundary.url, {
+            cert: fixture.clientCertificate,
+            key: fixture.clientKey,
+            ca: fixture.ca,
+          });
+          expect(boundary.relayOpens()).toBe(1);
+          expect(boundary.failedRelayExporterKey()).toBeDefined();
+          expect(boundary.failedRelayExporterKey()?.every((byte) => byte === 0)).toBe(true);
+        });
+      }),
+    (directory) => Effect.tryPromise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+  ),
 );

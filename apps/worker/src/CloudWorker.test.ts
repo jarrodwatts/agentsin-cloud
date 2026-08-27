@@ -160,6 +160,7 @@ const makeHarness = (options: HarnessOptions) => {
           const currentConnectionIndex = connectionIndex++;
           const source = [...(options.connections[currentConnectionIndex] ?? [null])];
           const connection: WorkerRelayConnection = {
+            credentialChannelKey: new Uint8Array(32),
             receive: Effect.suspend(() => {
               const next = source.shift() ?? null;
               if (next === NEVER_FRAME) return Effect.never;

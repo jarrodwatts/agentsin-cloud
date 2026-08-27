@@ -13,22 +13,50 @@ import {
   makeNodeMtlsGitHubTokenLeaseBroker,
   makeNodeMtlsRelayConnector,
 } from "./NodeMtlsRelayConnector.ts";
+import {
+  makeNodeWorkerCredentialIdentityRuntime,
+  makeWorkerProviderCredentialExecutor,
+} from "./ProviderCredentialExecutor.ts";
+import { makeRestrictedProviderFactory } from "./ProviderRuntimeSupervisor.ts";
 
 export const WORKER_EXECUTION_MODE_ENV = "AGENTSIN_WORKER_MODE";
 export const WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV = "AGENTSIN_WORKER_MTLS_DIRECTORY";
+export const WORKER_PROVIDER_CREDENTIAL_ROOT_ENV = "AGENTSIN_WORKER_PROVIDER_CREDENTIAL_ROOT";
+export const WORKER_AGENT_UID_ENV = "AGENTSIN_AGENT_UID";
+export const WORKER_AGENT_GID_ENV = "AGENTSIN_AGENT_GID";
+export const WORKER_PROVIDER_RUNTIME_MODULE_ENV = "AGENTSIN_PROVIDER_RUNTIME_MODULE";
+export const WORKER_PROVIDER_RUNTIME_SHA256_ENV = "AGENTSIN_PROVIDER_RUNTIME_SHA256";
+export const WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV = "AGENTSIN_PROVIDER_RUNTIME_CHILD_SHA256";
+export const WORKER_NODE_INTERPRETER_PATH_ENV = "AGENTSIN_NODE_INTERPRETER_PATH";
+export const WORKER_NODE_INTERPRETER_SHA256_ENV = "AGENTSIN_NODE_INTERPRETER_SHA256";
+export const WORKER_AGENT_HOME_ENV = "AGENTSIN_AGENT_HOME";
+export const WORKER_AGENT_PATH_ENV = "AGENTSIN_AGENT_PATH";
 
 export interface WorkerProcessOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly bootstrapSource?: WorkerBootstrapFileSource;
   readonly termination?: Effect.Effect<void>;
+  /** Test seam; production uses the effective uid of this process. */
+  readonly currentUid?: number;
 }
 
 export const selectWorkerProcessDependencies = (
   dependencies: CloudWorkerDependencies,
   env: Readonly<Record<string, string | undefined>>,
+  currentUid = NodeProcess.getuid?.() ?? -1,
 ): Effect.Effect<CloudWorkerDependencies, WorkerBootstrapError> => {
   const mode = env[WORKER_EXECUTION_MODE_ENV];
-  if (mode === undefined || mode === "injected") return Effect.succeed(dependencies);
+  if (mode === undefined) {
+    return Effect.fail(new WorkerBootstrapError({ reason: "worker execution mode is required" }));
+  }
+  if (mode === "injected") {
+    if (currentUid === 0) {
+      return Effect.fail(
+        new WorkerBootstrapError({ reason: "root workers cannot use injected execution mode" }),
+      );
+    }
+    return Effect.succeed(dependencies);
+  }
   if (mode !== "hosted") {
     return Effect.fail(new WorkerBootstrapError({ reason: "worker execution mode is invalid" }));
   }
@@ -72,14 +100,94 @@ export const runWorkerMain = (
 ): Effect.Effect<void, CloudWorkerError> =>
   Effect.gen(function* () {
     const env = options.env ?? NodeProcess.env;
-    const selectedDependencies = yield* selectWorkerProcessDependencies(dependencies, env);
+    const selectedDependencies = yield* selectWorkerProcessDependencies(
+      dependencies,
+      env,
+      options.currentUid,
+    );
     const nowIso = yield* selectedDependencies.clock.now;
     const bootstrap = yield* loadWorkerBootstrap({
       env,
       nowIso,
       ...(options.bootstrapSource === undefined ? {} : { source: options.bootstrapSource }),
     });
-    const worker = runCloudWorker(bootstrap, selectedDependencies);
+    let runtimeDependencies = selectedDependencies;
+    if (env[WORKER_EXECUTION_MODE_ENV] === "hosted") {
+      const credentialRoot = env[WORKER_PROVIDER_CREDENTIAL_ROOT_ENV];
+      const agentUid = Number(env[WORKER_AGENT_UID_ENV]);
+      const agentGid = Number(env[WORKER_AGENT_GID_ENV]);
+      const providerRuntimeModule = env[WORKER_PROVIDER_RUNTIME_MODULE_ENV];
+      const providerRuntimeSha256 = env[WORKER_PROVIDER_RUNTIME_SHA256_ENV];
+      const providerRuntimeChildSha256 = env[WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV];
+      const nodeInterpreterPath = env[WORKER_NODE_INTERPRETER_PATH_ENV];
+      const nodeInterpreterSha256 = env[WORKER_NODE_INTERPRETER_SHA256_ENV];
+      const agentHome = env[WORKER_AGENT_HOME_ENV];
+      const agentPath = env[WORKER_AGENT_PATH_ENV];
+      if (
+        credentialRoot === undefined ||
+        !NodePath.isAbsolute(credentialRoot) ||
+        !Number.isSafeInteger(agentUid) ||
+        agentUid < 1 ||
+        !Number.isSafeInteger(agentGid) ||
+        agentGid < 1 ||
+        providerRuntimeModule === undefined ||
+        !NodePath.isAbsolute(providerRuntimeModule) ||
+        providerRuntimeSha256 === undefined ||
+        providerRuntimeChildSha256 === undefined ||
+        nodeInterpreterPath === undefined ||
+        !NodePath.isAbsolute(nodeInterpreterPath) ||
+        nodeInterpreterSha256 === undefined ||
+        !/^[0-9a-f]{64}$/u.test(nodeInterpreterSha256) ||
+        agentHome === undefined ||
+        !NodePath.isAbsolute(agentHome) ||
+        agentPath === undefined ||
+        agentPath.length < 1
+      ) {
+        return yield* new WorkerBootstrapError({
+          reason: "hosted worker credential executor configuration is required",
+        });
+      }
+      const identityRuntime = makeNodeWorkerCredentialIdentityRuntime({
+        interpreterPath: nodeInterpreterPath,
+        interpreterSha256: nodeInterpreterSha256,
+      });
+      const providerCredentials = yield* makeWorkerProviderCredentialExecutor({
+        privateRoot: credentialRoot,
+        workspaceDirectory: bootstrap.workspaceDirectory,
+        agentUid,
+        agentGid,
+        identityRuntime,
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new WorkerBootstrapError({
+              reason: "hosted worker credential executor could not be configured",
+              cause,
+            }),
+        ),
+      );
+      const provider = yield* makeRestrictedProviderFactory({
+        interpreterPath: nodeInterpreterPath,
+        modulePath: providerRuntimeModule,
+        moduleSha256: providerRuntimeSha256,
+        childSha256: providerRuntimeChildSha256,
+        searchPath: agentPath,
+        agentHomeDirectory: agentHome,
+        agentUid,
+        agentGid,
+        identityRuntime,
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new WorkerBootstrapError({
+              reason: "hosted worker provider runtime could not be isolated",
+              cause,
+            }),
+        ),
+      );
+      runtimeDependencies = { ...selectedDependencies, providerCredentials, provider };
+    }
+    const worker = runCloudWorker(bootstrap, runtimeDependencies);
     const termination = options.termination ?? processTermination;
     yield* Effect.raceFirst(worker, termination);
   });

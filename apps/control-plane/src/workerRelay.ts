@@ -1,16 +1,21 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Relay frame sizing and connection ids use Node primitives at the transport boundary.
 // @effect-diagnostics globalTimers:off -- Heartbeat deadlines are per-connection and cleared during deterministic cleanup.
+// @effect-diagnostics globalTimersInEffect:off -- Credential deadlines are relay-owned native boundary timers.
 // @effect-diagnostics runEffectInsideEffect:off -- Native WebSocket callbacks re-enter the fully constructed Effect service.
 import * as NodeCrypto from "node:crypto";
 
 import type { CloudThreadCommand } from "@t3tools/contracts/cloud";
 import {
+  WorkerRelayInbound,
   WorkerRelayOutbound,
+  type WorkerProviderCredentialCommand,
+  type WorkerProviderCredentialResult,
   type WorkerCommandClaimResponse,
   type WorkerDeliveryId,
-  type WorkerRelayInbound,
   type WorkerRelayGitHubCommandResult,
 } from "@t3tools/contracts/worker";
+import { sealCredentialBinaryFrame } from "@t3tools/shared/credentialRelayCrypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -25,6 +30,7 @@ import {
   type WorkerIdentity,
   type WorkerIdentityService,
 } from "./workerIdentity.ts";
+import type { Secret } from "./providerSecrets.ts";
 
 export class WorkerRelayServerError extends Schema.TaggedErrorClass<WorkerRelayServerError>()(
   "WorkerRelayServerError",
@@ -46,7 +52,9 @@ export class WorkerRelayServerError extends Schema.TaggedErrorClass<WorkerRelayS
 const isWorkerRelayServerError = Schema.is(WorkerRelayServerError);
 
 export interface WorkerRelaySocket {
-  readonly send: (payload: string, complete: (error?: Error) => void) => void;
+  /** TLS-exported channel key; the mTLS adapter zeroizes it on socket close. */
+  readonly credentialChannelKey: Uint8Array;
+  readonly send: (payload: string | Uint8Array, complete: (error?: Error) => void) => void;
   readonly close: (code: number, reason: string) => void;
   readonly onMessage: (listener: (payload: Uint8Array, binary: boolean) => void) => () => void;
   readonly onClose: (listener: () => void) => () => void;
@@ -87,18 +95,36 @@ export interface WorkerRelayLimits {
   readonly maxQueuedFrames: number;
   readonly maxQueuedBytes: number;
   readonly heartbeatTimeoutMs: number;
+  readonly maxPendingCredentialOperations: number;
+  readonly maxPendingCredentialOperationsPerWorkspace: number;
+  readonly maxPendingCredentialOperationsPerRoute: number;
+  readonly maxPendingCredentialBytes: number;
+  readonly maxPendingCredentialBytesPerWorkspace: number;
+  readonly maxPendingCredentialBytesPerRoute: number;
+  readonly credentialOperationTimeoutMs: number;
 }
 
 export const DEFAULT_WORKER_RELAY_LIMITS: WorkerRelayLimits = {
-  maxFrameBytes: 512 * 1024,
+  maxFrameBytes: 2 * 1024 * 1024,
   maxQueuedFrames: 128,
   maxQueuedBytes: 2 * 1024 * 1024,
   heartbeatTimeoutMs: 45_000,
+  maxPendingCredentialOperations: 64,
+  maxPendingCredentialOperationsPerWorkspace: 16,
+  maxPendingCredentialOperationsPerRoute: 8,
+  maxPendingCredentialBytes: 32 * 1024 * 1024,
+  maxPendingCredentialBytesPerWorkspace: 8 * 1024 * 1024,
+  maxPendingCredentialBytesPerRoute: 4 * 1024 * 1024,
+  credentialOperationTimeoutMs: 120_000,
 };
 
 export interface ActiveWorkerRoute {
   readonly lease: ActiveWorkerLease;
   readonly send: (frame: WorkerRelayInbound) => boolean;
+  readonly sendCredential?: (
+    command: Extract<WorkerProviderCredentialCommand, { readonly operation: "materialize" }>,
+    plaintext: Uint8Array,
+  ) => boolean;
   readonly close: (code: number, reason: string) => void;
 }
 
@@ -194,6 +220,7 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
 };
 
 const decodeOutbound = Schema.decodeUnknownSync(Schema.fromJsonString(WorkerRelayOutbound));
+const encodeInbound = Schema.encodeUnknownSync(Schema.fromJsonString(WorkerRelayInbound));
 
 const sameRuntimeIdentity = (
   certificate: WorkerCertificateRecord,
@@ -220,8 +247,28 @@ const sameRuntimeIdentity = (
   return true;
 };
 
+const sameActiveLease = (left: ActiveWorkerLease, right: ActiveWorkerLease) =>
+  left.workspaceId === right.workspaceId &&
+  left.threadId === right.threadId &&
+  left.environmentId === right.environmentId &&
+  left.environmentRevisionId === right.environmentRevisionId &&
+  left.sandboxId === right.sandboxId &&
+  left.reservationId === right.reservationId &&
+  left.workerId === right.workerId &&
+  left.providerInstanceId === right.providerInstanceId &&
+  left.providerDriver === right.providerDriver &&
+  left.certificateFingerprint === right.certificateFingerprint &&
+  left.certificateGeneration === right.certificateGeneration &&
+  left.leaseGeneration === right.leaseGeneration &&
+  left.routeGeneration === right.routeGeneration &&
+  left.processInstanceId === right.processInstanceId &&
+  left.state === "connected";
+
 class BoundedWriter {
-  private readonly queue: Array<{ readonly payload: string; readonly bytes: number }> = [];
+  private readonly queue: Array<{
+    readonly payload: string | Uint8Array;
+    readonly bytes: number;
+  }> = [];
   private bytes = 0;
   private sending = false;
   private closed = false;
@@ -238,7 +285,7 @@ class BoundedWriter {
 
   send(frame: WorkerRelayInbound) {
     if (this.closed) return false;
-    const payload = JSON.stringify(frame);
+    const payload = encodeInbound(frame);
     const bytes = Buffer.byteLength(payload);
     if (
       bytes > this.limits.maxFrameBytes ||
@@ -254,8 +301,28 @@ class BoundedWriter {
     return true;
   }
 
+  sendCiphertext(payload: Uint8Array) {
+    if (
+      this.closed ||
+      payload.byteLength > this.limits.maxFrameBytes ||
+      this.queue.length >= this.limits.maxQueuedFrames ||
+      this.bytes + payload.byteLength > this.limits.maxQueuedBytes
+    ) {
+      payload.fill(0);
+      this.fail();
+      return false;
+    }
+    this.queue.push({ payload, bytes: payload.byteLength });
+    this.bytes += payload.byteLength;
+    this.drain();
+    return true;
+  }
+
   dispose() {
     this.closed = true;
+    for (const entry of this.queue) {
+      if (entry.payload instanceof Uint8Array) entry.payload.fill(0);
+    }
     this.queue.length = 0;
     this.bytes = 0;
   }
@@ -274,6 +341,7 @@ class BoundedWriter {
       }
       this.queue.shift();
       this.bytes -= next.bytes;
+      if (next.payload instanceof Uint8Array) next.payload.fill(0);
       this.drain();
     });
   }
@@ -294,11 +362,162 @@ export interface MakeWorkerRelayOptions {
   readonly limits?: Partial<WorkerRelayLimits>;
 }
 
+export interface WorkerRouteLossInput {
+  readonly workspaceId: WorkerIdentity["workspaceId"];
+  readonly threadId: WorkerIdentity["threadId"];
+  readonly sandboxId?: WorkerIdentity["sandboxId"];
+  readonly reason: "paused" | "destroyed" | "replaced";
+}
+
 export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
   const routes = options.routes ?? makeInMemoryWorkerRouteRegistry();
   const limits = { ...DEFAULT_WORKER_RELAY_LIMITS, ...options.limits };
   const processInstanceId = options.processInstanceId ?? NodeCrypto.randomUUID();
   const coordination = options.coordination;
+  type PendingCredentialOperation = {
+    readonly identity: ActiveWorkerLease;
+    readonly operation: WorkerProviderCredentialCommand["operation"];
+    readonly generation?: number;
+    readonly result: Deferred.Deferred<WorkerProviderCredentialResult, WorkerRelayServerError>;
+    readonly bytes: number;
+    readonly timeout: ReturnType<typeof setTimeout>;
+  };
+  type CredentialAdmission = {
+    readonly token: string;
+    readonly identity: ActiveWorkerLease;
+    readonly operationId: string;
+    readonly commandFingerprint: string;
+    readonly bytes: number;
+    readonly timeout: ReturnType<typeof setTimeout>;
+  };
+  const pendingCredentialOperations = new Map<string, PendingCredentialOperation>();
+  const credentialAdmissions = new Map<string, CredentialAdmission>();
+  const provisionalCredentialRoutes = new Map<string, ActiveWorkerRoute>();
+  const reconnectListeners = new Set<
+    (
+      identity: ActiveWorkerLease,
+      transport: {
+        readonly sendCredentialCommand: typeof sendCredentialCommand;
+      },
+    ) => Effect.Effect<void, WorkerRelayServerError>
+  >();
+  const routeLossListeners = new Set<
+    (input: WorkerRouteLossInput) => Effect.Effect<void, WorkerRelayServerError>
+  >();
+
+  const credentialKey = (identity: ActiveWorkerLease, operationId: string) =>
+    `${identity.workspaceId}\0${identity.threadId}\0${identity.sandboxId}\0${identity.workerId}\0${identity.certificateGeneration}\0${identity.leaseGeneration}\0${identity.routeGeneration}\0${operationId}`;
+  const routeKey = (identity: Pick<ActiveWorkerLease, "workspaceId" | "sandboxId">) =>
+    `${identity.workspaceId}\0${identity.sandboxId}`;
+  const sameCredentialRoute = (left: ActiveWorkerLease, right: ActiveWorkerLease) =>
+    left.workspaceId === right.workspaceId &&
+    left.threadId === right.threadId &&
+    left.sandboxId === right.sandboxId &&
+    left.workerId === right.workerId &&
+    left.certificateGeneration === right.certificateGeneration &&
+    left.leaseGeneration === right.leaseGeneration &&
+    left.routeGeneration === right.routeGeneration;
+  const rejectPendingCredentials = (
+    matches: (pending: PendingCredentialOperation) => boolean,
+    operation: string,
+  ) => {
+    for (const [key, pending] of pendingCredentialOperations) {
+      if (!matches(pending)) continue;
+      pendingCredentialOperations.delete(key);
+      clearTimeout(pending.timeout);
+      Deferred.doneUnsafe(
+        pending.result,
+        Effect.fail(new WorkerRelayServerError({ code: "transportFailed", operation })),
+      );
+    }
+  };
+  const rejectCredentialAdmissions = (matches: (admission: CredentialAdmission) => boolean) => {
+    for (const [token, admission] of credentialAdmissions) {
+      if (!matches(admission)) continue;
+      credentialAdmissions.delete(token);
+      clearTimeout(admission.timeout);
+    }
+  };
+
+  const credentialUsage = (identity: ActiveWorkerLease) => {
+    let globalBytes = 0;
+    let workspaceCount = 0;
+    let workspaceBytes = 0;
+    let routeCount = 0;
+    let routeBytes = 0;
+    const visit = (entry: Pick<PendingCredentialOperation, "identity" | "bytes">) => {
+      globalBytes += entry.bytes;
+      if (entry.identity.workspaceId === identity.workspaceId) {
+        workspaceCount += 1;
+        workspaceBytes += entry.bytes;
+      }
+      if (sameCredentialRoute(entry.identity, identity)) {
+        routeCount += 1;
+        routeBytes += entry.bytes;
+      }
+    };
+    for (const pending of pendingCredentialOperations.values()) visit(pending);
+    for (const admission of credentialAdmissions.values()) visit(admission);
+    return {
+      count: pendingCredentialOperations.size + credentialAdmissions.size,
+      globalBytes,
+      workspaceCount,
+      workspaceBytes,
+      routeCount,
+      routeBytes,
+    };
+  };
+
+  const acceptCredentialResult = (
+    lease: ActiveWorkerLease,
+    result: WorkerProviderCredentialResult,
+  ) =>
+    Effect.gen(function* () {
+      const operationKey = credentialKey(lease, result.operationId);
+      const pending = pendingCredentialOperations.get(operationKey);
+      if (
+        pending === undefined ||
+        !sameCredentialRoute(pending.identity, lease) ||
+        result.routeGeneration !== lease.routeGeneration ||
+        ("profileGeneration" in result && pending.generation !== result.profileGeneration)
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "identityMismatch",
+          operation: "provider-credential-result",
+        });
+      }
+      if (result.operation !== pending.operation) {
+        return yield* new WorkerRelayServerError({
+          code: "invalidFrame",
+          operation: "provider-credential-result-kind",
+        });
+      }
+      pendingCredentialOperations.delete(operationKey);
+      clearTimeout(pending.timeout);
+      yield* Deferred.succeed(pending.result, result);
+    });
+
+  const validateActiveLease = (lease: ActiveWorkerLease) =>
+    options.identities.repository.validateActiveLease(lease).pipe(
+      Effect.mapError(
+        (cause) =>
+          new WorkerRelayServerError({
+            code: "leaseFenced",
+            operation: "validate-active-lease",
+            cause,
+          }),
+      ),
+      Effect.flatMap((current) =>
+        sameActiveLease(current, lease)
+          ? Effect.succeed(current)
+          : Effect.fail(
+              new WorkerRelayServerError({
+                code: "leaseFenced",
+                operation: "validate-active-lease-identity",
+              }),
+            ),
+      ),
+    );
 
   const open = (certificate: WorkerCertificateRecord, socket: WorkerRelaySocket) =>
     Effect.gen(function* () {
@@ -308,6 +527,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
       let inboundFrames = 0;
       let inboundBytes = 0;
       let poisoned = false;
+      let routeReady = false;
       let processing = Promise.resolve();
 
       const writer = new BoundedWriter(socket, limits, () => close(4413, "slow_consumer"));
@@ -332,12 +552,24 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
         if (heartbeatDeadline !== undefined) clearTimeout(heartbeatDeadline);
         writer.dispose();
         routes.deactivate(lease);
+        const provisionalKey = routeKey(lease);
+        if (
+          provisionalCredentialRoutes.get(provisionalKey)?.lease.routeGeneration ===
+          lease.routeGeneration
+        ) {
+          provisionalCredentialRoutes.delete(provisionalKey);
+        }
         if (removeEphemeralRoute !== undefined) {
           void Effect.runPromise(removeEphemeralRoute.pipe(Effect.ignore));
         }
         if (removeEphemeralPresence !== undefined) {
           void Effect.runPromise(removeEphemeralPresence.pipe(Effect.ignore));
         }
+        rejectPendingCredentials(
+          (pending) => sameCredentialRoute(pending.identity, lease),
+          "provider-credential-route-lost",
+        );
+        rejectCredentialAdmissions((admission) => sameCredentialRoute(admission.identity, lease));
         void Effect.runPromise(
           options.identities.disconnectLease(lease, state).pipe(Effect.ignore),
         );
@@ -346,6 +578,16 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
         cleanup(code === 4408 ? "timed_out" : "disconnected");
         socket.close(code, reason);
       }
+      const failFencedOpen = (operation: string, cause?: unknown) =>
+        Effect.gen(function* () {
+          close(4009, "worker_replaced");
+          if (removeEphemeralRoute !== undefined) yield* removeEphemeralRoute.pipe(Effect.ignore);
+          return yield* new WorkerRelayServerError({
+            code: "leaseFenced",
+            operation,
+            ...(cause === undefined ? {} : { cause }),
+          });
+        });
       const armHeartbeatDeadline = () => {
         if (heartbeatDeadline !== undefined) clearTimeout(heartbeatDeadline);
         heartbeatDeadline = setTimeout(
@@ -384,7 +626,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
                   }),
               ),
             );
-            if (coordination !== undefined) {
+            if (coordination !== undefined && routeReady) {
               // Presence is advisory: an established healthy socket remains usable during
               // a transient Valkey outage, while its cross-replica route expires naturally.
               yield* coordination
@@ -423,6 +665,10 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
             armHeartbeatDeadline();
           }
 
+          if (message.type === "provider.credentials.result") {
+            yield* acceptCredentialResult(lease, message);
+            return;
+          }
           const acceptance = yield* message.type === "github.command.result"
             ? options.githubResults === undefined
               ? Effect.fail(
@@ -501,6 +747,67 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
           }
         });
 
+      const route: ActiveWorkerRoute = {
+        lease,
+        send: (frame) => writer.send(frame),
+        sendCredential: (command, plaintext) =>
+          writer.sendCiphertext(
+            sealCredentialBinaryFrame({
+              key: socket.credentialChannelKey,
+              kind: "materialize",
+              operationId: command.operationId,
+              routeGeneration: command.routeGeneration,
+              control: command,
+              plaintext,
+            }),
+          ),
+        close,
+      };
+      const activeRoute = routes.get(lease.workspaceId, lease.sandboxId);
+      const provisionalKey = routeKey(lease);
+      const previousProvisional = provisionalCredentialRoutes.get(provisionalKey);
+      if (
+        (activeRoute !== undefined && activeRoute.lease.routeGeneration >= lease.routeGeneration) ||
+        (previousProvisional !== undefined &&
+          previousProvisional.lease.routeGeneration >= lease.routeGeneration)
+      ) {
+        close(4009, "worker_replaced");
+        return yield* new WorkerRelayServerError({
+          code: "leaseFenced",
+          operation: "provisional-route",
+        });
+      }
+      provisionalCredentialRoutes.set(provisionalKey, route);
+      previousProvisional?.close(4009, "worker_replaced");
+
+      // Receive is installed before recovery and reconciliation so an immediate
+      // worker result cannot be lost while the route is still provisional.
+      const removeMessage = socket.onMessage((payload, binary) => {
+        if (closed) return;
+        if (
+          inboundFrames >= limits.maxQueuedFrames ||
+          inboundBytes + payload.byteLength > limits.maxQueuedBytes
+        ) {
+          close(4413, "inbound_queue_full");
+          return;
+        }
+        inboundFrames += 1;
+        inboundBytes += payload.byteLength;
+        processing = processing
+          .then(async () => {
+            if (closed || poisoned) return;
+            try {
+              await Effect.runPromise(processFrame(payload, binary));
+            } catch {
+              poisoned = true;
+              close(4400, "invalid_worker_frame");
+            }
+          })
+          .finally(() => {
+            inboundFrames -= 1;
+            inboundBytes -= payload.byteLength;
+          });
+      });
       const removeClose = socket.onClose(() => cleanup("disconnected"));
       const recovered = yield* options.recovery
         .recover(certificate, {
@@ -530,6 +837,23 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
         });
       }
 
+      const reconnectTransport = {
+        sendCredentialCommand: (input: Parameters<typeof sendCredentialCommandWithRoute>[0]) =>
+          sendCredentialCommandWithRoute(input, route),
+      };
+      for (const listener of reconnectListeners) {
+        yield* listener(lease, reconnectTransport).pipe(
+          Effect.tapError(() => Effect.sync(() => close(1011, "relay_reconciliation_failed"))),
+        );
+      }
+
+      if (provisionalCredentialRoutes.get(provisionalKey) !== route) {
+        return yield* failFencedOpen("publish-provisional-route");
+      }
+      yield* validateActiveLease(lease).pipe(
+        Effect.catch((cause) => failFencedOpen("publish-active-lease", cause)),
+      );
+
       if (coordination !== undefined) {
         const published = yield* coordination
           .publishRoute({
@@ -549,47 +873,19 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
           });
         }
       }
-      const route: ActiveWorkerRoute = {
-        lease,
-        send: (frame) => writer.send(frame),
-        close,
-      };
+      yield* validateActiveLease(lease).pipe(
+        Effect.catch((cause) => failFencedOpen("published-active-lease", cause)),
+      );
+      if (provisionalCredentialRoutes.get(provisionalKey) !== route) {
+        return yield* failFencedOpen("activate-provisional-route");
+      }
+      provisionalCredentialRoutes.delete(provisionalKey);
       const activation = routes.activate(route);
       if (!activation.accepted) {
-        close(4009, "worker_replaced");
-        return yield* new WorkerRelayServerError({
-          code: "leaseFenced",
-          operation: "activate-route",
-        });
+        return yield* failFencedOpen("activate-route");
       }
       activation.displaced?.close(4009, "worker_replaced");
-
-      const removeMessage = socket.onMessage((payload, binary) => {
-        if (closed) return;
-        if (
-          inboundFrames >= limits.maxQueuedFrames ||
-          inboundBytes + payload.byteLength > limits.maxQueuedBytes
-        ) {
-          close(4413, "inbound_queue_full");
-          return;
-        }
-        inboundFrames += 1;
-        inboundBytes += payload.byteLength;
-        processing = processing
-          .then(async () => {
-            if (closed || poisoned) return;
-            try {
-              await Effect.runPromise(processFrame(payload, binary));
-            } catch {
-              poisoned = true;
-              close(4400, "invalid_worker_frame");
-            }
-          })
-          .finally(() => {
-            inboundFrames -= 1;
-            inboundBytes -= payload.byteLength;
-          });
-      });
+      routeReady = true;
       armHeartbeatDeadline();
 
       return {
@@ -623,8 +919,32 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
 
   const initialize = options.identities.clock.now.pipe(
     Effect.flatMap((now) => options.identities.repository.recoverProcess(processInstanceId, now)),
-    Effect.tap(() => Effect.sync(() => routes.clear())),
+    Effect.tap(() =>
+      Effect.sync(() => {
+        rejectPendingCredentials(() => true, "provider-credential-relay-reset");
+        rejectCredentialAdmissions(() => true);
+        routes.clear();
+      }),
+    ),
   );
+
+  const beforeRouteLoss = (input: WorkerRouteLossInput) =>
+    Effect.forEach(routeLossListeners, (listener) => listener(input), {
+      concurrency: 1,
+      discard: true,
+    });
+
+  const closeProvisionalSandbox = (
+    workspaceId: WorkerIdentity["workspaceId"],
+    sandboxId: WorkerIdentity["sandboxId"],
+    reason: string,
+  ) => {
+    for (const [key, route] of provisionalCredentialRoutes) {
+      if (route.lease.workspaceId !== workspaceId || route.lease.sandboxId !== sandboxId) continue;
+      provisionalCredentialRoutes.delete(key);
+      route.close(4009, reason);
+    }
+  };
 
   const fenceSandboxForReplacement = (
     workspaceId: WorkerIdentity["workspaceId"],
@@ -632,9 +952,13 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
     sandboxId: WorkerIdentity["sandboxId"],
     reason: string,
   ) =>
-    options.identities.fenceSandbox(workspaceId, sandboxId, reason).pipe(
+    beforeRouteLoss({ workspaceId, threadId, sandboxId, reason: "replaced" }).pipe(
+      Effect.andThen(options.identities.fenceSandbox(workspaceId, sandboxId, reason)),
       Effect.tap(() =>
-        Effect.sync(() => routes.closeSandbox(workspaceId, sandboxId, "worker_fenced")),
+        Effect.sync(() => {
+          closeProvisionalSandbox(workspaceId, sandboxId, "worker_fenced");
+          routes.closeSandbox(workspaceId, sandboxId, "worker_fenced");
+        }),
       ),
       Effect.tap((identities) =>
         identities.some((identity) => identity.threadId !== threadId)
@@ -663,7 +987,8 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
     workspaceId: WorkerIdentity["workspaceId"],
     threadId: WorkerIdentity["threadId"],
   ) =>
-    Effect.sync(() => routes.closeThread(workspaceId, threadId, "worker_paused")).pipe(
+    beforeRouteLoss({ workspaceId, threadId, reason: "paused" }).pipe(
+      Effect.andThen(Effect.sync(() => routes.closeThread(workspaceId, threadId, "worker_paused"))),
       Effect.andThen(
         coordination === undefined
           ? Effect.void
@@ -681,7 +1006,8 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
     sandboxId: WorkerIdentity["sandboxId"],
     reason: string,
   ) =>
-    options.identities.fenceSandbox(workspaceId, sandboxId, reason).pipe(
+    beforeRouteLoss({ workspaceId, threadId, sandboxId, reason: "destroyed" }).pipe(
+      Effect.andThen(options.identities.fenceSandbox(workspaceId, sandboxId, reason)),
       Effect.tap(() =>
         Effect.sync(() => routes.closeThread(workspaceId, threadId, "thread_retired")),
       ),
@@ -692,6 +1018,248 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
       ),
     );
 
+  const reserveCredentialCommand = (input: {
+    readonly identity: ActiveWorkerLease;
+    readonly command: WorkerProviderCredentialCommand;
+  }) =>
+    Effect.gen(function* () {
+      if (
+        input.command.providerInstanceId !== input.identity.providerInstanceId ||
+        input.command.providerDriver !== input.identity.providerDriver ||
+        input.command.routeGeneration !== input.identity.routeGeneration
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "identityMismatch",
+          operation: "provider-credential-admission",
+        });
+      }
+      const route = routes.get(input.identity.workspaceId, input.identity.sandboxId);
+      if (route === undefined || !sameCredentialRoute(route.lease, input.identity)) {
+        return yield* new WorkerRelayServerError({
+          code: "leaseFenced",
+          operation: "provider-credential-admission",
+        });
+      }
+      const encoded = encodeInbound(input.command);
+      const bytes = Buffer.byteLength(encoded, "utf8");
+      const usage = credentialUsage(input.identity);
+      if (
+        usage.count >= limits.maxPendingCredentialOperations ||
+        usage.workspaceCount >= limits.maxPendingCredentialOperationsPerWorkspace ||
+        usage.routeCount >= limits.maxPendingCredentialOperationsPerRoute ||
+        usage.globalBytes + bytes > limits.maxPendingCredentialBytes ||
+        usage.workspaceBytes + bytes > limits.maxPendingCredentialBytesPerWorkspace ||
+        usage.routeBytes + bytes > limits.maxPendingCredentialBytesPerRoute
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "queueFull",
+          operation: "provider-credential-admission-budget",
+        });
+      }
+      const operationKey = credentialKey(input.identity, input.command.operationId);
+      if (
+        pendingCredentialOperations.has(operationKey) ||
+        [...credentialAdmissions.values()].some(
+          (entry) =>
+            entry.operationId === input.command.operationId &&
+            sameCredentialRoute(entry.identity, input.identity),
+        )
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "queueFull",
+          operation: "provider-credential-admission-duplicate",
+        });
+      }
+      const token = NodeCrypto.randomUUID();
+      const timeout = setTimeout(() => {
+        const current = credentialAdmissions.get(token);
+        if (current === undefined) return;
+        credentialAdmissions.delete(token);
+      }, limits.credentialOperationTimeoutMs);
+      timeout.unref();
+      credentialAdmissions.set(token, {
+        token,
+        identity: input.identity,
+        operationId: input.command.operationId,
+        commandFingerprint: NodeCrypto.createHash("sha256").update(encoded).digest("hex"),
+        bytes,
+        timeout,
+      });
+      return {
+        token,
+        release: Effect.sync(() => {
+          const current = credentialAdmissions.get(token);
+          if (current === undefined) return;
+          credentialAdmissions.delete(token);
+          clearTimeout(current.timeout);
+        }),
+      } as const;
+    });
+
+  const sendCredentialCommandWithRoute = (
+    input: {
+      readonly identity: ActiveWorkerLease;
+      readonly command: WorkerProviderCredentialCommand;
+      readonly admissionToken?: string;
+      readonly credentialPayload?: Secret<Uint8Array>;
+    },
+    routeOverride?: ActiveWorkerRoute,
+  ) =>
+    Effect.gen(function* () {
+      if (
+        input.command.providerInstanceId !== input.identity.providerInstanceId ||
+        input.command.providerDriver !== input.identity.providerDriver ||
+        input.command.routeGeneration !== input.identity.routeGeneration
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "identityMismatch",
+          operation: "provider-credential-command",
+        });
+      }
+      const route =
+        routeOverride ?? routes.get(input.identity.workspaceId, input.identity.sandboxId);
+      if (
+        route === undefined ||
+        !sameCredentialRoute(route.lease, input.identity) ||
+        route.lease.providerInstanceId !== input.identity.providerInstanceId
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "leaseFenced",
+          operation: "provider-credential-command",
+        });
+      }
+      const operationKey = credentialKey(input.identity, input.command.operationId);
+      if (pendingCredentialOperations.has(operationKey)) {
+        return yield* new WorkerRelayServerError({
+          code: "queueFull",
+          operation: "provider-credential-command-duplicate",
+        });
+      }
+      const secretBytes = input.credentialPayload?.withValue((bytes) => bytes.byteLength) ?? 0;
+      if (
+        (input.command.operation === "materialize") !== (input.credentialPayload !== undefined) ||
+        (input.command.operation === "materialize" &&
+          input.command.credentialPayloadBytes !== secretBytes)
+      ) {
+        return yield* new WorkerRelayServerError({
+          code: "invalidFrame",
+          operation: "provider-credential-command-payload",
+        });
+      }
+      const commandBytes = Buffer.byteLength(encodeInbound(input.command), "utf8") + secretBytes;
+      if (input.admissionToken !== undefined) {
+        const admission = credentialAdmissions.get(input.admissionToken);
+        const fingerprint = NodeCrypto.createHash("sha256")
+          .update(encodeInbound(input.command))
+          .digest("hex");
+        if (
+          admission === undefined ||
+          !sameCredentialRoute(admission.identity, input.identity) ||
+          admission.operationId !== input.command.operationId ||
+          admission.commandFingerprint !== fingerprint
+        ) {
+          return yield* new WorkerRelayServerError({
+            code: "leaseFenced",
+            operation: "provider-credential-admission-consume",
+          });
+        }
+        credentialAdmissions.delete(input.admissionToken);
+        clearTimeout(admission.timeout);
+      } else {
+        const usage = credentialUsage(input.identity);
+        if (
+          usage.count >= limits.maxPendingCredentialOperations ||
+          usage.workspaceCount >= limits.maxPendingCredentialOperationsPerWorkspace ||
+          usage.routeCount >= limits.maxPendingCredentialOperationsPerRoute ||
+          usage.globalBytes + commandBytes > limits.maxPendingCredentialBytes ||
+          usage.workspaceBytes + commandBytes > limits.maxPendingCredentialBytesPerWorkspace ||
+          usage.routeBytes + commandBytes > limits.maxPendingCredentialBytesPerRoute
+        ) {
+          return yield* new WorkerRelayServerError({
+            code: "queueFull",
+            operation: "provider-credential-command-budget",
+          });
+        }
+      }
+      const result = yield* Deferred.make<WorkerProviderCredentialResult, WorkerRelayServerError>();
+      const timeout = setTimeout(() => {
+        const pending = pendingCredentialOperations.get(operationKey);
+        if (pending === undefined) return;
+        pendingCredentialOperations.delete(operationKey);
+        Deferred.doneUnsafe(
+          pending.result,
+          Effect.fail(
+            new WorkerRelayServerError({
+              code: "transportFailed",
+              operation: "provider-credential-command-timeout",
+            }),
+          ),
+        );
+      }, limits.credentialOperationTimeoutMs);
+      timeout.unref();
+      pendingCredentialOperations.set(operationKey, {
+        identity: input.identity,
+        operation: input.command.operation,
+        generation: input.command.profileGeneration,
+        result,
+        bytes: commandBytes,
+        timeout,
+      });
+      let sent: boolean;
+      if (input.command.operation === "materialize" && input.credentialPayload !== undefined) {
+        const sendCredential = route.sendCredential;
+        if (sendCredential === undefined) {
+          return yield* new WorkerRelayServerError({
+            code: "transportFailed",
+            operation: "provider-credential-binary-channel",
+          });
+        }
+        const command = input.command;
+        sent = input.credentialPayload.withValue((plaintext) => sendCredential(command, plaintext));
+      } else {
+        sent = route.send(input.command);
+      }
+      if (!sent) {
+        pendingCredentialOperations.delete(operationKey);
+        clearTimeout(timeout);
+        return yield* new WorkerRelayServerError({
+          code: "queueFull",
+          operation: "provider-credential-command-send",
+        });
+      }
+      return yield* Deferred.await(result).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const pending = pendingCredentialOperations.get(operationKey);
+            if (pending !== undefined) clearTimeout(pending.timeout);
+            pendingCredentialOperations.delete(operationKey);
+          }),
+        ),
+      );
+    });
+
+  const sendCredentialCommand = (input: Parameters<typeof sendCredentialCommandWithRoute>[0]) =>
+    sendCredentialCommandWithRoute(input);
+
+  const onAuthenticatedReconnect = (
+    listener: (
+      identity: ActiveWorkerLease,
+      transport: {
+        readonly sendCredentialCommand: typeof sendCredentialCommand;
+      },
+    ) => Effect.Effect<void, WorkerRelayServerError>,
+  ) => {
+    reconnectListeners.add(listener);
+    return () => reconnectListeners.delete(listener);
+  };
+
+  const onBeforeRouteLoss = (
+    listener: (input: WorkerRouteLossInput) => Effect.Effect<void, WorkerRelayServerError>,
+  ) => {
+    routeLossListeners.add(listener);
+    return () => routeLossListeners.delete(listener);
+  };
+
   return {
     initialize,
     open,
@@ -699,6 +1267,10 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
     pauseThread,
     fenceSandboxForReplacement,
     retireThreadTerminal,
+    sendCredentialCommand,
+    reserveCredentialCommand,
+    onAuthenticatedReconnect,
+    onBeforeRouteLoss,
     routes,
     limits,
     processInstanceId,

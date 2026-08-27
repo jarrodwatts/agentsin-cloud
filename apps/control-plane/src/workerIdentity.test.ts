@@ -182,6 +182,25 @@ const makeRepository = (): WorkerIdentityRepository & {
         leases.set(lease.sandboxId, updated);
         return updated;
       }),
+    validateActiveLease: (lease) =>
+      attempted("validate-active-lease", () => {
+        const active = leases.get(lease.sandboxId);
+        if (
+          active === undefined ||
+          active.state !== "connected" ||
+          active.certificateFingerprint !== lease.certificateFingerprint ||
+          active.certificateGeneration !== lease.certificateGeneration ||
+          active.leaseGeneration !== lease.leaseGeneration ||
+          active.routeGeneration !== lease.routeGeneration ||
+          active.processInstanceId !== lease.processInstanceId
+        ) {
+          throw new WorkerIdentityError({
+            code: "leaseFenced",
+            operation: "validate-active-lease",
+          });
+        }
+        return active;
+      }),
     disconnect: (lease, state, _now) =>
       attempted("disconnect", () => {
         const active = leases.get(lease.sandboxId);

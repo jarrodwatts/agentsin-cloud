@@ -88,6 +88,34 @@ jobs:
       - name: Test
         run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' test
 
+  test_worker_credential_isolation:
+    name: Test Worker Credential Isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Prove worker and agent kernel isolation
+        run: >-
+          sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST=1
+          "$(command -v pnpm)" --filter @agentsin-cloud/worker exec vp test run
+          src/ProviderCredentialExecutor.root.test.ts
+          src/ProviderRuntimeSupervisor.root.test.ts
+          src/main.root.test.ts
+
   test_control_plane_coordination:
     name: Test Control Plane Coordination
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -141,6 +169,8 @@ jobs:
           src/valkeyCoordination.integration.test.ts
           src/workerRouteGeneration.postgres.test.ts
           src/artifactRepository.postgres.test.ts
+          src/githubThreadWorkflowStore.postgres.test.ts
+          src/providerCredentialStore.postgres.test.ts
 
   # apps/server sets `fileParallelism: false`, so its 239 files run strictly
   # one at a time. Sharding spreads them over separate runners instead of

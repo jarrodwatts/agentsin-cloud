@@ -154,6 +154,10 @@ export interface WorkerIdentityRepository {
     cursors: { readonly confirmedEventCursor?: number; readonly commandDeliveryId?: string },
     now: string,
   ) => Effect.Effect<ActiveWorkerLease, WorkerIdentityError>;
+  /** Revalidates the exact connected certificate, lease, and route fence before publication. */
+  readonly validateActiveLease: (
+    lease: ActiveWorkerLease,
+  ) => Effect.Effect<ActiveWorkerLease, WorkerIdentityError>;
   readonly disconnect: (
     lease: Pick<ActiveWorkerLease, "workspaceId" | "sandboxId" | "leaseGeneration">,
     state: "disconnected" | "timed_out",

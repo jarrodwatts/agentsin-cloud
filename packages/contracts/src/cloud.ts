@@ -39,6 +39,13 @@ import { ProviderDriverKind, ProviderInstanceRef } from "./providerInstance.ts";
 const makeCloudEntityId = <Brand extends string>(brand: Brand) =>
   TrimmedNonEmptyString.pipe(Schema.brand(brand));
 
+/** Opaque identifier safe to use as a single filesystem path component. */
+const makePathSafeCloudEntityId = <Brand extends string>(brand: Brand) =>
+  Schema.String.check(
+    Schema.isLengthBetween(1, 96),
+    Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]*$/),
+  ).pipe(Schema.brand(brand));
+
 const PkceBase64Url = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]+$/));
 
 /** SHA-256 PKCE challenge used to bind a desktop deep-link callback. */
@@ -87,11 +94,11 @@ export const EnvironmentRevisionId = makeCloudEntityId("EnvironmentRevisionId");
 export type EnvironmentRevisionId = typeof EnvironmentRevisionId.Type;
 export const AgentConnectionId = makeCloudEntityId("AgentConnectionId");
 export type AgentConnectionId = typeof AgentConnectionId.Type;
-export const AgentLoginId = makeCloudEntityId("AgentLoginId");
+export const AgentLoginId = makePathSafeCloudEntityId("AgentLoginId");
 export type AgentLoginId = typeof AgentLoginId.Type;
 export const AgentProfileId = makeCloudEntityId("AgentProfileId");
 export type AgentProfileId = typeof AgentProfileId.Type;
-export const AgentMaterializationId = makeCloudEntityId("AgentMaterializationId");
+export const AgentMaterializationId = makePathSafeCloudEntityId("AgentMaterializationId");
 export type AgentMaterializationId = typeof AgentMaterializationId.Type;
 export const PluginId = makeCloudEntityId("PluginId");
 export type PluginId = typeof PluginId.Type;
@@ -1190,7 +1197,7 @@ const AgentConnectionAdapterRequestFields = {
 
 export const AgentConnectionBeginLoginRequest = Schema.Struct({
   ...AgentConnectionAdapterRequestFields,
-  driver: ProviderDriverKind,
+  provider: ProviderInstanceRef,
   callbackUrl: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type AgentConnectionBeginLoginRequest = typeof AgentConnectionBeginLoginRequest.Type;
@@ -1198,13 +1205,63 @@ export type AgentConnectionBeginLoginRequest = typeof AgentConnectionBeginLoginR
 export const AgentConnectionLoginMethod = Schema.Literals(["browser", "deviceCode"]);
 export type AgentConnectionLoginMethod = typeof AgentConnectionLoginMethod.Type;
 
+const AgentConnectionPublicHttpsUrl = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(2_048),
+  Schema.makeFilter((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && url.username === "" && url.password === ""
+        ? true
+        : "provider authorization URLs must use HTTPS without embedded credentials";
+    } catch {
+      return "provider authorization URLs must be valid URLs";
+    }
+  }),
+);
+
+/** Sanitized login progress that is safe to relay to authenticated clients. */
+export const AgentConnectionLoginEvent = Schema.Union([
+  Schema.Struct({
+    sequence: NonNegativeInt,
+    occurredAt: IsoDateTime,
+    type: Schema.Literal("authorizationUrl"),
+    authorizationUrl: AgentConnectionPublicHttpsUrl,
+  }),
+  Schema.Struct({
+    sequence: NonNegativeInt,
+    occurredAt: IsoDateTime,
+    type: Schema.Literal("deviceCode"),
+    verificationUrl: AgentConnectionPublicHttpsUrl,
+    userCode: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  }),
+  Schema.Struct({
+    sequence: NonNegativeInt,
+    occurredAt: IsoDateTime,
+    type: Schema.Literal("status"),
+    status: Schema.Literals(["started", "waiting", "authorized", "denied", "expired", "failed"]),
+  }),
+]);
+export type AgentConnectionLoginEvent = typeof AgentConnectionLoginEvent.Type;
+
+export const AgentConnectionLoginEvents = Schema.Array(AgentConnectionLoginEvent).check(
+  Schema.isMaxLength(64),
+  Schema.makeFilter(
+    (events) =>
+      events.every(
+        (event, index) => index === 0 || event.sequence === events[index - 1]!.sequence + 1,
+      ) || "provider login event sequences must be contiguous and increasing",
+    { identifier: "AgentConnectionLoginEventsSequence" },
+  ),
+);
+export type AgentConnectionLoginEvents = typeof AgentConnectionLoginEvents.Type;
+
 export const AgentConnectionBeginLoginResult = Schema.Struct({
   loginId: AgentLoginId,
+  profileId: AgentProfileId,
   workspaceId: WorkspaceId,
-  driver: ProviderDriverKind,
+  provider: ProviderInstanceRef,
   method: AgentConnectionLoginMethod,
-  authorizationUrl: TrimmedNonEmptyString,
-  userCode: Schema.optionalKey(TrimmedNonEmptyString),
+  events: AgentConnectionLoginEvents,
   expiresAt: IsoDateTime,
   pollAfterMs: PositiveInt,
 });
@@ -1220,21 +1277,26 @@ export const AgentConnectionPollLoginResult = Schema.Union([
   Schema.Struct({
     status: Schema.Literal("pending"),
     loginId: AgentLoginId,
+    profileId: AgentProfileId,
     workspaceId: WorkspaceId,
     pollAfterMs: PositiveInt,
+    events: AgentConnectionLoginEvents,
   }),
   Schema.Struct({
     status: Schema.Literal("authorized"),
     loginId: AgentLoginId,
+    profileId: AgentProfileId,
     workspaceId: WorkspaceId,
-    credentialHandle: TrimmedNonEmptyString,
     accountLabel: Schema.optionalKey(TrimmedNonEmptyString),
+    events: AgentConnectionLoginEvents,
   }),
   Schema.Struct({
     status: Schema.Literals(["denied", "expired", "failed"]),
     loginId: AgentLoginId,
+    profileId: AgentProfileId,
     workspaceId: WorkspaceId,
     reason: Schema.optionalKey(TrimmedNonEmptyString),
+    events: AgentConnectionLoginEvents,
   }),
 ]);
 export type AgentConnectionPollLoginResult = typeof AgentConnectionPollLoginResult.Type;
@@ -1245,10 +1307,10 @@ export type AgentProfileState = typeof AgentProfileState.Type;
 export const AgentConnectionProfile = Schema.Struct({
   profileId: AgentProfileId,
   workspaceId: WorkspaceId,
-  driver: ProviderDriverKind,
+  provider: ProviderInstanceRef,
   label: TrimmedNonEmptyString,
-  sealedCredentialRef: TrimmedNonEmptyString,
   state: AgentProfileState,
+  keyVersion: TrimmedNonEmptyString,
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   expiresAt: Schema.optionalKey(IsoDateTime),
@@ -1258,7 +1320,9 @@ export type AgentConnectionProfile = typeof AgentConnectionProfile.Type;
 export const AgentConnectionSealProfileRequest = Schema.Struct({
   ...AgentConnectionAdapterRequestFields,
   loginId: AgentLoginId,
-  credentialHandle: TrimmedNonEmptyString,
+  provider: ProviderInstanceRef,
+  profileId: AgentProfileId,
+  idempotencyKey: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
   label: TrimmedNonEmptyString,
 });
 export type AgentConnectionSealProfileRequest = typeof AgentConnectionSealProfileRequest.Type;
@@ -1276,18 +1340,47 @@ export const AgentConnectionSealProfileResult = Schema.Struct({
 );
 export type AgentConnectionSealProfileResult = typeof AgentConnectionSealProfileResult.Type;
 
+/** Short-lived user authorization for one active thread sandbox target. */
+export const AgentProfileMaterializationAuthorization = Schema.Struct({
+  workspaceId: WorkspaceId,
+  authSessionId: AuthSessionId,
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  sandboxId: SandboxId,
+  provider: ProviderInstanceRef,
+  authorizedAt: IsoDateTime,
+  expiresAt: IsoDateTime,
+}).check(
+  Schema.makeFilter(
+    (input) => input.authorizedAt < input.expiresAt || "materialization authorization must expire",
+    { identifier: "AgentProfileMaterializationAuthorizationLifetime" },
+  ),
+);
+export type AgentProfileMaterializationAuthorization =
+  typeof AgentProfileMaterializationAuthorization.Type;
+
 export const AgentConnectionMaterializeRequest = Schema.Struct({
   ...AgentConnectionAdapterRequestFields,
   profileId: AgentProfileId,
-  environmentId: EnvironmentId,
-});
+  authorization: AgentProfileMaterializationAuthorization,
+  targetPath: TrimmedNonEmptyString.check(Schema.isMaxLength(1_024)),
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.workspaceId === input.authorization.workspaceId ||
+      "materialization request must match its authorization workspace",
+    { identifier: "AgentConnectionMaterializeRequestWorkspace" },
+  ),
+);
 export type AgentConnectionMaterializeRequest = typeof AgentConnectionMaterializeRequest.Type;
 
 export const AgentConnectionMaterializeResult = Schema.Struct({
   materializationId: AgentMaterializationId,
   profileId: AgentProfileId,
   workspaceId: WorkspaceId,
+  threadId: ThreadId,
   environmentId: EnvironmentId,
+  sandboxId: SandboxId,
   materializationRef: TrimmedNonEmptyString,
   materializedAt: IsoDateTime,
   expiresAt: Schema.optionalKey(IsoDateTime),
@@ -1370,7 +1463,9 @@ export const AgentConnectionAdapterExchange = Schema.Union([
     agentAdapterExchangeWorkspace,
     Schema.makeFilter(
       (input) =>
-        input.request.driver === input.result.driver || "begin-login driver identity must match",
+        (input.request.provider.instanceId === input.result.provider.instanceId &&
+          input.request.provider.driver === input.result.provider.driver) ||
+        "begin-login provider identity must match",
       { identifier: "AgentConnectionBeginLoginExchange" },
     ),
   ),
@@ -1389,7 +1484,17 @@ export const AgentConnectionAdapterExchange = Schema.Union([
     operation: Schema.Literal("sealProfile"),
     request: AgentConnectionSealProfileRequest,
     result: AgentConnectionSealProfileResult,
-  }).check(agentAdapterExchangeWorkspace),
+  }).check(
+    agentAdapterExchangeWorkspace,
+    Schema.makeFilter(
+      (input) =>
+        (input.request.profileId === input.result.profile.profileId &&
+          input.request.provider.instanceId === input.result.profile.provider.instanceId &&
+          input.request.provider.driver === input.result.profile.provider.driver) ||
+        "seal-profile identities must match",
+      { identifier: "AgentConnectionSealProfileExchange" },
+    ),
+  ),
   Schema.Struct({
     operation: Schema.Literal("materialize"),
     request: AgentConnectionMaterializeRequest,
@@ -1399,8 +1504,11 @@ export const AgentConnectionAdapterExchange = Schema.Union([
     Schema.makeFilter(
       (input) =>
         (input.request.profileId === input.result.profileId &&
-          input.request.environmentId === input.result.environmentId) ||
-        "materialization profile and environment identities must match",
+          input.request.authorization.workspaceId === input.result.workspaceId &&
+          input.request.authorization.threadId === input.result.threadId &&
+          input.request.authorization.environmentId === input.result.environmentId &&
+          input.request.authorization.sandboxId === input.result.sandboxId) ||
+        "materialization profile and authorized target identities must match",
       { identifier: "AgentConnectionMaterializeExchange" },
     ),
   ),
@@ -1497,6 +1605,53 @@ export const AgentConnection = Schema.Struct({
   lastError: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type AgentConnection = typeof AgentConnection.Type;
+
+/**
+ * Hosted client commands deliberately carry identifiers only. Better Auth,
+ * workspace membership, clock values, provider driver, and sandbox authority
+ * are derived by the control plane and cannot be asserted by a client.
+ */
+export const ProviderCredentialBeginLoginCommand = Schema.Struct({
+  requestId: CommandId,
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceRef.fields.instanceId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProviderCredentialBeginLoginCommand = typeof ProviderCredentialBeginLoginCommand.Type;
+
+export const ProviderCredentialPollLoginCommand = Schema.Struct({
+  requestId: CommandId,
+  loginId: AgentLoginId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProviderCredentialPollLoginCommand = typeof ProviderCredentialPollLoginCommand.Type;
+
+export const ProviderCredentialCancelLoginCommand = Schema.Struct({
+  requestId: CommandId,
+  loginId: AgentLoginId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProviderCredentialCancelLoginCommand = typeof ProviderCredentialCancelLoginCommand.Type;
+
+export const ProviderCredentialSealProfileCommand = Schema.Struct({
+  requestId: CommandId,
+  loginId: AgentLoginId,
+  profileId: AgentProfileId,
+  idempotencyKey: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  label: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProviderCredentialSealProfileCommand = typeof ProviderCredentialSealProfileCommand.Type;
+
+export const ProviderCredentialMaterializeCommand = Schema.Struct({
+  requestId: CommandId,
+  threadId: ThreadId,
+  profileId: AgentProfileId,
+  materializationId: AgentMaterializationId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProviderCredentialMaterializeCommand = typeof ProviderCredentialMaterializeCommand.Type;
+
+export const ProviderCredentialProfileCommand = Schema.Struct({
+  requestId: CommandId,
+  profileId: AgentProfileId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProviderCredentialProfileCommand = typeof ProviderCredentialProfileCommand.Type;
 
 export const PluginPublisher = Schema.Struct({
   publisherId: PluginPublisherId,

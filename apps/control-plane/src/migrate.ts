@@ -35,7 +35,7 @@ const migrate = async () => {
       "0004-cloud-thread-lifecycle.sql",
       "0005-worker-mtls.sql",
       "0006-github-thread-workflow.sql",
-      // 0007 is reserved for D1 in the integration branch.
+      "0007-provider-credential-profiles.sql",
       "0008-thread-route-generation.sql",
       "0009-github-worker-route-binding.sql",
       "0010-artifact-storage.sql",

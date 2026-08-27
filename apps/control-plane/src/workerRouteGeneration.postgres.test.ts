@@ -140,6 +140,22 @@ describe.skipIf(postgresUrl === undefined)("PostgreSQL thread route generation",
           );
           expect(rotated.routeGeneration).toBe(3);
           expect(rotated.leaseGeneration).toBe(2);
+          expect(yield* repository.validateActiveLease(rotated)).toMatchObject({
+            certificateFingerprint: rotated.certificateFingerprint,
+            certificateGeneration: rotated.certificateGeneration,
+            leaseGeneration: rotated.leaseGeneration,
+            routeGeneration: rotated.routeGeneration,
+            state: "connected",
+          });
+          yield* repository.fenceSandbox(
+            rotated.workspaceId,
+            rotated.sandboxId,
+            "replacement",
+            instant,
+          );
+          expect((yield* repository.validateActiveLease(rotated).pipe(Effect.exit))._tag).toBe(
+            "Failure",
+          );
 
           const stale = yield* Effect.exit(
             repository.activateLease(firstCertificate, "replica-stale", instant),

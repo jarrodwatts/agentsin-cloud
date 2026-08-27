@@ -44,6 +44,8 @@ export type WorkerCommandClaim = "execute" | "completed" | "in-flight";
  * second command frame until it has finished the first one.
  */
 export interface WorkerRelayConnection {
+  /** TLS-exported, connection-bound key; connector zeroizes it on close. */
+  readonly credentialChannelKey: Uint8Array;
   readonly receive: Effect.Effect<Option.Option<Uint8Array>, WorkerRelayError>;
   readonly claimCommand: (
     command: CloudThreadCommand,

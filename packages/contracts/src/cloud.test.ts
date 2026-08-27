@@ -5,6 +5,8 @@ import {
   AgentConnection,
   AgentConnectionAdapterExchange,
   AgentConnectionBeginLoginResult,
+  AgentConnectionLoginEvents,
+  AgentConnectionMaterializeRequest,
   AgentConnectionMaterializeResult,
   AgentConnectionPollLoginResult,
   AgentConnectionProfile,
@@ -32,6 +34,8 @@ import {
   PluginGrant,
   PluginManifest,
   PluginMcpServer,
+  ProviderCredentialBeginLoginCommand,
+  ProviderCredentialMaterializeCommand,
   SandboxProviderCapabilities,
   SandboxProviderExecuteResult,
   SandboxProviderPortsResult,
@@ -58,6 +62,16 @@ const decodeGitHubWorkflowCommand = Schema.decodeUnknownSync(GitHubThreadWorkflo
 const decodeGitHubWorkflowView = Schema.decodeUnknownSync(GitHubThreadWorkflowView);
 const decodeDesktopAuthInitiateRequest = Schema.decodeUnknownSync(DesktopAuthInitiateRequest);
 const decodeDesktopAuthExchangeRequest = Schema.decodeUnknownSync(DesktopAuthExchangeRequest);
+const decodeAgentConnectionLoginEvents = Schema.decodeUnknownSync(AgentConnectionLoginEvents);
+const decodeAgentConnectionMaterializeRequest = Schema.decodeUnknownSync(
+  AgentConnectionMaterializeRequest,
+);
+const decodeProviderCredentialBeginLoginCommand = Schema.decodeUnknownSync(
+  ProviderCredentialBeginLoginCommand,
+);
+const decodeProviderCredentialMaterializeCommand = Schema.decodeUnknownSync(
+  ProviderCredentialMaterializeCommand,
+);
 
 describe("desktop auth handoff contracts", () => {
   it("accepts canonical S256 PKCE inputs", () => {
@@ -836,27 +850,36 @@ describe("cloud lifecycle records", () => {
     const profile = decodeAgentConnectionProfile({
       profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
-      driver: "codex",
+      provider: { instanceId: "codex_work", driver: "codex" },
       label: "Work account",
-      sealedCredentialRef: "secrets/agent-profiles/profile-1",
       state: "active",
+      keyVersion: "kms-v1",
       createdAt: NOW,
       updatedAt: NOW,
     });
     const begin = decodeAgentConnectionBeginLoginResult({
       loginId: "login-1",
+      profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
-      driver: "codex",
+      provider: { instanceId: "codex_work", driver: "codex" },
       method: "browser",
-      authorizationUrl: "https://example.test/authorize",
+      events: [
+        {
+          sequence: 0,
+          occurredAt: NOW,
+          type: "authorizationUrl",
+          authorizationUrl: "https://example.test/authorize",
+        },
+      ],
       expiresAt: "2026-08-27T12:05:00.000Z",
       pollAfterMs: 1000,
     });
     const poll = decodeAgentConnectionPollLoginResult({
       status: "authorized",
       loginId: "login-1",
+      profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
-      credentialHandle: "ephemeral/login-1",
+      events: [],
     });
     const sealed = decodeAgentConnectionSealProfileResult({
       workspaceId: WORKSPACE_ID,
@@ -866,7 +889,9 @@ describe("cloud lifecycle records", () => {
       materializationId: "materialization-1",
       profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
+      threadId: "thread-1",
       environmentId: "environment-1",
+      sandboxId: "sandbox-1",
       materializationRef: "sandbox-secrets/materialization-1",
       materializedAt: NOW,
     });
@@ -908,8 +933,9 @@ describe("cloud lifecycle records", () => {
       result: {
         status: "authorized",
         loginId: "login-1",
+        profileId: "profile-1",
         workspaceId: WORKSPACE_ID,
-        credentialHandle: "ephemeral/login-1",
+        events: [],
       },
     } as const;
 
@@ -924,6 +950,105 @@ describe("cloud lifecycle records", () => {
       decodeAgentConnectionAdapterExchange({
         ...exchange,
         result: { ...exchange.result, loginId: "login-2" },
+      }),
+    ).toThrow();
+  });
+
+  it("bounds sanitized login events and binds materialization authorization to its workspace", () => {
+    expect(() =>
+      decodeAgentConnectionLoginEvents([
+        {
+          sequence: 1,
+          occurredAt: NOW,
+          type: "authorizationUrl",
+          authorizationUrl: "https://provider.example/authorize",
+        },
+        {
+          sequence: 1,
+          occurredAt: NOW,
+          type: "status",
+          status: "waiting",
+        },
+      ]),
+    ).toThrow();
+    expect(() =>
+      decodeAgentConnectionLoginEvents([
+        {
+          sequence: 0,
+          occurredAt: NOW,
+          type: "authorizationUrl",
+          authorizationUrl: "https://user:password@provider.example/authorize",
+        },
+      ]),
+    ).toThrow();
+    expect(() =>
+      decodeAgentConnectionMaterializeRequest({
+        requestId: "command-1",
+        workspaceId: WORKSPACE_ID,
+        requestedAt: NOW,
+        profileId: "profile-1",
+        targetPath: ".config/provider/auth.json",
+        authorization: {
+          workspaceId: "workspace-2",
+          authSessionId: "session-1",
+          threadId: "thread-1",
+          environmentId: "environment-1",
+          sandboxId: "sandbox-1",
+          provider: { instanceId: "codex_work", driver: "codex" },
+          authorizedAt: NOW,
+          expiresAt: "2026-08-27T12:05:00.000Z",
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects materialization identifiers that are not one bounded path component", () => {
+    const base = {
+      requestId: "command-1",
+      threadId: "thread-1",
+      profileId: "profile-1",
+    };
+    for (const materializationId of [
+      "../outside",
+      "x/../../../etc",
+      "x\\outside",
+      ".",
+      "-leading",
+      "x\0outside",
+      `x${"a".repeat(96)}`,
+    ]) {
+      expect(() =>
+        decodeProviderCredentialMaterializeCommand({ ...base, materializationId }),
+      ).toThrow();
+    }
+    expect(
+      decodeProviderCredentialMaterializeCommand({
+        ...base,
+        materializationId: "materialization_01-valid",
+      }).materializationId,
+    ).toBe("materialization_01-valid");
+  });
+
+  it("keeps hosted provider credential commands identifier-only", () => {
+    expect(
+      decodeProviderCredentialBeginLoginCommand({
+        requestId: "command-1",
+        threadId: "thread-1",
+        providerInstanceId: "codex_work",
+      }),
+    ).toEqual({
+      requestId: "command-1",
+      threadId: "thread-1",
+      providerInstanceId: "codex_work",
+    });
+    expect(() =>
+      decodeProviderCredentialBeginLoginCommand({
+        requestId: "command-1",
+        threadId: "thread-1",
+        providerInstanceId: "codex_work",
+        workspaceId: WORKSPACE_ID,
+        expiresAt: NOW,
+        authorization: { userId: "attacker" },
       }),
     ).toThrow();
   });

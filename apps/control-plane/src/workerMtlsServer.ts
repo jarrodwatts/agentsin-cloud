@@ -6,6 +6,7 @@ import type * as NodeHttp from "node:http";
 import type * as NodeStream from "node:stream";
 import type * as NodeTls from "node:tls";
 
+import { CREDENTIAL_CHANNEL_EXPORTER_LABEL } from "@t3tools/contracts/credential-binary";
 import {
   WorkerCertificateBootstrapRequest,
   WorkerCertificateRotationRequest,
@@ -213,7 +214,11 @@ const rawData = (data: RawData): Uint8Array => {
   return data instanceof ArrayBuffer ? new Uint8Array(data) : data;
 };
 
-const adaptWebSocket = (webSocket: WebSocket): WorkerRelaySocket => ({
+const adaptWebSocket = (
+  webSocket: WebSocket,
+  credentialChannelKey: Uint8Array,
+): WorkerRelaySocket => ({
+  credentialChannelKey,
   send: (payload, complete) => {
     if (webSocket.readyState !== WebSocket.OPEN) {
       complete(new Error("socket is not open"));
@@ -232,8 +237,12 @@ const adaptWebSocket = (webSocket: WebSocket): WorkerRelaySocket => ({
     return () => webSocket.off("message", receive);
   },
   onClose: (listener) => {
-    webSocket.on("close", listener);
-    return () => webSocket.off("close", listener);
+    const close = () => {
+      credentialChannelKey.fill(0);
+      listener();
+    };
+    webSocket.on("close", close);
+    return () => webSocket.off("close", close);
   },
 });
 
@@ -412,9 +421,17 @@ export const createWorkerMtlsServer = (options: CreateWorkerMtlsServerOptions) =
             activeConnections -= 1;
           });
           webSockets.emit("connection", webSocket, request);
-          void Effect.runPromise(options.relay.open(certificate, adaptWebSocket(webSocket))).catch(
-            () => webSocket.close(1011, "relay_open_failed"),
+          const credentialChannelKey = tlsSocket.exportKeyingMaterial(
+            32,
+            CREDENTIAL_CHANNEL_EXPORTER_LABEL,
+            Buffer.alloc(0),
           );
+          void Effect.runPromise(
+            options.relay.open(certificate, adaptWebSocket(webSocket, credentialChannelKey)),
+          ).catch(() => {
+            credentialChannelKey.fill(0);
+            webSocket.close(1011, "relay_open_failed");
+          });
         });
       },
       () => {

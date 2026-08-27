@@ -20,6 +20,8 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import {
+  AgentMaterializationId,
+  AgentProfileId,
   CloudThreadCommand,
   CloudThreadEvent,
   EnvironmentRevisionId,
@@ -276,12 +278,89 @@ export const WorkerRelayShutdown = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type WorkerRelayShutdown = typeof WorkerRelayShutdown.Type;
 
+/**
+ * Non-durable, mTLS-only control messages. The relay must never enqueue,
+ * recover, log, or persist these frames. Generation is checked again by both
+ * worker and control plane before a result can become authoritative.
+ */
+export const WorkerProviderCredentialCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("provider.credentials.command"),
+    operation: Schema.Literal("materialize"),
+    operationId: AgentMaterializationId,
+    routeGeneration: PositiveInt,
+    profileId: AgentProfileId,
+    profileGeneration: PositiveInt,
+    providerInstanceId: ProviderInstanceId,
+    providerDriver: ProviderDriverKind,
+    authorizationExpiresAt: IsoDateTime,
+    credentialPayloadBytes: PositiveInt,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider.credentials.command"),
+    operation: Schema.Literal("cleanup"),
+    operationId: AgentMaterializationId,
+    routeGeneration: PositiveInt,
+    profileId: AgentProfileId,
+    profileGeneration: PositiveInt,
+    providerInstanceId: ProviderInstanceId,
+    providerDriver: ProviderDriverKind,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider.credentials.command"),
+    operation: Schema.Literal("lease.arm"),
+    operationId: AgentMaterializationId,
+    routeGeneration: PositiveInt,
+    profileId: AgentProfileId,
+    profileGeneration: PositiveInt,
+    providerInstanceId: ProviderInstanceId,
+    providerDriver: ProviderDriverKind,
+    authorizationExpiresAt: IsoDateTime,
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerProviderCredentialCommand = typeof WorkerProviderCredentialCommand.Type;
+
+export const WorkerProviderCredentialResult = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("provider.credentials.result"),
+    operation: Schema.Literal("materialize"),
+    operationId: AgentMaterializationId,
+    routeGeneration: PositiveInt,
+    profileGeneration: PositiveInt,
+    outcome: Schema.Literals(["materialized", "absent", "failed"]),
+    errorCode: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(100))),
+    occurredAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider.credentials.result"),
+    operation: Schema.Literal("lease.arm"),
+    operationId: AgentMaterializationId,
+    routeGeneration: PositiveInt,
+    profileGeneration: PositiveInt,
+    outcome: Schema.Literals(["armed", "absent", "failed"]),
+    errorCode: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(100))),
+    occurredAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider.credentials.result"),
+    operation: Schema.Literal("cleanup"),
+    operationId: AgentMaterializationId,
+    routeGeneration: PositiveInt,
+    profileGeneration: PositiveInt,
+    outcome: Schema.Literals(["absent", "failed"]),
+    errorCode: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(100))),
+    occurredAt: IsoDateTime,
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerProviderCredentialResult = typeof WorkerProviderCredentialResult.Type;
+
 export const WorkerRelayInbound = Schema.Union([
   WorkerRelayCommandDelivery,
   WorkerRelayGitHubCommandDelivery,
   WorkerRelayEventConfirmation,
   WorkerRelayReplayComplete,
   WorkerRelayShutdown,
+  WorkerProviderCredentialCommand,
 ]);
 export type WorkerRelayInbound = typeof WorkerRelayInbound.Type;
 
@@ -431,5 +510,6 @@ export const WorkerRelayOutbound = Schema.Union([
   WorkerRelayReady,
   WorkerRelayFailure,
   WorkerRelayGitHubCommandResult,
+  WorkerProviderCredentialResult,
 ]);
 export type WorkerRelayOutbound = typeof WorkerRelayOutbound.Type;

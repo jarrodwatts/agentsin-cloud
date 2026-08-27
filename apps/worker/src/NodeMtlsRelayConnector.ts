@@ -5,6 +5,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeHttps from "node:https";
 import * as NodeTls from "node:tls";
 
+import { CREDENTIAL_CHANNEL_EXPORTER_LABEL } from "@t3tools/contracts/credential-binary";
 import {
   WorkerCertificateGrant,
   WorkerCommandClaimResponse,
@@ -265,7 +266,10 @@ export const makeNodeMtlsRelayConnector = (
       Effect.acquireRelease(
         Effect.gen(function* () {
           const credential = yield* ensureCredential(input);
-          const socket = yield* Effect.callback<WebSocket, WorkerRelayError>((resume) => {
+          const connected = yield* Effect.callback<
+            { readonly socket: WebSocket; readonly credentialChannelKey: Uint8Array },
+            WorkerRelayError
+          >((resume) => {
             const clientOptions: WebSocket.ClientOptions = {
               cert: credential.grant.certificateChainPem,
               key: credential.privateKeyPem,
@@ -281,8 +285,25 @@ export const makeNodeMtlsRelayConnector = (
             };
             const webSocket = new WebSocket(input.identity.relayEndpoint, clientOptions);
             const opened = () => {
-              cleanup();
-              resume(Effect.succeed(webSocket));
+              try {
+                const tlsSocket = (
+                  webSocket as WebSocket & { readonly _socket?: NodeTls.TLSSocket }
+                )._socket;
+                if (tlsSocket === undefined || !tlsSocket.authorized) {
+                  throw new Error("authenticated TLS socket unavailable");
+                }
+                const credentialChannelKey = tlsSocket.exportKeyingMaterial(
+                  32,
+                  CREDENTIAL_CHANNEL_EXPORTER_LABEL,
+                  Buffer.alloc(0),
+                );
+                cleanup();
+                resume(Effect.succeed({ socket: webSocket, credentialChannelKey }));
+              } catch (cause) {
+                cleanup();
+                webSocket.terminate();
+                resume(Effect.fail(failure("credential-channel", false, cause)));
+              }
             };
             const failed = (cause: Error) => {
               cleanup();
@@ -299,6 +320,7 @@ export const makeNodeMtlsRelayConnector = (
               webSocket.terminate();
             });
           });
+          const { socket, credentialChannelKey } = connected;
 
           const queue: Array<Uint8Array> = [];
           const outboundBudget = makeOutboundFrameBudget(limits);
@@ -312,17 +334,20 @@ export const makeNodeMtlsRelayConnector = (
             () => socket.close(4001, "certificate_rotation"),
             rotationDelay,
           );
-          socket.on("message", (data, binary) => {
-            if (binary || closed) {
-              socket.close(4400, "invalid_relay_frame");
-              return;
-            }
+          const clearInboundQueue = () => {
+            for (const frame of queue) frame.fill(0);
+            queue.length = 0;
+            queuedBytes = 0;
+          };
+          socket.on("message", (data, _binary) => {
+            if (closed) return;
             const frame = rawData(data);
             if (
               frame.byteLength > limits.maxFrameBytes ||
               queue.length >= limits.maxQueuedFrames ||
               queuedBytes + frame.byteLength > limits.maxQueuedBytes
             ) {
+              frame.fill(0);
               socket.close(4413, "relay_queue_full");
               return;
             }
@@ -337,6 +362,8 @@ export const makeNodeMtlsRelayConnector = (
           });
           socket.once("close", () => {
             closed = true;
+            credentialChannelKey.fill(0);
+            clearInboundQueue();
             clearTimeout(rotation);
             outboundBudget.clear();
             if (pending !== undefined) {
@@ -347,6 +374,7 @@ export const makeNodeMtlsRelayConnector = (
           });
 
           const connection: WorkerRelayConnection = {
+            credentialChannelKey,
             receive: Effect.callback((resume) => {
               const frame = queue.shift();
               if (frame !== undefined) {
@@ -405,6 +433,8 @@ export const makeNodeMtlsRelayConnector = (
               }),
             close: Effect.sync(() => {
               clearTimeout(rotation);
+              credentialChannelKey.fill(0);
+              clearInboundQueue();
               if (socket.readyState === WebSocket.OPEN) socket.close(1000, "worker_closing");
               else if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
             }),
