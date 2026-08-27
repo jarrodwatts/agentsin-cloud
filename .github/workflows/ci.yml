@@ -88,6 +88,59 @@ jobs:
       - name: Test
         run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' test
 
+  test_control_plane_coordination:
+    name: Test Control Plane Coordination
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: agentsin_test
+          POSTGRES_PASSWORD: agentsin_test
+          POSTGRES_USER: agentsin_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentsin_test -d agentsin_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Exercise the real Valkey adapter
+        working-directory: apps/control-plane
+        env:
+          AGENTSIN_TEST_VALKEY_URL: redis://127.0.0.1:6379/15
+          AGENTSIN_TEST_POSTGRES_URL: postgresql://agentsin_test:agentsin_test@127.0.0.1:5432/agentsin_test
+        run: >-
+          vp test run
+          src/valkeyCoordination.integration.test.ts
+          src/workerRouteGeneration.postgres.test.ts
+
   # apps/server sets `fileParallelism: false`, so its 239 files run strictly
   # one at a time. Sharding spreads them over separate runners instead of
   # separate workers, so no two server test files ever share a machine and the

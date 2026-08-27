@@ -52,6 +52,8 @@ export interface ActiveWorkerLease extends WorkerIdentity {
   readonly certificateFingerprint: string;
   readonly certificateGeneration: number;
   readonly leaseGeneration: number;
+  /** Durable monotonic fence allocated in workspace+thread route scope. */
+  readonly routeGeneration: number;
   readonly processInstanceId: string;
   readonly state: "connected" | "disconnected" | "timed_out" | "fenced";
   readonly connectedAt: string;

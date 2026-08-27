@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 
 import type { ControlPlaneConfigShape } from "./config.ts";
 import type { DatabaseService } from "./database.ts";
+import type { EphemeralCoordinationService } from "./ephemeralCoordination.ts";
 import {
   makeWorkerIdentityService,
   type CertificateSigner,
@@ -18,6 +19,10 @@ import { makeThreadEventStoreWorkerLifecycleRecorder } from "./workerLifecycle.t
 import { makeWorkerBootstrapHandler } from "./workerMtlsServer.ts";
 import { makeWorkerRelay, type WorkerRecoverySource, type WorkerRelay } from "./workerRelay.ts";
 import type { ThreadEventStoreService } from "./threadEventStore.ts";
+import {
+  CloudThreadLifecycleDependencyError,
+  type WorkerRouteLifecycle,
+} from "./cloudThreadLifecycle.ts";
 
 /**
  * The certificate issuer is implemented by the deployment's KMS adapter. The
@@ -43,21 +48,24 @@ export class WorkerProductionConfigurationError extends Schema.TaggedErrorClass<
 export interface WorkerControlPlaneRuntime {
   readonly identities: ReturnType<typeof makeWorkerIdentityService>;
   readonly relay: WorkerRelay;
+  readonly routeLifecycle: WorkerRouteLifecycle;
   readonly workerBootstrap: {
     readonly handleHttp: ReturnType<typeof makeWorkerBootstrapHandler>;
   };
 }
 
 /**
- * Compose the authoritative Postgres identity/lifecycle service and the
- * replaceable in-process route table. Only the TLS-authenticated principal is
- * passed to C3's recovery source; worker frames cannot supply identity fields.
+ * Compose the authoritative Postgres identity/lifecycle service, process-local
+ * live socket table, and ephemeral cross-replica route mirror. Only the
+ * TLS-authenticated principal is passed to C3's recovery source; worker frames
+ * cannot supply identity fields.
  */
 export const makeWorkerControlPlaneRuntime = (input: {
   readonly config: ControlPlaneConfigShape;
   readonly database: DatabaseService;
   readonly threadEvents: ThreadEventStoreService;
   readonly production: WorkerProductionDependencies;
+  readonly coordination: EphemeralCoordinationService;
 }): Effect.Effect<WorkerControlPlaneRuntime, WorkerProductionConfigurationError> =>
   Effect.gen(function* () {
     if (input.production.signer.kmsKeyId !== input.config.workerCertificateSignerKmsKeyId) {
@@ -83,11 +91,33 @@ export const makeWorkerControlPlaneRuntime = (input: {
       identities,
       recovery: input.production.recovery,
       processInstanceId: input.config.workerProcessInstanceId,
+      coordination: input.coordination,
     });
+    const routeLifecycle: WorkerRouteLifecycle = {
+      fenceSandboxForReplacement: (request) =>
+        relay
+          .fenceSandboxForReplacement(
+            request.workspaceId,
+            request.threadId,
+            request.sandboxId,
+            request.reason,
+          )
+          .pipe(
+            Effect.mapError(
+              () =>
+                new CloudThreadLifecycleDependencyError({
+                  code: "worker-route-fence-failed",
+                  retryable: true,
+                  outcome: "uncertain",
+                }),
+            ),
+          ),
+    };
 
     return {
       identities,
       relay,
+      routeLifecycle,
       workerBootstrap: {
         handleHttp: makeWorkerBootstrapHandler({ identities }),
       },

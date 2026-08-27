@@ -1,11 +1,14 @@
 import { expect, it } from "@effect/vitest";
 import { WorkerCertificateBootstrapRequest } from "@t3tools/contracts/worker";
+import type { ThreadId } from "@t3tools/contracts";
+import type { SandboxId, WorkspaceId } from "@t3tools/contracts/cloud";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { Pool } from "pg";
 
 import { type ControlPlaneConfigShape } from "./config.ts";
 import { type DatabaseService } from "./database.ts";
+import { makeMemoryEphemeralCoordination } from "./ephemeralCoordination.ts";
 import { makeApplication } from "./main.ts";
 import { type ThreadEventStoreService } from "./threadEventStore.ts";
 import {
@@ -59,6 +62,7 @@ const threadEvents = {
   submitCommand: () => Effect.die("not used by the health-route composition test"),
   replayAfter: () => Effect.die("not used by the health-route composition test"),
 } as unknown as ThreadEventStoreService;
+const coordination = makeMemoryEphemeralCoordination().service;
 
 const workerProduction: WorkerProductionDependencies = {
   signer: {
@@ -88,7 +92,13 @@ it.effect("wires auth, services, and HTTP routes without opening a listener", ()
         query: <Row>() => Effect.succeed([] as ReadonlyArray<Row>),
         ping: Effect.void,
       };
-      const application = makeApplication({ config, database, workspaces, threadEvents });
+      const application = makeApplication({
+        config,
+        database,
+        workspaces,
+        threadEvents,
+        coordination,
+      });
       const response = yield* Effect.promise(() =>
         application.handle(new Request("https://control.example.com/healthz")),
       );
@@ -122,6 +132,7 @@ it.effect(
           database,
           threadEvents,
           production: workerProduction,
+          coordination,
         });
         const application = makeApplication({
           config,
@@ -129,6 +140,7 @@ it.effect(
           workspaces,
           threadEvents,
           worker,
+          coordination,
         });
         const response = yield* Effect.promise(() =>
           application.handle(
@@ -174,10 +186,97 @@ it.effect("fails closed when the injected signer does not match the configured K
             ...workerProduction,
             signer: { ...workerProduction.signer, kmsKeyId: "kms://unexpected-key" },
           },
+          coordination,
         }),
       );
 
       expect(result._tag).toBe("Failure");
     }),
   ),
+);
+
+it.effect(
+  "composes transient replacement and terminal coordination with the worker lifecycle",
+  () =>
+    Effect.gen(function* () {
+      const pool = {
+        connect: async () => ({
+          query: async () => ({ rows: [] }),
+          release: () => undefined,
+        }),
+      } as unknown as Pool;
+      const database: DatabaseService = {
+        pool,
+        query: <Row>() => Effect.succeed([] as ReadonlyArray<Row>),
+        ping: Effect.void,
+      };
+      const coordinationHarness = makeMemoryEphemeralCoordination();
+      const worker = yield* makeWorkerControlPlaneRuntime({
+        config,
+        database,
+        threadEvents,
+        production: workerProduction,
+        coordination: coordinationHarness.service,
+      });
+      const workspaceId = "00000000-0000-4000-8000-000000000001" as WorkspaceId;
+      const threadId = "composition-thread" as ThreadId;
+      const sandboxId = "composition-sandbox" as SandboxId;
+      const route = {
+        workspaceId,
+        threadId,
+        connectionId: "connection-1",
+        processInstanceId: config.workerProcessInstanceId,
+        generation: 1,
+        ttlMs: 5_000,
+      };
+      yield* coordinationHarness.service.publishRoute(route);
+      yield* worker.relay.pauseThread(workspaceId, threadId);
+      expect(yield* coordinationHarness.service.getRoute(workspaceId, threadId)).toBeUndefined();
+
+      yield* coordinationHarness.service.publishRoute({
+        ...route,
+        connectionId: "connection-2",
+        generation: 2,
+      });
+      coordinationHarness.setAvailable(false);
+      yield* worker.routeLifecycle.fenceSandboxForReplacement({
+        workspaceId,
+        threadId,
+        sandboxId,
+        reason: "sandbox_replaced",
+      });
+      coordinationHarness.setAvailable(true);
+      expect(
+        yield* coordinationHarness.service.publishRoute({
+          ...route,
+          connectionId: "connection-3",
+          generation: 3,
+        }),
+      ).toBe("refreshed");
+      expect(yield* coordinationHarness.service.getRoute(workspaceId, threadId)).toMatchObject({
+        connectionId: "connection-3",
+        generation: 3,
+      });
+
+      coordinationHarness.setAvailable(false);
+      expect(
+        (yield* Effect.exit(
+          worker.relay.retireThreadTerminal(workspaceId, threadId, sandboxId, "thread_destroyed"),
+        ))._tag,
+      ).toBe("Failure");
+      coordinationHarness.setAvailable(true);
+      yield* worker.relay.retireThreadTerminal(
+        workspaceId,
+        threadId,
+        sandboxId,
+        "thread_destroyed",
+      );
+      expect(
+        yield* coordinationHarness.service.publishRoute({
+          ...route,
+          connectionId: "stale-worker",
+          generation: 999,
+        }),
+      ).toBe("stale");
+    }),
 );

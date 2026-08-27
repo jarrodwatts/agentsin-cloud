@@ -177,6 +177,16 @@ export interface WorkerConnectionGateway {
   ) => Effect.Effect<VerifiedWorkerPrincipal, CloudThreadLifecycleDependencyError>;
 }
 
+/** C3 invokes this only after it has selected the current sandbox for replacement cleanup. */
+export interface WorkerRouteLifecycle {
+  readonly fenceSandboxForReplacement: (input: {
+    readonly workspaceId: WorkspaceId;
+    readonly threadId: ThreadId;
+    readonly sandboxId: SandboxProviderSandbox["sandboxId"];
+    readonly reason: string;
+  }) => Effect.Effect<void, CloudThreadLifecycleDependencyError>;
+}
+
 export interface VerifiedWorkerPrincipal {
   /** Lifecycle attempt ID. Each replacement worker gets a new immutable generation. */
   readonly generation: string;
@@ -216,6 +226,7 @@ export interface CloudThreadLifecycleDependencies {
   readonly reservations: SandboxReservationInspector;
   readonly bootstrapIssuer: WorkerBootstrapIssuer;
   readonly workerGateway: WorkerConnectionGateway;
+  readonly workerRoutes: WorkerRouteLifecycle;
   readonly clock: CloudThreadLifecycleClock;
   readonly stepLeaseMs?: number;
 }
@@ -375,6 +386,23 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
     const now = iso(dependencies.clock.now());
     if (attempt.sandboxId === undefined) {
       return yield* storeEffect(() => dependencies.lifecycle.markFailed(attempt, now, errorCode));
+    }
+    const fenced = yield* Effect.result(
+      dependencies.workerRoutes.fenceSandboxForReplacement({
+        workspaceId: attempt.workspaceId,
+        threadId: attempt.threadId,
+        sandboxId: attempt.sandboxId,
+        reason: `compensate:${errorCode}`,
+      }),
+    );
+    if (Result.isFailure(fenced)) {
+      return yield* storeEffect(() =>
+        dependencies.lifecycle.markCleanupRequired(
+          attempt,
+          now,
+          `${errorCode}:worker-fence-uncertain`,
+        ),
+      );
     }
     const destroyed = yield* Effect.result(
       dependencies.sandbox.destroy({

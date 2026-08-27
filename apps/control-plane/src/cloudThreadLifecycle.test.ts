@@ -350,10 +350,13 @@ const makeHarness = () => {
   let destroyCalls = 0;
   let bootstrapCalls = 0;
   let startCalls = 0;
+  let routeFenceCalls = 0;
   let inspectStatus: "running" | "absent" | "unknown" = "absent";
   let createFailure: { code: string; retryable: boolean } | undefined;
   let bootstrapFailure: CloudThreadLifecycleDependencyError | undefined;
   let startFailure: CloudThreadLifecycleDependencyError | undefined;
+  let routeFenceFailure: CloudThreadLifecycleDependencyError | undefined;
+  const compensationOrder: Array<"fence" | "destroy"> = [];
   let verifiedPrincipal: VerifiedWorkerPrincipal | undefined;
   let createGate: Promise<void> | undefined;
   const reservations = new Map<
@@ -447,6 +450,7 @@ const makeHarness = () => {
         completedAt: NOW,
       }),
     destroy: (request) => {
+      compensationOrder.push("destroy");
       destroyCalls += 1;
       return Effect.succeed({
         type: "destroyed" as const,
@@ -611,6 +615,18 @@ const makeHarness = () => {
               }),
             ),
     },
+    workerRoutes: {
+      fenceSandboxForReplacement: () => {
+        routeFenceCalls += 1;
+        compensationOrder.push("fence");
+        if (routeFenceFailure !== undefined) {
+          const failure = routeFenceFailure;
+          routeFenceFailure = undefined;
+          return Effect.fail(failure);
+        }
+        return Effect.void;
+      },
+    },
     clock,
     stepLeaseMs: 1_000,
   });
@@ -620,7 +636,8 @@ const makeHarness = () => {
     lifecycle,
     clock,
     reservations,
-    counts: () => ({ createCalls, destroyCalls, bootstrapCalls, startCalls }),
+    counts: () => ({ createCalls, destroyCalls, bootstrapCalls, startCalls, routeFenceCalls }),
+    compensationOrder: () => compensationOrder,
     setCreateFailure: (failure: { code: string; retryable: boolean }) => {
       createFailure = failure;
     },
@@ -629,6 +646,9 @@ const makeHarness = () => {
     },
     setStartFailure: (failure: CloudThreadLifecycleDependencyError) => {
       startFailure = failure;
+    },
+    setRouteFenceFailure: (failure: CloudThreadLifecycleDependencyError) => {
+      routeFenceFailure = failure;
     },
     setInspectStatus: (status: typeof inspectStatus) => {
       inspectStatus = status;
@@ -723,6 +743,51 @@ it.effect("retries an idempotent bootstrap failure without replacing the sandbox
     const retry = yield* harness.service.createThread("user-1", createInput());
     expect(retry.state).toBe("ready");
     expect(harness.counts()).toMatchObject({ createCalls: 1, bootstrapCalls: 2, startCalls: 1 });
+  }),
+);
+
+it.effect("fences transient worker routing before compensation destroys a sandbox", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    harness.setBootstrapFailure(
+      new CloudThreadLifecycleDependencyError({
+        code: "worker-bootstrap-invalid",
+        retryable: false,
+        outcome: "confirmed",
+      }),
+    );
+
+    const result = yield* harness.service.createThread("user-1", createInput());
+
+    expect(result.state).toBe("failed");
+    expect(harness.compensationOrder()).toEqual(["fence", "destroy"]);
+    expect(harness.counts()).toMatchObject({ routeFenceCalls: 1, destroyCalls: 1 });
+  }),
+);
+
+it.effect("preserves the sandbox cleanup fence when worker route fencing is uncertain", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    harness.setBootstrapFailure(
+      new CloudThreadLifecycleDependencyError({
+        code: "worker-bootstrap-invalid",
+        retryable: false,
+        outcome: "confirmed",
+      }),
+    );
+    harness.setRouteFenceFailure(
+      new CloudThreadLifecycleDependencyError({
+        code: "worker-route-fence-failed",
+        retryable: true,
+        outcome: "uncertain",
+      }),
+    );
+
+    const result = yield* harness.service.createThread("user-1", createInput());
+
+    expect(result.state).toBe("cleanup_required");
+    expect(harness.compensationOrder()).toEqual(["fence"]);
+    expect(harness.counts()).toMatchObject({ routeFenceCalls: 1, destroyCalls: 0 });
   }),
 );
 

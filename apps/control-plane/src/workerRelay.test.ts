@@ -5,6 +5,10 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Result from "effect/Result";
 import type { WorkerRelayOutbound } from "@t3tools/contracts/worker";
+import {
+  makeMemoryEphemeralCoordination,
+  type EphemeralCoordinationService,
+} from "./ephemeralCoordination.ts";
 
 import {
   WorkerIdentityError,
@@ -106,8 +110,11 @@ const makeHarness = (input?: {
     message: WorkerRelayOutbound,
   ) => Effect.Effect<WorkerOutboundAcceptance, WorkerRelayServerError>;
   readonly onSaveCursors?: () => void;
+  readonly coordination?: EphemeralCoordinationService;
+  readonly fencedIdentities?: ReadonlyArray<WorkerCertificateRecord>;
 }) => {
   let generation = 0;
+  let routeGeneration = 0;
   let heartbeatSequence = 0;
   let disconnects = 0;
   let processRecoveries = 0;
@@ -122,6 +129,7 @@ const makeHarness = (input?: {
         ...record,
         processInstanceId,
         leaseGeneration: ++generation,
+        routeGeneration: ++routeGeneration,
         state: "connected" as const,
         connectedAt: "2026-08-27T13:00:00.000Z",
         lastSeenAt: "2026-08-27T13:00:00.000Z",
@@ -144,7 +152,7 @@ const makeHarness = (input?: {
         disconnects += 1;
         return true;
       }),
-    fenceSandbox: () => Effect.succeed([]),
+    fenceSandbox: () => Effect.succeed(input?.fencedIdentities ?? []),
     clock: { now: Effect.succeed("2026-08-27T13:00:00.000Z") },
     repository: {
       saveCursors: (lease: object, cursors: (typeof savedCursors)[number]) =>
@@ -192,6 +200,7 @@ const makeHarness = (input?: {
     recovery,
     processInstanceId: "railway-replica-1",
     limits: { heartbeatTimeoutMs: input?.heartbeatTimeoutMs ?? 45_000 },
+    ...(input?.coordination === undefined ? {} : { coordination: input.coordination }),
   });
   return {
     relay,
@@ -213,6 +222,7 @@ it("keeps the newer route when an older connection finishes activation late", ()
     lastSeenAt: "2026-08-27T13:00:00.000Z",
     heartbeatSequence: 0,
     confirmedEventCursor: 7,
+    routeGeneration: 1,
   };
   const newer = {
     lease: { ...lease, leaseGeneration: 3 },
@@ -253,6 +263,204 @@ it.effect(
       secondConnection.close();
       expect(harness.relay.routes.size()).toBe(0);
     }),
+);
+
+it.effect("publishes only authenticated active sockets into cross-replica routing", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination().service;
+    const harness = makeHarness({ coordination });
+    const socket = new FakeSocket();
+    const connection = yield* harness.relay.open(certificate, socket);
+
+    expect(
+      yield* coordination.getRoute(certificate.workspaceId, certificate.threadId),
+    ).toMatchObject({
+      processInstanceId: "railway-replica-1",
+      generation: connection.lease.routeGeneration,
+    });
+    connection.close();
+  }),
+);
+
+it.effect(
+  "fails connection activation closed without displacing local routing on Valkey loss",
+  () =>
+    Effect.gen(function* () {
+      const coordination = makeMemoryEphemeralCoordination();
+      coordination.setAvailable(false);
+      const harness = makeHarness({ coordination: coordination.service });
+      const socket = new FakeSocket();
+
+      expect((yield* Effect.exit(harness.relay.open(certificate, socket)))._tag).toBe("Failure");
+      expect(socket.closes).toContainEqual({ code: 1011, reason: "route_publish_failed" });
+      expect(harness.relay.routes.size()).toBe(0);
+    }),
+);
+
+it.effect("retires ephemeral thread state only after authoritative sandbox fencing", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination().service;
+    const harness = makeHarness({ coordination, fencedIdentities: [certificate] });
+    const socket = new FakeSocket();
+    yield* harness.relay.open(certificate, socket);
+
+    yield* harness.relay.retireThreadTerminal(
+      certificate.workspaceId,
+      certificate.threadId,
+      certificate.sandboxId,
+      "destroyed",
+    );
+
+    expect(
+      yield* coordination.getRoute(certificate.workspaceId, certificate.threadId),
+    ).toBeUndefined();
+    expect(
+      yield* coordination.publishRoute({
+        workspaceId: certificate.workspaceId,
+        threadId: certificate.threadId,
+        connectionId: "stale-worker",
+        processInstanceId: "stale-replica",
+        generation: 99,
+        ttlMs: 1_000,
+      }),
+    ).toBe("stale");
+  }),
+);
+
+it.effect("pause and resume clear only transient routing and allocate a newer route fence", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination().service;
+    const harness = makeHarness({ coordination });
+    const first = new FakeSocket();
+    const firstConnection = yield* harness.relay.open(certificate, first);
+    yield* harness.relay.pauseThread(certificate.workspaceId, certificate.threadId);
+
+    expect(first.closes).toContainEqual({ code: 4003, reason: "worker_paused" });
+    expect(
+      yield* coordination.getRoute(certificate.workspaceId, certificate.threadId),
+    ).toBeUndefined();
+
+    const resumed = yield* harness.relay.open(certificate, new FakeSocket());
+    expect(resumed.lease.routeGeneration).toBeGreaterThan(firstConnection.lease.routeGeneration);
+    expect(
+      yield* coordination.getRoute(certificate.workspaceId, certificate.threadId),
+    ).toMatchObject({ generation: resumed.lease.routeGeneration });
+  }),
+);
+
+it.effect("replacement sandbox publishes immediately and permanently fences the old worker", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination().service;
+    const harness = makeHarness({ coordination, fencedIdentities: [certificate] });
+    const first = yield* harness.relay.open(certificate, new FakeSocket());
+    yield* harness.relay.fenceSandboxForReplacement(
+      certificate.workspaceId,
+      certificate.threadId,
+      certificate.sandboxId,
+      "sandbox_replaced",
+    );
+
+    const replacementCertificate = {
+      ...certificate,
+      sandboxId: "sandbox-2",
+      reservationId: "command-reserve-2",
+      workerId: "worker-2",
+      certificateFingerprint: "bb",
+      identityBinding: "replacement-binding",
+    } as WorkerCertificateRecord;
+    const replacement = yield* harness.relay.open(replacementCertificate, new FakeSocket());
+    expect(replacement.lease.routeGeneration).toBeGreaterThan(first.lease.routeGeneration);
+    expect(
+      yield* coordination.getRoute(certificate.workspaceId, certificate.threadId),
+    ).toMatchObject({
+      connectionId: `worker-2:${replacement.lease.leaseGeneration}`,
+      generation: replacement.lease.routeGeneration,
+    });
+    expect(
+      yield* coordination.publishRoute({
+        workspaceId: certificate.workspaceId,
+        threadId: certificate.threadId,
+        connectionId: `worker-1:${first.lease.leaseGeneration}`,
+        processInstanceId: "railway-replica-1",
+        generation: first.lease.routeGeneration,
+        ttlMs: 1_000,
+      }),
+    ).toBe("stale");
+  }),
+);
+
+it.effect("replacement recovers from Valkey loss without terminally retiring the thread", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination();
+    const harness = makeHarness({
+      coordination: coordination.service,
+      fencedIdentities: [certificate],
+    });
+    const first = yield* harness.relay.open(certificate, new FakeSocket());
+    coordination.setAvailable(false);
+    yield* harness.relay.fenceSandboxForReplacement(
+      certificate.workspaceId,
+      certificate.threadId,
+      certificate.sandboxId,
+      "sandbox_replaced",
+    );
+    coordination.setAvailable(true);
+
+    const replacementCertificate = {
+      ...certificate,
+      sandboxId: "sandbox-2",
+      reservationId: "command-reserve-2",
+      workerId: "worker-2",
+      certificateFingerprint: "bb",
+      identityBinding: "replacement-binding",
+    } as WorkerCertificateRecord;
+    const replacement = yield* harness.relay.open(replacementCertificate, new FakeSocket());
+    expect(replacement.lease.routeGeneration).toBeGreaterThan(first.lease.routeGeneration);
+    expect(
+      yield* coordination.service.getRoute(certificate.workspaceId, certificate.threadId),
+    ).toMatchObject({ generation: replacement.lease.routeGeneration });
+  }),
+);
+
+it.effect("terminal retirement fails for retry on Valkey loss and tombstones after recovery", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination();
+    const harness = makeHarness({
+      coordination: coordination.service,
+      fencedIdentities: [certificate],
+    });
+    yield* harness.relay.open(certificate, new FakeSocket());
+    coordination.setAvailable(false);
+
+    expect(
+      (yield* Effect.exit(
+        harness.relay.retireThreadTerminal(
+          certificate.workspaceId,
+          certificate.threadId,
+          certificate.sandboxId,
+          "thread_destroyed",
+        ),
+      ))._tag,
+    ).toBe("Failure");
+
+    coordination.setAvailable(true);
+    yield* harness.relay.retireThreadTerminal(
+      certificate.workspaceId,
+      certificate.threadId,
+      certificate.sandboxId,
+      "thread_destroyed",
+    );
+    expect(
+      yield* coordination.service.publishRoute({
+        workspaceId: certificate.workspaceId,
+        threadId: certificate.threadId,
+        connectionId: "stale-worker",
+        processInstanceId: "stale-replica",
+        generation: 999,
+        ttlMs: 1_000,
+      }),
+    ).toBe("stale");
+  }),
 );
 
 it.effect("reconstructs routing from durable state after a relay process restart", () =>
@@ -361,6 +569,30 @@ it.effect("persists a valid C2 heartbeat and fails closed on a replayed sequence
     socket.emit({ type: "worker.heartbeat", heartbeatSequence: 1, health });
     yield* Effect.promise(() => socket.waitForClose());
     expect(socket.closes.at(-1)).toEqual({ code: 4400, reason: "invalid_worker_frame" });
+    connection.close();
+  }),
+);
+
+it.effect("keeps advisory presence fail-open for an already authenticated live socket", () =>
+  Effect.gen(function* () {
+    const coordination = makeMemoryEphemeralCoordination();
+    let handled: (() => void) | undefined;
+    const outbound = new Promise<void>((resolve) => {
+      handled = resolve;
+    });
+    const harness = makeHarness({
+      coordination: coordination.service,
+      onOutbound: () => handled?.(),
+    });
+    const socket = new FakeSocket();
+    const connection = yield* harness.relay.open(certificate, socket);
+    coordination.setAvailable(false);
+
+    socket.emit({ type: "worker.heartbeat", heartbeatSequence: 1, health });
+    yield* Effect.promise(() => outbound);
+
+    expect(harness.heartbeatSequence()).toBe(1);
+    expect(socket.closes).toEqual([]);
     connection.close();
   }),
 );

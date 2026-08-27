@@ -17,6 +17,7 @@
     "@t3tools/e2b-sandbox": "workspace:*",
     "better-auth": "catalog:",
     "effect": "catalog:",
+    "ioredis": "5.11.0",
     "pg": "catalog:",
     "ws": "8.21.0"
   },

@@ -14,6 +14,10 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  PRESENCE_HEARTBEAT_RATE_POLICY,
+  type EphemeralCoordinationService,
+} from "./ephemeralCoordination.ts";
+import {
   WorkerIdentityError,
   type ActiveWorkerLease,
   type WorkerCertificateRecord,
@@ -114,6 +118,11 @@ export interface WorkerRouteRegistry {
     sandboxId: WorkerIdentity["sandboxId"],
     reason: string,
   ) => void;
+  readonly closeThread: (
+    workspaceId: WorkerIdentity["workspaceId"],
+    threadId: WorkerIdentity["threadId"],
+    reason: string,
+  ) => void;
   readonly clear: () => void;
   readonly size: () => number;
 }
@@ -146,6 +155,13 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
       if (route === undefined) return;
       routes.delete(key(workspaceId, sandboxId));
       route.close(4003, reason);
+    },
+    closeThread: (workspaceId, threadId, reason) => {
+      for (const [routeKey, route] of routes) {
+        if (route.lease.workspaceId !== workspaceId || route.lease.threadId !== threadId) continue;
+        routes.delete(routeKey);
+        route.close(4003, reason);
+      }
     },
     clear: () => {
       for (const route of routes.values()) route.close(1012, "relay_restart");
@@ -246,6 +262,7 @@ export interface MakeWorkerRelayOptions {
   readonly recovery: WorkerRecoverySource;
   readonly processInstanceId?: string;
   readonly routes?: WorkerRouteRegistry;
+  readonly coordination?: EphemeralCoordinationService;
   readonly limits?: Partial<WorkerRelayLimits>;
 }
 
@@ -253,6 +270,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
   const routes = options.routes ?? makeInMemoryWorkerRouteRegistry();
   const limits = { ...DEFAULT_WORKER_RELAY_LIMITS, ...options.limits };
   const processInstanceId = options.processInstanceId ?? NodeCrypto.randomUUID();
+  const coordination = options.coordination;
 
   const open = (certificate: WorkerCertificateRecord, socket: WorkerRelaySocket) =>
     Effect.gen(function* () {
@@ -265,6 +283,20 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
       let processing = Promise.resolve();
 
       const writer = new BoundedWriter(socket, limits, () => close(4413, "slow_consumer"));
+      const routeConnectionId = `${lease.workerId}:${lease.leaseGeneration}`;
+
+      const removeEphemeralRoute = coordination?.removeRoute({
+        workspaceId: lease.workspaceId,
+        threadId: lease.threadId,
+        connectionId: routeConnectionId,
+        generation: lease.routeGeneration,
+      });
+      const removeEphemeralPresence = coordination?.removePresence({
+        workspaceId: lease.workspaceId,
+        threadId: lease.threadId,
+        connectionId: routeConnectionId,
+        generation: lease.routeGeneration,
+      });
 
       const cleanup = (state: "disconnected" | "timed_out") => {
         if (closed) return;
@@ -272,6 +304,12 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
         if (heartbeatDeadline !== undefined) clearTimeout(heartbeatDeadline);
         writer.dispose();
         routes.deactivate(lease);
+        if (removeEphemeralRoute !== undefined) {
+          void Effect.runPromise(removeEphemeralRoute.pipe(Effect.ignore));
+        }
+        if (removeEphemeralPresence !== undefined) {
+          void Effect.runPromise(removeEphemeralPresence.pipe(Effect.ignore));
+        }
         void Effect.runPromise(
           options.identities.disconnectLease(lease, state).pipe(Effect.ignore),
         );
@@ -318,6 +356,42 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
                   }),
               ),
             );
+            if (coordination !== undefined) {
+              // Presence is advisory: an established healthy socket remains usable during
+              // a transient Valkey outage, while its cross-replica route expires naturally.
+              yield* coordination
+                .publishRoute({
+                  workspaceId: lease.workspaceId,
+                  threadId: lease.threadId,
+                  connectionId: routeConnectionId,
+                  processInstanceId,
+                  generation: lease.routeGeneration,
+                  ttlMs: limits.heartbeatTimeoutMs,
+                })
+                .pipe(Effect.catch(() => Effect.void));
+              const presenceDecision = yield* coordination.consumeRateLimit({
+                workspaceId: lease.workspaceId,
+                subjectKind: "worker",
+                subjectId: lease.workerId,
+                policy: PRESENCE_HEARTBEAT_RATE_POLICY,
+              });
+              if (presenceDecision.allowed) {
+                yield* coordination
+                  .heartbeatPresence({
+                    workspaceId: lease.workspaceId,
+                    threadId: lease.threadId,
+                    connectionId: routeConnectionId,
+                    kind: "worker",
+                    generation: lease.routeGeneration,
+                    ttlMs: limits.heartbeatTimeoutMs,
+                  })
+                  .pipe(
+                    Effect.catch((error) =>
+                      error.code === "unavailable" ? Effect.void : Effect.fail(error),
+                    ),
+                  );
+              }
+            }
             armHeartbeatDeadline();
           }
 
@@ -409,6 +483,25 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
         });
       }
 
+      if (coordination !== undefined) {
+        const published = yield* coordination
+          .publishRoute({
+            workspaceId: lease.workspaceId,
+            threadId: lease.threadId,
+            connectionId: routeConnectionId,
+            processInstanceId,
+            generation: lease.routeGeneration,
+            ttlMs: limits.heartbeatTimeoutMs,
+          })
+          .pipe(Effect.tapError(() => Effect.sync(() => close(1011, "route_publish_failed"))));
+        if (published === "stale") {
+          close(4009, "worker_replaced");
+          return yield* new WorkerRelayServerError({
+            code: "leaseFenced",
+            operation: "publish-route",
+          });
+        }
+      }
       const route: ActiveWorkerRoute = {
         lease,
         send: (frame) => writer.send(frame),
@@ -486,24 +579,79 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
     Effect.tap(() => Effect.sync(() => routes.clear())),
   );
 
-  const fenceSandbox = (
+  const fenceSandboxForReplacement = (
     workspaceId: WorkerIdentity["workspaceId"],
+    threadId: WorkerIdentity["threadId"],
     sandboxId: WorkerIdentity["sandboxId"],
     reason: string,
   ) =>
-    options.identities
-      .fenceSandbox(workspaceId, sandboxId, reason)
-      .pipe(
-        Effect.tap(() =>
-          Effect.sync(() => routes.closeSandbox(workspaceId, sandboxId, "worker_fenced")),
-        ),
-      );
+    options.identities.fenceSandbox(workspaceId, sandboxId, reason).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => routes.closeSandbox(workspaceId, sandboxId, "worker_fenced")),
+      ),
+      Effect.tap((identities) =>
+        identities.some((identity) => identity.threadId !== threadId)
+          ? Effect.fail(
+              new WorkerRelayServerError({
+                code: "identityMismatch",
+                operation: "fence-sandbox-for-replacement",
+              }),
+            )
+          : Effect.void,
+      ),
+      Effect.tap(() =>
+        coordination === undefined
+          ? Effect.void
+          : coordination
+              .clearThreadTransient(workspaceId, threadId)
+              .pipe(
+                Effect.catch(() =>
+                  Effect.logWarning("Valkey transient cleanup failed after sandbox replacement"),
+                ),
+              ),
+      ),
+    );
+
+  const pauseThread = (
+    workspaceId: WorkerIdentity["workspaceId"],
+    threadId: WorkerIdentity["threadId"],
+  ) =>
+    Effect.sync(() => routes.closeThread(workspaceId, threadId, "worker_paused")).pipe(
+      Effect.andThen(
+        coordination === undefined
+          ? Effect.void
+          : coordination
+              .clearThreadTransient(workspaceId, threadId)
+              .pipe(
+                Effect.catch(() => Effect.logWarning("Valkey transient cleanup failed on pause")),
+              ),
+      ),
+    );
+
+  const retireThreadTerminal = (
+    workspaceId: WorkerIdentity["workspaceId"],
+    threadId: WorkerIdentity["threadId"],
+    sandboxId: WorkerIdentity["sandboxId"],
+    reason: string,
+  ) =>
+    options.identities.fenceSandbox(workspaceId, sandboxId, reason).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => routes.closeThread(workspaceId, threadId, "thread_retired")),
+      ),
+      Effect.andThen(
+        coordination === undefined
+          ? Effect.void
+          : coordination.retireThreadTerminal(workspaceId, threadId),
+      ),
+    );
 
   return {
     initialize,
     open,
     claimCommand,
-    fenceSandbox,
+    pauseThread,
+    fenceSandboxForReplacement,
+    retireThreadTerminal,
     routes,
     limits,
     processInstanceId,

@@ -17,6 +17,10 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import type { ControlPlaneAuth } from "./http.ts";
+import {
+  CONTROL_MUTATION_RATE_POLICY,
+  type EphemeralCoordinationService,
+} from "./ephemeralCoordination.ts";
 import { type ThreadEventStoreError, type ThreadEventStoreService } from "./threadEventStore.ts";
 import type { WorkspaceRepositoryService } from "./workspaces.ts";
 
@@ -103,6 +107,7 @@ export class CloudRpcError extends Schema.TaggedErrorClass<CloudRpcError>()("Clo
     "replayGap",
     "slowConsumer",
     "connectionLimit",
+    "rateLimited",
     "internalError",
   ]),
   status: Schema.Int,
@@ -133,12 +138,18 @@ export const isTrustedCloudRpcOrigin = (headers: Headers, hostedOrigin: string) 
   return origin === hostedOrigin || trustedDesktopOrigins.has(origin);
 };
 
-const jsonResponse = (body: unknown, status = 200, origin?: string) =>
+const jsonResponse = (
+  body: unknown,
+  status = 200,
+  origin?: string,
+  extraHeaders: Readonly<Record<string, string>> = {},
+) =>
   Response.json(body, {
     status,
     headers: {
       "cache-control": "no-store",
       "content-type": "application/json; charset=utf-8",
+      ...extraHeaders,
       ...(origin === undefined
         ? {}
         : {
@@ -295,6 +306,7 @@ export interface MakeCloudRpcOptions {
   readonly workspaces: WorkspaceRepositoryService;
   readonly eventStore: ThreadEventStoreService;
   readonly signals?: ThreadEventSignalHub;
+  readonly coordination?: EphemeralCoordinationService;
   readonly limits?: Partial<CloudRpcLimits>;
 }
 
@@ -394,6 +406,33 @@ export const makeCloudRpc = (options: MakeCloudRpcOptions) => {
         submitted.envelope.threadId !== routeThreadId
       ) {
         return yield* new CloudRpcError({ code: "notFound", status: 404, retryable: false });
+      }
+      if (options.coordination !== undefined) {
+        const decision = yield* options.coordination
+          .consumeRateLimit({
+            workspaceId: principal.workspaceId,
+            subjectKind: "user",
+            subjectId: principal.userId,
+            policy: CONTROL_MUTATION_RATE_POLICY,
+          })
+          .pipe(
+            Effect.mapError(
+              () =>
+                new CloudRpcError({
+                  code: "internalError",
+                  status: 503,
+                  retryable: true,
+                }),
+            ),
+          );
+        if (!decision.allowed) {
+          return jsonResponse(
+            { error: "rateLimited", retryable: true, retryAfterMs: decision.retryAfterMs },
+            429,
+            requestOrigin,
+            { "retry-after": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1_000))) },
+          );
+        }
       }
       const result = yield* options.eventStore
         .submitCommand({

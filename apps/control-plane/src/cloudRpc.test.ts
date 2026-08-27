@@ -12,6 +12,7 @@ import { vi } from "vite-plus/test";
 
 import type { ControlPlaneAuth } from "./http.ts";
 import { makeCloudRpc, makeThreadEventSignalHub, type CloudRpcSocket } from "./cloudRpc.ts";
+import { makeMemoryEphemeralCoordination } from "./ephemeralCoordination.ts";
 import { ThreadEventStoreError, type ThreadEventStoreService } from "./threadEventStore.ts";
 import type { WorkspaceRepositoryService } from "./workspaces.ts";
 
@@ -308,6 +309,55 @@ it.effect("authenticates B1 desktop bearers and preserves command idempotency", 
       (yield* Effect.promise(() => duplicate!.json())) as { disposition: string },
     ).toMatchObject({ disposition: "duplicate" });
     expect(store.commands).toHaveLength(1);
+  });
+});
+
+it.effect(
+  "fails closed before persistence when the production mutation limiter is unavailable",
+  () => {
+    const store = new FakeThreadStore();
+    const harness = makeMemoryEphemeralCoordination();
+    harness.setAvailable(false);
+    const rpc = makeCloudRpc({
+      auth: auth(),
+      hostedOrigin: "https://control.example.com",
+      workspaces,
+      eventStore: store.service,
+      coordination: harness.service,
+    });
+    return Effect.gen(function* () {
+      expect((yield* rpc.handleHttp(request(submission())))?.status).toBe(503);
+      expect(store.submitCalls).toBe(0);
+    });
+  },
+);
+
+it.effect("returns retry-after without persisting when the mutation boundary is exhausted", () => {
+  const store = new FakeThreadStore();
+  const base = makeMemoryEphemeralCoordination().service;
+  const rpc = makeCloudRpc({
+    auth: auth(),
+    hostedOrigin: "https://control.example.com",
+    workspaces,
+    eventStore: store.service,
+    coordination: {
+      ...base,
+      consumeRateLimit: () =>
+        Effect.succeed({
+          allowed: false,
+          limit: 60,
+          remaining: 0,
+          retryAfterMs: 12_345,
+          degraded: false,
+        }),
+    },
+  });
+  return Effect.gen(function* () {
+    const response = yield* rpc.handleHttp(request(submission()));
+    expect(response?.status).toBe(429);
+    expect(response?.headers.get("retry-after")).toBe("13");
+    expect(yield* Effect.promise(() => response!.json())).toMatchObject({ retryAfterMs: 12_345 });
+    expect(store.submitCalls).toBe(0);
   });
 });
 

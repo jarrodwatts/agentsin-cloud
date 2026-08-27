@@ -12,6 +12,10 @@ import { makeCloudRpc, type ThreadEventSignalHub } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import { ControlPlaneConfig, layer as controlPlaneConfigLayer } from "./config.ts";
 import { Database, layer as databaseLayer } from "./database.ts";
+import {
+  EphemeralCoordination,
+  type EphemeralCoordinationService,
+} from "./ephemeralCoordination.ts";
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
 import {
   layer as threadEventStoreLayer,
@@ -31,6 +35,7 @@ import {
   type WorkerProductionDependencies,
 } from "./workerProduction.ts";
 import { loadWorkerMtlsTlsOptions } from "./workerTlsFiles.ts";
+import { productionLayer as valkeyProductionLayer } from "./valkeyCoordination.ts";
 
 const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -351,7 +356,9 @@ const persistenceLayer = Layer.merge(workspaceRepositoryLayer, threadEventStoreL
   Layer.provideMerge(databaseLayer),
 );
 
-export const runtimeLayer = persistenceLayer.pipe(Layer.provideMerge(controlPlaneConfigLayer));
+export const runtimeLayer = Layer.merge(persistenceLayer, valkeyProductionLayer).pipe(
+  Layer.provideMerge(controlPlaneConfigLayer),
+);
 
 export interface ControlPlaneApplicationDependencies {
   readonly config: import("./config.ts").ControlPlaneConfigShape;
@@ -360,6 +367,7 @@ export interface ControlPlaneApplicationDependencies {
   readonly threadEvents: ThreadEventStoreService;
   readonly threadEventSignals?: ThreadEventSignalHub;
   readonly worker?: WorkerControlPlaneRuntime;
+  readonly coordination: EphemeralCoordinationService;
 }
 
 /**
@@ -374,6 +382,7 @@ export const makeApplication = ({
   threadEvents,
   threadEventSignals,
   worker,
+  coordination,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
@@ -396,6 +405,7 @@ export const makeApplication = ({
     hostedOrigin: config.betterAuthUrl.origin,
     workspaces,
     eventStore: threadEvents,
+    coordination,
     ...(threadEventSignals === undefined ? {} : { signals: threadEventSignals }),
   });
 
@@ -426,11 +436,14 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
     const database = yield* Database;
     const workspaces = yield* WorkspaceRepository;
     const threadEvents = yield* ThreadEventStore;
+    const coordination = yield* EphemeralCoordination;
+    yield* coordination.ping;
     const worker = yield* makeWorkerControlPlaneRuntime({
       config,
       database,
       threadEvents,
       production,
+      coordination,
     });
     yield* worker.relay.initialize;
 
@@ -450,6 +463,7 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
       workspaces,
       threadEvents,
       worker,
+      coordination,
     });
     const server = yield* Effect.acquireRelease(
       listen(config, config.betterAuthUrl, handle),

@@ -99,6 +99,7 @@ interface LeaseRow extends QueryResultRow {
   readonly certificate_fingerprint: string;
   readonly certificate_generation: string;
   readonly lease_generation: string;
+  readonly route_generation: string;
   readonly process_instance_id: string;
   readonly state: ActiveWorkerLease["state"];
   readonly connected_at: string;
@@ -154,6 +155,7 @@ const leaseFromRow = (row: LeaseRow): ActiveWorkerLease => ({
   certificateFingerprint: row.certificate_fingerprint,
   certificateGeneration: Number(row.certificate_generation),
   leaseGeneration: Number(row.lease_generation),
+  routeGeneration: Number(row.route_generation),
   processInstanceId: row.process_instance_id,
   state: row.state,
   connectedAt: row.connected_at,
@@ -168,7 +170,8 @@ const leaseFromRow = (row: LeaseRow): ActiveWorkerLease => ({
 const leaseReturning = `RETURNING workspace_id::text, thread_id, environment_id,
   environment_revision_id, sandbox_id, reservation_id, worker_id,
   provider_instance_id, provider_driver, certificate_fingerprint,
-  certificate_generation::text, lease_generation::text, process_instance_id,
+  certificate_generation::text, lease_generation::text, route_generation::text,
+  process_instance_id,
   state, connected_at::text, last_seen_at::text, heartbeat_sequence::text,
   confirmed_event_cursor::text, last_command_delivery_id`;
 
@@ -286,17 +289,35 @@ export const makePostgresWorkerIdentityRepository = (
       ),
     ),
   activateLease: (certificate, processInstanceId, now) =>
-    query<LeaseRow>(
-      database,
-      "activate-worker-lease",
-      `INSERT INTO cloud_worker_lease (
+    transaction(database, "activate-worker-lease", (client) =>
+      Effect.gen(function* () {
+        const generations = yield* clientQuery<{ readonly generation: string } & QueryResultRow>(
+          client,
+          "allocate-thread-route-generation",
+          `INSERT INTO cloud_thread_route_generation
+            (workspace_id, thread_id, generation, updated_at)
+           VALUES ($1, $2, 1, $3::timestamptz)
+           ON CONFLICT (workspace_id, thread_id) DO UPDATE SET
+             generation = cloud_thread_route_generation.generation + 1,
+             updated_at = EXCLUDED.updated_at
+           RETURNING generation::text`,
+          [certificate.workspaceId, certificate.threadId, now],
+        );
+        const routeGeneration = Number(generations[0]?.generation);
+        if (!Number.isSafeInteger(routeGeneration) || routeGeneration < 1) {
+          return yield* fail("allocate-thread-route-generation", undefined, "storeFailed");
+        }
+        const rows = yield* clientQuery<LeaseRow>(
+          client,
+          "activate-worker-lease",
+          `INSERT INTO cloud_worker_lease (
         workspace_id, sandbox_id, thread_id, environment_id, environment_revision_id,
         reservation_id, worker_id, provider_instance_id, provider_driver,
-        certificate_fingerprint, certificate_generation, lease_generation,
+        certificate_fingerprint, certificate_generation, lease_generation, route_generation,
         process_instance_id, state, connected_at, last_seen_at,
         heartbeat_sequence, confirmed_event_cursor
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,$12,'connected',
-        $13::timestamptz,$13::timestamptz,0,-1)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,$12,$13,'connected',
+        $14::timestamptz,$14::timestamptz,0,-1)
       ON CONFLICT (workspace_id, sandbox_id) DO UPDATE SET
         thread_id = EXCLUDED.thread_id,
         environment_id = EXCLUDED.environment_id,
@@ -308,33 +329,35 @@ export const makePostgresWorkerIdentityRepository = (
         certificate_fingerprint = EXCLUDED.certificate_fingerprint,
         certificate_generation = EXCLUDED.certificate_generation,
         lease_generation = cloud_worker_lease.lease_generation + 1,
+        route_generation = EXCLUDED.route_generation,
         process_instance_id = EXCLUDED.process_instance_id,
         state = 'connected', connected_at = EXCLUDED.connected_at,
         last_seen_at = EXCLUDED.last_seen_at, disconnected_at = NULL,
         heartbeat_sequence = 0, fence_reason = NULL
       WHERE EXCLUDED.certificate_generation >= cloud_worker_lease.certificate_generation
       ${leaseReturning}`,
-      [
-        certificate.workspaceId,
-        certificate.sandboxId,
-        certificate.threadId,
-        certificate.environmentId,
-        certificate.environmentRevisionId,
-        certificate.reservationId,
-        certificate.workerId,
-        certificate.providerInstanceId,
-        certificate.providerDriver,
-        certificate.certificateFingerprint,
-        certificate.certificateGeneration,
-        processInstanceId,
-        now,
-      ],
-    ).pipe(
-      Effect.flatMap((rows) =>
-        rows[0] === undefined
-          ? Effect.fail(fail("activate-worker-lease", undefined, "staleCertificate"))
-          : Effect.succeed(leaseFromRow(rows[0])),
-      ),
+          [
+            certificate.workspaceId,
+            certificate.sandboxId,
+            certificate.threadId,
+            certificate.environmentId,
+            certificate.environmentRevisionId,
+            certificate.reservationId,
+            certificate.workerId,
+            certificate.providerInstanceId,
+            certificate.providerDriver,
+            certificate.certificateFingerprint,
+            certificate.certificateGeneration,
+            routeGeneration,
+            processInstanceId,
+            now,
+          ],
+        );
+        const row = rows[0];
+        return row === undefined
+          ? yield* fail("activate-worker-lease", undefined, "staleCertificate")
+          : leaseFromRow(row);
+      }),
     ),
   heartbeat: (lease, heartbeatSequence, now) =>
     query<LeaseRow>(

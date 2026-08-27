@@ -64,6 +64,7 @@ const makeRepository = (): WorkerIdentityRepository & {
   const tokens = new Map<string, WorkerBootstrapTokenRecord & { consumed?: boolean }>();
   const certificateRecords = new Map<string, WorkerCertificateRecord>();
   const leases = new Map<string, ActiveWorkerLease>();
+  const routeGenerations = new Map<string, number>();
   const attempted = <A>(operation: string, use: () => A) =>
     Effect.try({
       try: use,
@@ -128,6 +129,8 @@ const makeRepository = (): WorkerIdentityRepository & {
           ...certificate,
           processInstanceId,
           leaseGeneration: (previous?.leaseGeneration ?? 0) + 1,
+          routeGeneration:
+            (routeGenerations.get(`${certificate.workspaceId}\0${certificate.threadId}`) ?? 0) + 1,
           state: "connected",
           connectedAt: now,
           lastSeenAt: now,
@@ -137,6 +140,10 @@ const makeRepository = (): WorkerIdentityRepository & {
             ? {}
             : { lastCommandDeliveryId: previous.lastCommandDeliveryId }),
         };
+        routeGenerations.set(
+          `${certificate.workspaceId}\0${certificate.threadId}`,
+          lease.routeGeneration,
+        );
         leases.set(certificate.sandboxId, lease);
         return lease;
       }),
