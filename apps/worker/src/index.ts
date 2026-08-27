@@ -21,7 +21,32 @@ export {
   WorkerSecretLeaseError,
   WorkerStoppedError,
 } from "./errors.ts";
-export { processTermination, runWorkerMain, type WorkerProcessOptions } from "./main.ts";
+export {
+  WORKER_EXECUTION_MODE_ENV,
+  WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV,
+  processTermination,
+  runWorkerMain,
+  selectWorkerProcessDependencies,
+  type WorkerProcessOptions,
+} from "./main.ts";
+export {
+  generateWorkerKeyPair,
+  makeNodeWorkerMtlsCredentialStore,
+  persistBootstrappedWorkerMtlsCredential,
+  workerMtlsBootstrapTokenPath,
+  workerMtlsCertificatePath,
+  type WorkerMtlsCredential,
+  type WorkerMtlsCredentialStore,
+  type WorkerMtlsFileHandle,
+  type WorkerMtlsFileSystem,
+} from "./MtlsCredentials.ts";
+export {
+  DEFAULT_NODE_MTLS_RELAY_LIMITS,
+  certificateSpkiPin,
+  makeNodeMtlsRelayConnector,
+  type MakeNodeMtlsRelayConnectorOptions,
+  type NodeMtlsRelayLimits,
+} from "./NodeMtlsRelayConnector.ts";
 export type {
   WorkerClock,
   WorkerCommandClaim,

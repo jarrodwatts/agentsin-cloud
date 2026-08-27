@@ -11,6 +11,12 @@ const validEnv = {
   GITHUB_CLIENT_SECRET: "github-client-secret",
   DESKTOP_AUTH_CALLBACK_URL: "agentsincloud://auth/callback",
   DESKTOP_AUTH_HANDOFF_SECRET: "a-separate-handoff-secret-that-is-at-least-32-characters",
+  WORKER_MTLS_PORT: "9443",
+  WORKER_MTLS_SERVER_CERT_FILE: "/run/secrets/worker-server.crt",
+  WORKER_MTLS_SERVER_KEY_FILE: "/run/secrets/worker-server.key",
+  WORKER_MTLS_CLIENT_CA_FILE: "/run/secrets/worker-client-ca.crt",
+  WORKER_PROCESS_INSTANCE_ID: "railway-replica-1",
+  WORKER_CERTIFICATE_SIGNER_KMS_KEY_ID: "kms://worker-issuer-production",
 };
 
 it.effect("loads typed configuration and applies safe defaults", () =>
@@ -29,6 +35,8 @@ it.effect("loads typed configuration and applies safe defaults", () =>
     expect(config.maxRequestBodyBytes).toBe(1_024 * 1_024);
     expect(config.requestTimeoutMs).toBe(15_000);
     expect(config.headersTimeoutMs).toBe(10_000);
+    expect(config.workerMtlsPort).toBe(9443);
+    expect(config.workerProcessInstanceId).toBe("railway-replica-1");
   }),
 );
 
@@ -54,6 +62,30 @@ it.effect("rejects missing provider credentials instead of starting partially co
     const result = yield* Effect.exit(fromEnv(withoutGitHubSecret));
 
     expect(result._tag).toBe("Failure");
+  }),
+);
+
+it.effect("rejects missing worker TLS and KMS signer configuration", () =>
+  Effect.gen(function* () {
+    const { WORKER_MTLS_SERVER_KEY_FILE: _key, ...withoutKey } = validEnv;
+    const { WORKER_CERTIFICATE_SIGNER_KMS_KEY_ID: _kms, ...withoutKms } = validEnv;
+
+    expect((yield* Effect.exit(fromEnv(withoutKey)))._tag).toBe("Failure");
+    expect((yield* Effect.exit(fromEnv(withoutKms)))._tag).toBe("Failure");
+  }),
+);
+
+it.effect("rejects relative or parent-traversing worker TLS secret paths", () =>
+  Effect.gen(function* () {
+    const relative = yield* Effect.exit(
+      fromEnv({ ...validEnv, WORKER_MTLS_SERVER_KEY_FILE: "run/secrets/server.key" }),
+    );
+    const traversing = yield* Effect.exit(
+      fromEnv({ ...validEnv, WORKER_MTLS_SERVER_KEY_FILE: "/../tmp/server.key" }),
+    );
+
+    expect(relative._tag).toBe("Failure");
+    expect(traversing._tag).toBe("Failure");
   }),
 );
 

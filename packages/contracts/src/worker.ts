@@ -52,6 +52,22 @@ const WssEndpoint = TrimmedNonEmptyString.check(
   Schema.isMaxLength(2048),
   Schema.isPattern(/^wss:\/\/[^\s]+$/),
 );
+const HttpsEndpoint = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(2048),
+  Schema.isPattern(/^https:\/\/[^\s]+$/),
+);
+const Sha256Pin = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(128),
+  Schema.isPattern(/^sha256\/[A-Za-z0-9+/]{43}=$/),
+);
+const Base64Der = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(16 * 1024),
+  Schema.isPattern(/^[A-Za-z0-9+/]+={0,2}$/),
+);
+const PemCertificateChain = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(64 * 1024),
+  Schema.isPattern(/^-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTIFICATE-----$/),
+);
 
 /**
  * Immutable identity and opaque credential references placed in a sealed file
@@ -66,18 +82,58 @@ export const WorkerBootstrap = Schema.Struct({
   environmentRevisionId: EnvironmentRevisionId,
   threadId: ThreadId,
   sandboxId: SandboxId,
+  /** C1's durable one-sandbox-per-thread reservation. */
+  reservationId: CommandId,
   provider: Schema.Struct({
     instanceId: ProviderInstanceId,
     driver: ProviderDriverKind,
   }).annotate({ parseOptions: { onExcessProperty: "error" } }),
   workspaceDirectory: TrimmedNonEmptyString.check(Schema.isMaxLength(4096)),
+  bootstrapEndpoint: HttpsEndpoint,
   relayEndpoint: WssEndpoint,
+  /** Pin for the direct Railway TLS service, independent from Web PKI rotation. */
+  relayServerSpkiSha256: Sha256Pin,
   relayCredentialRef: WorkerRelayCredentialRef,
   secretLeaseRef: WorkerSecretLeaseRef,
   issuedAt: IsoDateTime,
   expiresAt: IsoDateTime,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type WorkerBootstrap = typeof WorkerBootstrap.Type;
+
+/** Secret-bearing, single-use exchange request. Never persist or log this frame. */
+export const WorkerCertificateBootstrapRequest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  token: TrimmedNonEmptyString.check(Schema.isMinLength(32), Schema.isMaxLength(4096)),
+  publicKeySpkiDerBase64: Base64Der,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerCertificateBootstrapRequest = typeof WorkerCertificateBootstrapRequest.Type;
+
+export const WorkerCertificateRotationRequest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  publicKeySpkiDerBase64: Base64Der,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerCertificateRotationRequest = typeof WorkerCertificateRotationRequest.Type;
+
+export const WorkerCertificateGrant = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  certificateChainPem: PemCertificateChain,
+  notBefore: IsoDateTime,
+  notAfter: IsoDateTime,
+  rotateAfter: IsoDateTime,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerCertificateGrant = typeof WorkerCertificateGrant.Type;
+
+export const WorkerCommandClaimRequest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  command: CloudThreadCommand,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerCommandClaimRequest = typeof WorkerCommandClaimRequest.Type;
+
+export const WorkerCommandClaimResponse = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  claim: Schema.Literals(["execute", "completed", "in-flight"]),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerCommandClaimResponse = typeof WorkerCommandClaimResponse.Type;
 
 export const WorkerRelayCommandDelivery = Schema.Struct({
   type: Schema.Literal("thread.command"),

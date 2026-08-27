@@ -4,10 +4,34 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import { WORKER_BOOTSTRAP_FILE_ENV, type WorkerBootstrapFileSource } from "./bootstrap.ts";
-import { runWorkerMain } from "./main.ts";
+import {
+  WORKER_EXECUTION_MODE_ENV,
+  WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV,
+  runWorkerMain,
+  selectWorkerProcessDependencies,
+} from "./main.ts";
 import type { CloudWorkerDependencies } from "./CloudWorker.ts";
 
-const bootstrapText = `{"schemaVersion":1,"workerId":"worker-1","workspaceId":"workspace-1","environmentId":"environment-1","environmentRevisionId":"revision-1","threadId":"thread-1","sandboxId":"sandbox-1","provider":{"instanceId":"codex_personal","driver":"codex"},"workspaceDirectory":"/workspace/project","relayEndpoint":"wss://control.example.com/worker","relayCredentialRef":"relay-ref-1","secretLeaseRef":"lease-ref-1","issuedAt":"2026-08-27T00:25:00.000Z","expiresAt":"2026-08-27T00:40:00.000Z"}`;
+const bootstrapText = `{"schemaVersion":1,"workerId":"worker-1","workspaceId":"workspace-1","environmentId":"environment-1","environmentRevisionId":"revision-1","threadId":"thread-1","sandboxId":"sandbox-1","reservationId":"command-reserve-1","provider":{"instanceId":"codex_personal","driver":"codex"},"workspaceDirectory":"/workspace/project","bootstrapEndpoint":"https://control.example.com/api/v1/worker-certificates/bootstrap","relayEndpoint":"wss://control.example.com/worker","relayServerSpkiSha256":"sha256/47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=","relayCredentialRef":"relay-ref-1","secretLeaseRef":"lease-ref-1","issuedAt":"2026-08-27T00:25:00.000Z","expiresAt":"2026-08-27T00:40:00.000Z"}`;
+
+it.effect("selects the concrete Node mTLS relay only in fail-closed hosted mode", () =>
+  Effect.gen(function* () {
+    const injectedRelay = {} as CloudWorkerDependencies["relay"];
+    const dependencies = { relay: injectedRelay } as CloudWorkerDependencies;
+    const hosted = yield* selectWorkerProcessDependencies(dependencies, {
+      [WORKER_EXECUTION_MODE_ENV]: "hosted",
+      [WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV]: "/run/agentsin/mtls",
+    });
+    expect(hosted.relay).not.toBe(injectedRelay);
+
+    const missingDirectory = yield* Effect.result(
+      selectWorkerProcessDependencies(dependencies, {
+        [WORKER_EXECUTION_MODE_ENV]: "hosted",
+      }),
+    );
+    expect(missingDirectory._tag).toBe("Failure");
+  }),
+);
 
 it.effect("interrupts provider work and scrubs leased credentials on termination", () =>
   Effect.gen(function* () {

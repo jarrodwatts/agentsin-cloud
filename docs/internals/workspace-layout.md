@@ -21,6 +21,8 @@ the task commands.
   sandbox. It validates sealed thread identity, adapts the existing T3 provider runtime, and relays
   provider events outbound. Durable ordering, identity, and command receipts remain control-plane
   responsibilities.
+- `apps/control-plane`: hosted auth, durable thread state, desktop RPC, and the dedicated direct-TLS
+  worker ingress described in [worker mTLS and recovery](./worker-mtls.md).
 
 ## packages
 

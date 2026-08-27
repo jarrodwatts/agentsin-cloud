@@ -763,6 +763,9 @@ importers:
       effect:
         specifier: 4.0.0-beta.103
         version: 4.0.0-beta.103(patch_hash=af36b7948b6f9c56623074662b51dade5699880c1a7c71245de73e13c3185fb6)
+      ws:
+        specifier: 8.21.0
+        version: 8.21.0(bufferutil@4.1.0)(utf-8-validate@6.0.6)
     devDependencies:
       '@effect/vitest':
         specifier: 4.0.0-beta.103
@@ -770,6 +773,9 @@ importers:
       '@types/node':
         specifier: 24.12.4
         version: 24.12.4
+      '@types/ws':
+        specifier: 8.18.1
+        version: 8.18.1
       '@typescript/native-preview':
         specifier: 'catalog:'
         version: 7.0.0-dev.20260604.1

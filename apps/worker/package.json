@@ -20,11 +20,13 @@
   "dependencies": {
     "@effect/platform-node": "catalog:",
     "@t3tools/contracts": "workspace:*",
-    "effect": "catalog:"
+    "effect": "catalog:",
+    "ws": "8.21.0"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
+    "@types/ws": "8.18.1",
     "@typescript/native-preview": "catalog:",
     "vite-plus": "catalog:"
   },

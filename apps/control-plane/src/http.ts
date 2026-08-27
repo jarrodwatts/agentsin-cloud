@@ -46,6 +46,9 @@ export interface RequestHandlerDependencies {
   readonly cloudRpc?: {
     readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
   };
+  readonly workerBootstrap?: {
+    readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
+  };
 }
 
 class RequestHandlerError extends Schema.TaggedErrorClass<RequestHandlerError>()(
@@ -247,6 +250,11 @@ const dispatch = (request: Request, dependencies: RequestHandlerDependencies) =>
     if (dependencies.cloudRpc !== undefined) {
       const cloudResponse = yield* dependencies.cloudRpc.handleHttp(request);
       if (cloudResponse !== undefined) return cloudResponse;
+    }
+
+    if (dependencies.workerBootstrap !== undefined) {
+      const workerResponse = yield* dependencies.workerBootstrap.handleHttp(request);
+      if (workerResponse !== undefined) return workerResponse;
     }
 
     return jsonResponse({ error: "not_found" }, 404);

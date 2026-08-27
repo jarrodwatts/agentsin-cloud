@@ -33,6 +33,7 @@ const migrate = async () => {
       "0002-cloud-thread-store.sql",
       "0003-thread-integrity-locks.sql",
       "0004-cloud-thread-lifecycle.sql",
+      "0005-worker-mtls.sql",
     ];
     for (const filename of applicationMigrations) {
       const migration = await NodeFSP.readFile(

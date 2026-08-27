@@ -58,6 +58,18 @@ const RequestBodyLimit = Schema.Int.check(
 );
 const RequestTimeout = Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 120_000 }));
 const HandoffTtl = Schema.Int.check(Schema.isBetween({ minimum: 60, maximum: 300 }));
+const AbsoluteSecretFile = Schema.Trimmed.check(
+  Schema.isMaxLength(4_096),
+  Schema.isPattern(/^\/.+$/),
+  Schema.makeFilter((path) =>
+    path.includes("\u0000") ? "secret file paths must not contain null bytes" : true,
+  ),
+  Schema.makeFilter((path) =>
+    path.split("/").includes("..")
+      ? "secret file paths must not traverse parent directories"
+      : true,
+  ),
+);
 
 export interface ControlPlaneConfigShape {
   readonly port: number;
@@ -75,6 +87,13 @@ export interface ControlPlaneConfigShape {
   readonly maxRequestBodyBytes: number;
   readonly requestTimeoutMs: number;
   readonly headersTimeoutMs: number;
+  readonly workerMtlsPort: number;
+  readonly workerMtlsHost: string;
+  readonly workerMtlsServerCertificateFile: string;
+  readonly workerMtlsServerKeyFile: string;
+  readonly workerMtlsClientCaFile: string;
+  readonly workerProcessInstanceId: string;
+  readonly workerCertificateSignerKmsKeyId: string;
 }
 
 export class ControlPlaneConfig extends Context.Service<
@@ -109,6 +128,21 @@ const baseEnvConfig = Config.all({
   headersTimeoutMs: Config.schema(RequestTimeout, "HEADERS_TIMEOUT_MS").pipe(
     Config.withDefault(10_000),
   ),
+  workerMtlsPort: Config.port("WORKER_MTLS_PORT"),
+  workerMtlsHost: Config.schema(NonEmptyString, "WORKER_MTLS_HOST").pipe(
+    Config.withDefault("0.0.0.0"),
+  ),
+  workerMtlsServerCertificateFile: Config.schema(
+    AbsoluteSecretFile,
+    "WORKER_MTLS_SERVER_CERT_FILE",
+  ),
+  workerMtlsServerKeyFile: Config.schema(AbsoluteSecretFile, "WORKER_MTLS_SERVER_KEY_FILE"),
+  workerMtlsClientCaFile: Config.schema(AbsoluteSecretFile, "WORKER_MTLS_CLIENT_CA_FILE"),
+  workerProcessInstanceId: Config.schema(NonEmptyString, "WORKER_PROCESS_INSTANCE_ID"),
+  workerCertificateSignerKmsKeyId: Config.schema(
+    NonEmptyString,
+    "WORKER_CERTIFICATE_SIGNER_KMS_KEY_ID",
+  ),
   passkeyRpName: Config.schema(NonEmptyString, "PASSKEY_RP_NAME").pipe(
     Config.withDefault("Agents in Cloud"),
   ),
@@ -125,6 +159,15 @@ const validatedEnvConfig = baseEnvConfig.pipe(
     }
     if (config.desktopAuthHandoffSecret === config.betterAuthSecret) {
       return invalid("DESKTOP_AUTH_HANDOFF_SECRET must be distinct from BETTER_AUTH_SECRET");
+    }
+    if (config.workerMtlsPort === config.port) {
+      return invalid("WORKER_MTLS_PORT must be distinct from PORT");
+    }
+    if (
+      config.workerMtlsServerKeyFile === config.workerMtlsServerCertificateFile ||
+      config.workerMtlsServerKeyFile === config.workerMtlsClientCaFile
+    ) {
+      return invalid("WORKER_MTLS_SERVER_KEY_FILE must be distinct from certificate files");
     }
     return Effect.succeed(config);
   }),

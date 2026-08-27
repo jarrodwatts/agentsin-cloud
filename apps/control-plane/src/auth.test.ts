@@ -21,6 +21,13 @@ const config: ControlPlaneConfigShape = {
   maxRequestBodyBytes: 1_024 * 1_024,
   requestTimeoutMs: 15_000,
   headersTimeoutMs: 10_000,
+  workerMtlsPort: 9443,
+  workerMtlsHost: "127.0.0.1",
+  workerMtlsServerCertificateFile: "/run/secrets/worker-server.crt",
+  workerMtlsServerKeyFile: "/run/secrets/worker-server.key",
+  workerMtlsClientCaFile: "/run/secrets/worker-client-ca.crt",
+  workerProcessInstanceId: "railway-replica-1",
+  workerCertificateSignerKmsKeyId: "kms://worker-issuer-production",
 };
 
 it.effect("configures GitHub, email/password, and passkeys without fallback credentials", () =>

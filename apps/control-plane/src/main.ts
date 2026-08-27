@@ -24,6 +24,13 @@ import {
   WorkspaceRepository,
   type WorkspaceRepositoryService,
 } from "./workspaces.ts";
+import { createWorkerMtlsServer } from "./workerMtlsServer.ts";
+import {
+  makeWorkerControlPlaneRuntime,
+  type WorkerControlPlaneRuntime,
+  type WorkerProductionDependencies,
+} from "./workerProduction.ts";
+import { loadWorkerMtlsTlsOptions } from "./workerTlsFiles.ts";
 
 const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -320,6 +327,26 @@ const listen = (
     catch: (cause) => new ServerStartupError({ cause }),
   });
 
+const listenWorkerMtls = (
+  workerMtls: ReturnType<typeof createWorkerMtlsServer>,
+  config: Pick<import("./config.ts").ControlPlaneConfigShape, "workerMtlsHost" | "workerMtlsPort">,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      new Promise<void>((resolve, reject) => {
+        const onError = (cause: Error) => reject(cause);
+        workerMtls.server.once("error", onError);
+        workerMtls.server.listen(config.workerMtlsPort, config.workerMtlsHost, () => {
+          workerMtls.server.removeListener("error", onError);
+          resolve();
+        });
+      }),
+    catch: (cause) => new ServerStartupError({ cause }),
+  });
+
+const closeWorkerMtls = (workerMtls: ReturnType<typeof createWorkerMtlsServer>) =>
+  Effect.tryPromise(() => workerMtls.close()).pipe(Effect.catch(() => Effect.void));
+
 const persistenceLayer = Layer.merge(workspaceRepositoryLayer, threadEventStoreLayer).pipe(
   Layer.provideMerge(databaseLayer),
 );
@@ -332,6 +359,7 @@ export interface ControlPlaneApplicationDependencies {
   readonly workspaces: WorkspaceRepositoryService;
   readonly threadEvents: ThreadEventStoreService;
   readonly threadEventSignals?: ThreadEventSignalHub;
+  readonly worker?: WorkerControlPlaneRuntime;
 }
 
 /**
@@ -345,6 +373,7 @@ export const makeApplication = ({
   workspaces,
   threadEvents,
   threadEventSignals,
+  worker,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
@@ -373,36 +402,90 @@ export const makeApplication = ({
   return {
     auth,
     cloudRpc,
-    handle: makeRequestHandler({ auth, config, database, workspaces, cloudRpc }),
+    handle: makeRequestHandler({
+      auth,
+      config,
+      database,
+      workspaces,
+      cloudRpc,
+      ...(worker === undefined ? {} : { workerBootstrap: worker.workerBootstrap }),
+    }),
   };
 };
 
-export const program = Effect.gen(function* () {
-  const config = yield* ControlPlaneConfig;
-  const database = yield* Database;
-  const workspaces = yield* WorkspaceRepository;
-  const threadEvents = yield* ThreadEventStore;
-  const { handle, cloudRpc } = makeApplication({ config, database, workspaces, threadEvents });
-  const server = yield* listen(config, config.betterAuthUrl, handle);
-  const cloudRpcWebSocket = attachCloudRpcWebSocket({
-    server,
-    rpc: cloudRpc,
-    baseUrl: config.betterAuthUrl,
-    authenticationTimeoutMs: config.requestTimeoutMs,
+/**
+ * Railway production composition. The ordinary HTTPS health/RPC listener and
+ * direct client-certificate TLS listener have independent ports and shutdown
+ * lifecycles. The caller must inject the deployment KMS signer plus C1/C3
+ * reservation/recovery boundaries; there is deliberately no development CA
+ * or permissive fallback.
+ */
+export const makeProgram = (production: WorkerProductionDependencies) =>
+  Effect.gen(function* () {
+    const config = yield* ControlPlaneConfig;
+    const database = yield* Database;
+    const workspaces = yield* WorkspaceRepository;
+    const threadEvents = yield* ThreadEventStore;
+    const worker = yield* makeWorkerControlPlaneRuntime({
+      config,
+      database,
+      threadEvents,
+      production,
+    });
+    yield* worker.relay.initialize;
+
+    const workerTls = yield* loadWorkerMtlsTlsOptions(config);
+    const workerMtls = createWorkerMtlsServer({
+      tls: workerTls,
+      identities: worker.identities,
+      relay: worker.relay,
+    });
+    yield* Effect.acquireRelease(listenWorkerMtls(workerMtls, config), () =>
+      closeWorkerMtls(workerMtls),
+    );
+
+    const { handle, cloudRpc } = makeApplication({
+      config,
+      database,
+      workspaces,
+      threadEvents,
+      worker,
+    });
+    const server = yield* Effect.acquireRelease(
+      listen(config, config.betterAuthUrl, handle),
+      (activeServer) =>
+        Effect.callback<void, never>((resume) => {
+          activeServer.close(() => resume(Effect.void));
+        }),
+    );
+    const cloudRpcWebSocket = attachCloudRpcWebSocket({
+      server,
+      rpc: cloudRpc,
+      baseUrl: config.betterAuthUrl,
+      authenticationTimeoutMs: config.requestTimeoutMs,
+    });
+
+    yield* Effect.addFinalizer(() => Effect.sync(() => cloudRpcWebSocket.detach()));
+    yield* Effect.logInfo("Control plane listeners ready", {
+      host: config.host,
+      port: config.port,
+      workerMtlsHost: config.workerMtlsHost,
+      workerMtlsPort: config.workerMtlsPort,
+    });
+    return yield* Effect.never;
   });
 
-  yield* Effect.addFinalizer(() =>
-    Effect.callback<void, never>((resume) => {
-      cloudRpcWebSocket.detach();
-      server.close(() => resume(Effect.void));
-    }),
-  );
-  yield* Effect.logInfo("Control plane listening", {
-    host: config.host,
-    port: config.port,
-  });
-  return yield* Effect.never;
-});
+/**
+ * The repository has no KMS vendor adapter or C1/C3 implementation yet. A
+ * deployment launcher must import `makeProgram` and supply those capabilities;
+ * running this module directly fails closed instead of minting development
+ * certificates or accepting unauthenticated workers.
+ */
+export const program = Effect.fail(
+  new ServerStartupError({
+    cause: "worker production dependencies are required; use makeProgram from the Railway launcher",
+  }),
+);
 
 if (import.meta.main) {
   program.pipe(Effect.scoped, Effect.provide(runtimeLayer), NodeRuntime.runMain);

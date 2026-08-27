@@ -1,11 +1,21 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
-import { WorkerBootstrap, WorkerEventCursor, WorkerRelayEventProposal } from "./worker.ts";
+import {
+  WorkerBootstrap,
+  WorkerCertificateBootstrapRequest,
+  WorkerCertificateGrant,
+  WorkerCommandClaimResponse,
+  WorkerEventCursor,
+  WorkerRelayEventProposal,
+} from "./worker.ts";
 
 const decodeBootstrap = Schema.decodeUnknownSync(WorkerBootstrap);
 const decodeEventProposal = Schema.decodeUnknownSync(WorkerRelayEventProposal);
 const decodeEventCursor = Schema.decodeUnknownSync(WorkerEventCursor);
+const decodeCertificateBootstrap = Schema.decodeUnknownSync(WorkerCertificateBootstrapRequest);
+const decodeCertificateGrant = Schema.decodeUnknownSync(WorkerCertificateGrant);
+const decodeClaimResponse = Schema.decodeUnknownSync(WorkerCommandClaimResponse);
 
 it("uses -1 as the sole empty event-log cursor", () => {
   expect(decodeEventCursor(-1)).toBe(-1);
@@ -21,9 +31,12 @@ const validBootstrap = {
   environmentRevisionId: "revision-1",
   threadId: "thread-1",
   sandboxId: "sandbox-1",
+  reservationId: "command-reserve-1",
   provider: { instanceId: "codex_personal", driver: "codex" },
   workspaceDirectory: "/workspace/project",
+  bootstrapEndpoint: "https://control.example.com/api/v1/worker-certificates/bootstrap",
   relayEndpoint: "wss://control.example.com/worker",
+  relayServerSpkiSha256: "sha256/47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
   relayCredentialRef: "relay-ref-1",
   secretLeaseRef: "lease-ref-1",
   issuedAt: "2026-08-27T00:00:00.000Z",
@@ -73,5 +86,32 @@ describe("WorkerRelayEventProposal", () => {
       runtimeEvent: { eventId: "provider-event-1" },
     });
     expect(() => decodeEventProposal({ ...proposal, sequence: 1 })).toThrow();
+  });
+});
+
+describe("worker mTLS wire contracts", () => {
+  it("bounds the one-time token and public SPKI without accepting identity fields", () => {
+    const request = {
+      schemaVersion: 1,
+      token: "t".repeat(48),
+      publicKeySpkiDerBase64: "QUJDRA==",
+    };
+    expect(decodeCertificateBootstrap(request)).toEqual(request);
+    expect(() => decodeCertificateBootstrap({ ...request, workerId: "worker-forged" })).toThrow();
+    expect(() => decodeCertificateBootstrap({ ...request, token: "short" })).toThrow();
+  });
+
+  it("requires a bounded PEM grant and closed command-claim state", () => {
+    expect(
+      decodeCertificateGrant({
+        schemaVersion: 1,
+        certificateChainPem: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----",
+        notBefore: "2026-08-27T00:00:00.000Z",
+        notAfter: "2026-08-27T00:10:00.000Z",
+        rotateAfter: "2026-08-27T00:06:00.000Z",
+      }).schemaVersion,
+    ).toBe(1);
+    expect(decodeClaimResponse({ schemaVersion: 1, claim: "in-flight" }).claim).toBe("in-flight");
+    expect(() => decodeClaimResponse({ schemaVersion: 1, claim: "unknown" })).toThrow();
   });
 });
