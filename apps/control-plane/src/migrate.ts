@@ -28,11 +28,18 @@ const migrate = async () => {
     const migrationPlan = await getMigrations(auth.options);
     await migrationPlan.runMigrations();
 
-    const workspaceMigration = await NodeFSP.readFile(
-      new URL("./migrations/0001-workspaces.sql", import.meta.url),
-      "utf8",
-    );
-    await pool.query(workspaceMigration);
+    const applicationMigrations = [
+      "0001-workspaces.sql",
+      "0002-cloud-thread-store.sql",
+      "0003-thread-integrity-locks.sql",
+    ];
+    for (const filename of applicationMigrations) {
+      const migration = await NodeFSP.readFile(
+        new URL(`./migrations/${filename}`, import.meta.url),
+        "utf8",
+      );
+      await pool.query(migration);
+    }
   } finally {
     await pool.end();
   }
