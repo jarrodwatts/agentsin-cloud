@@ -2,12 +2,21 @@
 import * as NodeProcess from "node:process";
 import * as NodePath from "node:path";
 
+import type { WorkerBootstrap } from "@t3tools/contracts/worker";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 
-import { loadWorkerBootstrap, type WorkerBootstrapFileSource } from "./bootstrap.ts";
+import {
+  loadWorkerBootstrap,
+  WORKER_BOOTSTRAP_FILE_ENV,
+  type WorkerBootstrapFileSource,
+} from "./bootstrap.ts";
 import { runCloudWorker, type CloudWorkerDependencies } from "./CloudWorker.ts";
 import { WorkerBootstrapError, type CloudWorkerError } from "./errors.ts";
 import { makeGitHubGitExecutor } from "./GitHubGitExecutor.ts";
+import { InspectorRuntimeError, makeNodeInspectorRuntime } from "./InspectorRuntime.ts";
+import { makeLinuxBubblewrapPtySandbox } from "./InspectorPtySandbox.ts";
+import type { InspectorPtySandbox } from "./InspectorPtySandbox.ts";
 import { makeNodeWorkerMtlsCredentialStore } from "./MtlsCredentials.ts";
 import {
   makeNodeMtlsGitHubTokenLeaseBroker,
@@ -18,12 +27,15 @@ import {
   makeWorkerProviderCredentialExecutor,
 } from "./ProviderCredentialExecutor.ts";
 import { makeRestrictedProviderFactory } from "./ProviderRuntimeSupervisor.ts";
+import type { WorkerSecretMaterialization } from "./ports.ts";
 
 export const WORKER_EXECUTION_MODE_ENV = "AGENTSIN_WORKER_MODE";
 export const WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV = "AGENTSIN_WORKER_MTLS_DIRECTORY";
 export const WORKER_PROVIDER_CREDENTIAL_ROOT_ENV = "AGENTSIN_WORKER_PROVIDER_CREDENTIAL_ROOT";
 export const WORKER_AGENT_UID_ENV = "AGENTSIN_AGENT_UID";
 export const WORKER_AGENT_GID_ENV = "AGENTSIN_AGENT_GID";
+export const WORKER_INSPECTOR_UID_ENV = "AGENTSIN_INSPECTOR_UID";
+export const WORKER_INSPECTOR_GID_ENV = "AGENTSIN_INSPECTOR_GID";
 export const WORKER_PROVIDER_RUNTIME_MODULE_ENV = "AGENTSIN_PROVIDER_RUNTIME_MODULE";
 export const WORKER_PROVIDER_RUNTIME_SHA256_ENV = "AGENTSIN_PROVIDER_RUNTIME_SHA256";
 export const WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV = "AGENTSIN_PROVIDER_RUNTIME_CHILD_SHA256";
@@ -39,6 +51,85 @@ export interface WorkerProcessOptions {
   /** Test seam; production uses the effective uid of this process. */
   readonly currentUid?: number;
 }
+
+export const makeHostedInspectorFactory = (options: {
+  readonly mtlsDirectory: string;
+  /** Provider runtime identity; it must not be able to reach inspector transaction files. */
+  readonly agentUid?: number;
+  readonly agentGid?: number;
+  /** Dedicated identity for the interactive inspector PTY only. */
+  readonly inspectorUid?: number;
+  readonly inspectorGid?: number;
+  readonly bootstrapPath?: string;
+  readonly loadPty?: () => Promise<typeof import("node-pty")>;
+  readonly ptySandbox?: InspectorPtySandbox;
+  readonly requireLinuxDescriptorTraversal?: boolean;
+}) => ({
+  make: ({
+    bootstrap,
+    materialization,
+  }: {
+    readonly bootstrap: WorkerBootstrap;
+    readonly materialization: WorkerSecretMaterialization;
+  }) =>
+    Effect.gen(function* () {
+      const hostPlatform = yield* HostProcessPlatform;
+      const protectedPaths = [
+        materialization.credentialDirectory,
+        options.mtlsDirectory,
+        options.bootstrapPath,
+      ].filter((path): path is string => path !== undefined);
+      const pty = yield* Effect.tryPromise({
+        try: options.loadPty ?? (() => import("node-pty")),
+        catch: (cause) =>
+          new InspectorRuntimeError({
+            code: "unsupported",
+            retryable: false,
+            operation: "hosted-inspector-load-pty",
+            cause,
+          }),
+      });
+      if (
+        options.ptySandbox === undefined &&
+        (!Number.isSafeInteger(options.agentUid) ||
+          (options.agentUid ?? 0) < 1 ||
+          !Number.isSafeInteger(options.agentGid) ||
+          (options.agentGid ?? 0) < 1 ||
+          !Number.isSafeInteger(options.inspectorUid) ||
+          (options.inspectorUid ?? 0) < 1 ||
+          !Number.isSafeInteger(options.inspectorGid) ||
+          (options.inspectorGid ?? 0) < 1 ||
+          options.inspectorUid === options.agentUid ||
+          options.inspectorGid === options.agentGid)
+      ) {
+        return yield* new InspectorRuntimeError({
+          code: "unsupported",
+          retryable: false,
+          operation: "hosted-inspector-untrusted-identity",
+        });
+      }
+      return yield* makeNodeInspectorRuntime({
+        workspaceDirectory: bootstrap.workspaceDirectory,
+        protectedPaths,
+        makeInspectorOutputRedactor: materialization.makeInspectorOutputRedactor,
+        ptySandbox:
+          options.ptySandbox ??
+          makeLinuxBubblewrapPtySandbox({
+            loadPty: pty,
+            hostPlatform,
+            agentUid: options.inspectorUid!,
+            agentGid: options.inspectorGid!,
+          }),
+        requirePtyNamespace: true,
+        requireLinuxDescriptorTraversal: options.requireLinuxDescriptorTraversal ?? true,
+        ...(options.agentUid === undefined ? {} : { untrustedUid: options.agentUid }),
+        ...(options.inspectorUid === undefined
+          ? {}
+          : { additionalUntrustedUids: [options.inspectorUid] }),
+        loadPty: async () => pty,
+      });
+    }),
+});
 
 export const selectWorkerProcessDependencies = (
   dependencies: CloudWorkerDependencies,
@@ -81,6 +172,16 @@ export const selectWorkerProcessDependencies = (
               tokenLeases: makeNodeMtlsGitHubTokenLeaseBroker({ credentials }),
             }),
         },
+        inspectorFactory: makeHostedInspectorFactory({
+          mtlsDirectory: directory,
+          agentUid: Number(env[WORKER_AGENT_UID_ENV]),
+          agentGid: Number(env[WORKER_AGENT_GID_ENV]),
+          inspectorUid: Number(env[WORKER_INSPECTOR_UID_ENV]),
+          inspectorGid: Number(env[WORKER_INSPECTOR_GID_ENV]),
+          ...(env[WORKER_BOOTSTRAP_FILE_ENV] === undefined
+            ? {}
+            : { bootstrapPath: env[WORKER_BOOTSTRAP_FILE_ENV] }),
+        }),
       };
     },
     catch: (cause) =>
@@ -116,6 +217,8 @@ export const runWorkerMain = (
       const credentialRoot = env[WORKER_PROVIDER_CREDENTIAL_ROOT_ENV];
       const agentUid = Number(env[WORKER_AGENT_UID_ENV]);
       const agentGid = Number(env[WORKER_AGENT_GID_ENV]);
+      const inspectorUid = Number(env[WORKER_INSPECTOR_UID_ENV]);
+      const inspectorGid = Number(env[WORKER_INSPECTOR_GID_ENV]);
       const providerRuntimeModule = env[WORKER_PROVIDER_RUNTIME_MODULE_ENV];
       const providerRuntimeSha256 = env[WORKER_PROVIDER_RUNTIME_SHA256_ENV];
       const providerRuntimeChildSha256 = env[WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV];
@@ -130,6 +233,12 @@ export const runWorkerMain = (
         agentUid < 1 ||
         !Number.isSafeInteger(agentGid) ||
         agentGid < 1 ||
+        !Number.isSafeInteger(inspectorUid) ||
+        inspectorUid < 1 ||
+        !Number.isSafeInteger(inspectorGid) ||
+        inspectorGid < 1 ||
+        inspectorUid === agentUid ||
+        inspectorGid === agentGid ||
         providerRuntimeModule === undefined ||
         !NodePath.isAbsolute(providerRuntimeModule) ||
         providerRuntimeSha256 === undefined ||

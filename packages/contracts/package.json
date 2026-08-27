@@ -23,6 +23,10 @@
       "types": "./src/credentialBinary.ts",
       "import": "./src/credentialBinary.ts"
     },
+    "./inspector": {
+      "types": "./src/inspector.ts",
+      "import": "./src/inspector.ts"
+    },
     "./settings": {
       "types": "./src/settings.ts",
       "import": "./src/settings.ts"

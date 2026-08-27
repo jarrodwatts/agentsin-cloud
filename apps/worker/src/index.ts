@@ -14,6 +14,16 @@ export {
 } from "./CloudWorker.ts";
 export { executeGitHubWorkerCommand } from "./githubCommandHandler.ts";
 export {
+  InspectorRuntimeError,
+  makeNodeInspectorRuntime,
+  type InspectorPortBackend,
+  type InspectorVisualBackend,
+  type NodeInspectorRuntimeOptions,
+  type WorkerInspectorFrameSink,
+  type WorkerInspectorRuntime,
+} from "./InspectorRuntime.ts";
+export { makeLinuxBubblewrapPtySandbox, type InspectorPtySandbox } from "./InspectorPtySandbox.ts";
+export {
   CloudWorkerError,
   WorkerBootstrapError,
   WorkerProtocolError,
@@ -28,6 +38,8 @@ export {
   WORKER_AGENT_PATH_ENV,
   WORKER_AGENT_UID_ENV,
   WORKER_EXECUTION_MODE_ENV,
+  WORKER_INSPECTOR_GID_ENV,
+  WORKER_INSPECTOR_UID_ENV,
   WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV,
   WORKER_NODE_INTERPRETER_PATH_ENV,
   WORKER_NODE_INTERPRETER_SHA256_ENV,
@@ -35,6 +47,7 @@ export {
   WORKER_PROVIDER_RUNTIME_MODULE_ENV,
   WORKER_PROVIDER_RUNTIME_SHA256_ENV,
   WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV,
+  makeHostedInspectorFactory,
   processTermination,
   runWorkerMain,
   selectWorkerProcessDependencies,

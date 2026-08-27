@@ -38,6 +38,7 @@ import type {
   WorkerRelayConnection,
   WorkerRelayConnector,
   WorkerSecretLeaseBroker,
+  WorkerSecretMaterialization,
 } from "./ports.ts";
 import {
   WorkerProviderCredentialError,
@@ -52,6 +53,7 @@ import {
 import { isForbiddenBootstrapKey, redactLogFields } from "./redaction.ts";
 import type { GitHubGitExecutor } from "./GitHubGitExecutor.ts";
 import { executeGitHubWorkerCommand } from "./githubCommandHandler.ts";
+import { InspectorRuntimeError, type WorkerInspectorRuntime } from "./InspectorRuntime.ts";
 
 export interface CloudWorkerOptions {
   readonly maxPendingEventProposals: number;
@@ -70,6 +72,13 @@ export interface CloudWorkerDependencies {
   readonly logger: WorkerLogger;
   readonly github?: {
     readonly makeExecutor: (bootstrap: WorkerBootstrap) => GitHubGitExecutor;
+  };
+  readonly inspector?: WorkerInspectorRuntime;
+  readonly inspectorFactory?: {
+    readonly make: (input: {
+      readonly bootstrap: WorkerBootstrap;
+      readonly materialization: WorkerSecretMaterialization;
+    }) => Effect.Effect<WorkerInspectorRuntime, InspectorRuntimeError>;
   };
   readonly onCloudEvent?: (event: CloudThreadEvent) => Effect.Effect<void>;
   /** Required by hosted production; omitted only by local legacy workers. */
@@ -191,33 +200,48 @@ export const runCloudWorker = (
 
       const logger = safeLogger(dependencies.logger);
       const github = dependencies.github?.makeExecutor(bootstrap);
-      const materialization = yield* dependencies.secretLease
-        .materialize({
+      let materializationScrubbed = false;
+      const scrubOnce = (materialized: WorkerSecretMaterialization) =>
+        Effect.suspend(() => {
+          if (materializationScrubbed) return Effect.void;
+          return materialized.scrub.pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                materializationScrubbed = true;
+              }),
+            ),
+          );
+        });
+      const materialization = yield* Effect.acquireRelease(
+        dependencies.secretLease.materialize({
           identity: bootstrap,
           leaseRef: bootstrap.secretLeaseRef,
           provider: bootstrap.provider,
-        })
-        .pipe(
-          Effect.mapError(
-            (cause) =>
-              new WorkerProviderError({
-                operation: "materialize-credentials",
-                crashed: false,
-                cause,
-              }),
-          ),
-        );
+        }),
+        (materialized) => scrubOnce(materialized).pipe(Effect.ignore),
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new WorkerProviderError({
+              operation: "materialize-credentials",
+              crashed: false,
+              cause,
+            }),
+        ),
+      );
       if (
         materialization.containsWalletMaterial ||
         materialization.environmentVariableNames.some(isForbiddenBootstrapKey)
       ) {
-        yield* materialization.scrub.pipe(Effect.ignore);
+        yield* scrubOnce(materialization).pipe(Effect.ignore);
         return yield* new WorkerProviderError({
           operation: "materialize-credentials",
           crashed: false,
           cause: "secret lease attempted to materialize wallet or signing material",
         });
       }
+      let inspector = dependencies.inspector;
+      const scrubMaterialization = scrubOnce(materialization);
 
       const relayRef = yield* Ref.make<WorkerRelayConnection | undefined>(undefined);
       const relayFailureRef = yield* Ref.make<
@@ -526,6 +550,46 @@ export const runCloudWorker = (
             )
           : executeGitHubWorkerCommand(github, command).pipe(Effect.flatMap(send));
 
+      const processInspectorCommand = (
+        command: Extract<WorkerRelayInbound, { readonly type: "inspector.command" }>["command"],
+      ) => {
+        const binding = command.binding;
+        if (
+          binding.workspaceId !== bootstrap.workspaceId ||
+          binding.threadId !== bootstrap.threadId ||
+          binding.environmentId !== bootstrap.environmentId ||
+          binding.environmentRevisionId !== bootstrap.environmentRevisionId ||
+          binding.providerInstanceId !== bootstrap.provider.instanceId ||
+          binding.providerDriver !== bootstrap.provider.driver ||
+          binding.sandboxId !== bootstrap.sandboxId ||
+          String(binding.workerId) !== String(bootstrap.workerId)
+        ) {
+          return Effect.fail(
+            new WorkerProtocolError({
+              reason: "inspector route does not match the sealed worker identity",
+              retryable: false,
+            }),
+          );
+        }
+        if (inspector === undefined) {
+          return Effect.void;
+        }
+        return inspector.handle(command, {
+          emit: (frame) =>
+            send({ type: "inspector.frame", frame }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new InspectorRuntimeError({
+                    code: "internal",
+                    retryable: true,
+                    operation: "relay-send",
+                    cause,
+                  }),
+              ),
+            ),
+        });
+      };
+
       const acknowledgeState = (state: ConfirmationState, pending: PendingEventAck) => {
         const acknowledgedSequences = new Set(state.acknowledgedSequences);
         for (const sequence of pending.sequences) {
@@ -693,12 +757,37 @@ export const runCloudWorker = (
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
           yield* stopProvider;
-          yield* materialization.scrub.pipe(Effect.ignore);
+          yield* inspector?.close.pipe(Effect.ignore) ?? Effect.void;
           const relay = yield* Ref.getAndSet(relayRef, undefined);
           if (relay !== undefined) yield* relay.close.pipe(Effect.ignore);
         }),
       );
       yield* startProvider;
+      // Provider startup is the only consumer of the temporary credential
+      // materialization. Scrub it before constructing or validating inspector
+      // surfaces so a failing inspector factory cannot extend secret lifetime.
+      yield* scrubMaterialization.pipe(
+        Effect.mapError(
+          (cause) =>
+            new WorkerProviderError({
+              operation: "scrub-credentials",
+              crashed: false,
+              cause,
+            }),
+        ),
+      );
+      if (inspector === undefined && dependencies.inspectorFactory !== undefined) {
+        inspector = yield* dependencies.inspectorFactory.make({ bootstrap, materialization }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new WorkerProviderError({
+                operation: "configure-inspector",
+                crashed: false,
+                cause,
+              }),
+          ),
+        );
+      }
 
       const runConnection: Effect.Effect<
         void,
@@ -736,6 +825,9 @@ export const runCloudWorker = (
                 break;
               case "github.command":
                 yield* processGitHubCommand(message.command);
+                break;
+              case "inspector.command":
+                yield* processInspectorCommand(message.command);
                 break;
               case "thread.events.confirmed":
                 yield* observeConfirmation(message);

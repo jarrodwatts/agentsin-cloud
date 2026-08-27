@@ -5,6 +5,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import type { CloudThreadCommand } from "@t3tools/contracts/cloud";
+import type { InspectorWorkerFrame } from "@t3tools/contracts/inspector";
 import {
   WorkerRelayInbound,
   WorkerRelayOutbound,
@@ -157,12 +158,14 @@ export interface WorkerRouteRegistry {
   ) => void;
   readonly clear: () => void;
   readonly subscribeRemoval: (listener: (removal: WorkerRouteRemoval) => void) => () => void;
+  readonly subscribeActivation: (listener: (route: ActiveWorkerRoute) => void) => () => void;
   readonly size: () => number;
 }
 
 export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
   const routes = new Map<string, ActiveWorkerRoute>();
   const removalListeners = new Set<(removal: WorkerRouteRemoval) => void>();
+  const activationListeners = new Set<(route: ActiveWorkerRoute) => void>();
   const key = (workspaceId: string, sandboxId: string) => `${workspaceId}\0${sandboxId}`;
   const removed = (route: ActiveWorkerRoute, reason: WorkerRouteRemoval["reason"]) => {
     for (const listener of removalListeners) listener({ route, reason });
@@ -175,6 +178,7 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
         return { accepted: false };
       }
       routes.set(routeKey, route);
+      for (const listener of activationListeners) listener(route);
       if (previous !== undefined) removed(previous, "replaced");
       return {
         accepted: true,
@@ -215,6 +219,10 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
       removalListeners.add(listener);
       return () => removalListeners.delete(listener);
     },
+    subscribeActivation: (listener) => {
+      activationListeners.add(listener);
+      return () => activationListeners.delete(listener);
+    },
     size: () => routes.size,
   };
 };
@@ -242,6 +250,18 @@ const sameRuntimeIdentity = (
       message.runtimeEvent.provider === certificate.providerDriver &&
       (message.runtimeEvent.providerInstanceId === undefined ||
         message.runtimeEvent.providerInstanceId === certificate.providerInstanceId)
+    );
+  }
+  if (message.type === "inspector.frame") {
+    return (
+      message.frame.binding.workspaceId === certificate.workspaceId &&
+      message.frame.binding.threadId === certificate.threadId &&
+      message.frame.binding.environmentId === certificate.environmentId &&
+      message.frame.binding.environmentRevisionId === certificate.environmentRevisionId &&
+      message.frame.binding.providerInstanceId === certificate.providerInstanceId &&
+      message.frame.binding.providerDriver === certificate.providerDriver &&
+      message.frame.binding.sandboxId === certificate.sandboxId &&
+      String(message.frame.binding.workerId) === String(certificate.workerId)
     );
   }
   return true;
@@ -355,6 +375,15 @@ export interface MakeWorkerRelayOptions {
       identity: ActiveWorkerLease,
       result: WorkerRelayGitHubCommandResult,
     ) => Effect.Effect<void, { readonly _tag: string }>;
+  };
+  readonly inspectorFrames?: {
+    readonly handleFrame: (
+      identity: ActiveWorkerLease,
+      frame: InspectorWorkerFrame,
+    ) => Effect.Effect<
+      void,
+      { readonly _tag: string; readonly code?: string; readonly operation?: string }
+    >;
   };
   readonly processInstanceId?: string;
   readonly routes?: WorkerRouteRegistry;
@@ -518,6 +547,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
             ),
       ),
     );
+  let inspectorFrames = options.inspectorFrames;
 
   const open = (certificate: WorkerCertificateRecord, socket: WorkerRelaySocket) =>
     Effect.gen(function* () {
@@ -615,6 +645,15 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
               operation: "validate-frame",
             });
           }
+          if (
+            message.type === "inspector.frame" &&
+            message.frame.binding.routeGeneration !== lease.routeGeneration
+          ) {
+            return yield* new WorkerRelayServerError({
+              code: "identityMismatch",
+              operation: "validate-inspector-route-generation",
+            });
+          }
           if (message.type === "worker.heartbeat") {
             yield* options.identities.recordHeartbeat(lease, message).pipe(
               Effect.mapError(
@@ -688,7 +727,34 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
                       }),
                   ),
                 )
-            : options.recovery.handleOutbound(certificate, message);
+            : message.type === "inspector.frame"
+              ? inspectorFrames === undefined
+                ? Effect.fail(
+                    new WorkerRelayServerError({
+                      code: "invalidFrame",
+                      operation: "inspector-frame-unconfigured",
+                    }),
+                  )
+                : inspectorFrames.handleFrame(lease, message.frame).pipe(
+                    Effect.as({ type: "accepted" } as const),
+                    Effect.catch((cause) =>
+                      cause.code === "identityMismatch" || cause.code === "invalidRequest"
+                        ? Effect.fail(
+                            new WorkerRelayServerError({
+                              code:
+                                cause.code === "identityMismatch"
+                                  ? "identityMismatch"
+                                  : "invalidFrame",
+                              operation: cause.operation ?? "inspector-frame",
+                              cause,
+                            }),
+                          )
+                        : // Session expiry, stale route generations, artifact quotas,
+                          // and late cleanup frames are scoped inspector failures.
+                          Effect.succeed({ type: "accepted" } as const),
+                    ),
+                  )
+              : options.recovery.handleOutbound(certificate, message);
           if (message.type === "thread.events.ack") {
             if (
               acceptance.type !== "event-cursor" ||
@@ -1274,6 +1340,9 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
     routes,
     limits,
     processInstanceId,
+    setInspectorFrameHandler: (handler: MakeWorkerRelayOptions["inspectorFrames"] | undefined) => {
+      inspectorFrames = handler;
+    },
   } as const;
 };
 

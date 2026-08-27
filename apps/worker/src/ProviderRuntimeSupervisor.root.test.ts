@@ -244,6 +244,7 @@ describe.skipIf(NodeProcess.env.AGENTSIN_ROOT_SECURITY_TEST !== "1")(
                   credentialDirectory: ownDirectory,
                   environmentVariableNames: [],
                   containsWalletMaterial: false,
+                  makeInspectorOutputRedactor: () => (chunk: string) => chunk,
                   scrub: Effect.void,
                 },
                 emit: () => Effect.succeed(undefined),

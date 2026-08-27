@@ -84,6 +84,9 @@ const handleLine = async (line: string) => {
             identity: request.identity,
             materialization: {
               ...request.materialization,
+              // The restricted provider child has no inspector surface. The
+              // parent worker retains the broker-owned redactor used by PTYs.
+              makeInspectorOutputRedactor: () => (chunk: string) => chunk,
               scrub: Effect.void,
             },
             emit: (event) =>

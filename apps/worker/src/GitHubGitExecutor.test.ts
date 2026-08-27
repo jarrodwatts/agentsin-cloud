@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 
 import {
   authorizedGitHubPushUrl,
+  isForbiddenCheckpointPath,
   makeGitHubGitExecutor,
   makePinnedGitHubPushTransport,
   WorkerGitHubTokenLeaseError,
@@ -101,6 +102,25 @@ const executor = (cwd: string) =>
     now: Effect.succeed(now),
   });
 
+it("denies Git credential and repository-control paths at every depth", () => {
+  for (const path of [
+    ".git/config",
+    "nested/.git",
+    "nested/.git/config.worktree",
+    ".git-credentials",
+    "nested/.git-credentials",
+    "nested/.git-credentialsbackup",
+    ".gitconfig",
+    "nested/.gitconfig-work",
+    "nested/.gitconfigbackup",
+    ".config/git",
+    ".config/git/config",
+    "nested/.config/git/credentials",
+  ]) {
+    expect(isForbiddenCheckpointPath(path)).toBe(true);
+  }
+});
+
 it.effect("recovers the exact checkpoint after a commit-before-receipt crash", () =>
   withRepository((cwd, baseSha) =>
     Effect.gen(function* () {
@@ -147,6 +167,32 @@ it.effect("rejects tampered recovery history and secret paths", () =>
       expect(secret).toMatchObject({ status: "failed", code: "secretPath" });
 
       yield* Effect.promise(() => NodeFSP.rm(NodePath.join(cwd, ".env")));
+      for (const path of [
+        ".git-credentials",
+        ".gitconfig",
+        ".gitconfig-work",
+        "nested/.git-credentials",
+        ".config/git/config",
+        "nested/.config/git/credentials",
+      ]) {
+        const absolute = NodePath.join(cwd, path);
+        yield* Effect.promise(async () => {
+          await NodeFSP.mkdir(NodePath.dirname(absolute), { recursive: true });
+          await NodeFSP.writeFile(absolute, "credential=secret\n");
+        });
+        const protectedGitPath = yield* executor(cwd).execute(
+          decodeCommand({
+            ...commandIdentity,
+            type: "github.git.prepare-checkpoint",
+            branch: "agents/git-secret-check-123456789abc",
+            expectedParentSha: baseSha,
+            message: "feat: git secret",
+            committedAt: now,
+          }),
+        );
+        expect(protectedGitPath).toMatchObject({ status: "failed", code: "secretPath" });
+        yield* Effect.promise(() => NodeFSP.rm(absolute));
+      }
       yield* Effect.promise(() => NodeFSP.writeFile(NodePath.join(cwd, "safe.ts"), "export {};\n"));
       const command = decodeCommand({
         ...commandIdentity,

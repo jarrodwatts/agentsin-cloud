@@ -22,6 +22,7 @@
     "@t3tools/contracts": "workspace:*",
     "@t3tools/shared": "workspace:*",
     "effect": "catalog:",
+    "node-pty": "^1.1.0",
     "ws": "8.21.0"
   },
   "devDependencies": {

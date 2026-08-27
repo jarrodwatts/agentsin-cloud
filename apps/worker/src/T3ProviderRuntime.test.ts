@@ -65,6 +65,7 @@ const materialization: WorkerSecretMaterialization = {
   credentialDirectory: "/run/agentsin/credentials",
   environmentVariableNames: ["CODEX_HOME"],
   containsWalletMaterial: false,
+  makeInspectorOutputRedactor: () => (chunk) => chunk,
   scrub: Effect.void,
 };
 

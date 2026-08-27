@@ -14,6 +14,7 @@ import { WebSocket } from "ws";
 
 import { makeCloudRpc } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
+import { DEFAULT_INSPECTOR_BRIDGE_LIMITS, type InspectorBridge } from "./inspectorBridge.ts";
 import type { ControlPlaneAuth } from "./http.ts";
 import type { ThreadEventStoreService } from "./threadEventStore.ts";
 import type { WorkspaceRepositoryService } from "./workspaces.ts";
@@ -194,6 +195,62 @@ it.effect("authenticates upgrades and enforces the native max-payload boundary",
       });
       oversized.send("x".repeat(257));
       expect(yield* Effect.promise(() => closed)).toBe(1009);
+    }),
+  ),
+);
+
+it.effect("multiplexes the authenticated inspector path without trusting workspace input", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const server = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeHttp.createServer((_request, response) => response.end())),
+        closeServer,
+      );
+      const rpc = makeCloudRpc({
+        auth,
+        hostedOrigin: "https://control.example.com",
+        workspaces,
+        eventStore,
+      });
+      let opened = 0;
+      const inspector = {
+        limits: { ...DEFAULT_INSPECTOR_BRIDGE_LIMITS, maxFrameBytes: 512 },
+        authorizeWebSocket: (headers, requested) =>
+          headers.get("authorization") === "Bearer desktop-token" &&
+          requested.threadId === threadId &&
+          requested.attemptId === "attempt-1"
+            ? Effect.succeed({
+                workspaceId,
+                userId: "user-1",
+                threadId,
+                attempt: { attemptId: "attempt-1" } as never,
+              })
+            : Effect.die("unexpected inspector authorization"),
+        openAuthorizedSocket: () => {
+          opened += 1;
+          return () => undefined;
+        },
+      } as Pick<InspectorBridge, "authorizeWebSocket" | "openAuthorizedSocket" | "limits">;
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          attachCloudRpcWebSocket({
+            server,
+            rpc,
+            inspector,
+            baseUrl: new URL("https://control.example.com"),
+            authenticationTimeoutMs: 1_000,
+          }),
+        ),
+        (attachment) => Effect.sync(attachment.detach),
+      );
+      yield* listen(server);
+      const address = server.address();
+      if (address === null || typeof address === "string") return yield* Effect.die("no address");
+      const base = `ws://127.0.0.1:${address.port}/api/v1/inspector`;
+      expect(yield* upgradeStatus(`${base}?threadId=${threadId}`)).toBe(400);
+      const socket = yield* open(`${base}?threadId=${threadId}&attemptId=attempt-1`);
+      expect(opened).toBe(1);
+      socket.close(1000, "complete");
     }),
   ),
 );

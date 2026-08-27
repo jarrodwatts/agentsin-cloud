@@ -223,7 +223,7 @@ export const makePinnedGitHubPushTransport = (
     ),
 });
 
-const forbiddenSecretPath = (path: string) => {
+export const isForbiddenCheckpointPath = (path: string) => {
   const normalized = path.replaceAll("\\", "/").toLowerCase();
   const basename = normalized.split("/").at(-1) ?? normalized;
   return (
@@ -233,6 +233,10 @@ const forbiddenSecretPath = (path: string) => {
     normalized.includes("/.aws/") ||
     normalized.startsWith(".config/gh/") ||
     normalized.includes("/.config/gh/") ||
+    /(?:^|\/)\.config\/git(?:\/|$)/.test(normalized) ||
+    /(?:^|\/)\.git(?:\/|$)/.test(normalized) ||
+    /(?:^|\/)\.gitconfig[^/]*$/.test(normalized) ||
+    /(?:^|\/)\.git-credentials[^/]*$/.test(normalized) ||
     /^\.env(?:\..+)?$/.test(basename) ||
     /\.(?:pem|key|p12|pfx)$/.test(basename) ||
     /^(?:credentials|secrets?)(?:\..+)?$/.test(basename)
@@ -365,7 +369,7 @@ const prepareCheckpoint = (
         detail: "checkpoint has no changes",
       });
     }
-    const secret = paths.find(forbiddenSecretPath);
+    const secret = paths.find(isForbiddenCheckpointPath);
     if (secret !== undefined) {
       return yield* new GitExecutionFailure({
         code: "secretPath",
@@ -535,5 +539,3 @@ export const makeGitHubGitExecutor = (input: {
           };
     }),
 });
-
-export const isForbiddenCheckpointPath = forbiddenSecretPath;

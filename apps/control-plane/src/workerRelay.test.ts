@@ -8,6 +8,7 @@ import { Secret } from "./providerSecrets.ts";
 import type { AgentMaterializationId, AgentProfileId, SandboxId } from "@t3tools/contracts/cloud";
 import type { WorkerRelayOutbound } from "@t3tools/contracts/worker";
 import { openCredentialBinaryFrame } from "@t3tools/shared/credentialRelayCrypto";
+import type { InspectorWorkerFrame } from "@t3tools/contracts/inspector";
 import {
   makeMemoryEphemeralCoordination,
   type EphemeralCoordinationService,
@@ -24,6 +25,7 @@ import {
   makeWorkerRelay,
   type WorkerRelayLimits,
   WorkerRelayServerError,
+  type MakeWorkerRelayOptions,
   type WorkerOutboundAcceptance,
   type WorkerRecoverySource,
   type WorkerRelaySocket,
@@ -129,6 +131,8 @@ const makeHarness = (input?: {
   readonly coordination?: EphemeralCoordinationService;
   readonly fencedIdentities?: ReadonlyArray<WorkerCertificateRecord>;
   readonly credentialLimits?: Partial<WorkerRelayLimits>;
+  readonly onInspectorFrame?: (frame: InspectorWorkerFrame) => void;
+  readonly inspectorFrameHandler?: MakeWorkerRelayOptions["inspectorFrames"];
 }) => {
   let generation = 0;
   let routeGeneration = 0;
@@ -235,6 +239,15 @@ const makeHarness = (input?: {
       ...input?.credentialLimits,
     },
     ...(input?.coordination === undefined ? {} : { coordination: input.coordination }),
+    ...(input?.inspectorFrameHandler !== undefined
+      ? { inspectorFrames: input.inspectorFrameHandler }
+      : input?.onInspectorFrame === undefined
+        ? {}
+        : {
+            inspectorFrames: {
+              handleFrame: (_identity, frame) => Effect.sync(() => input.onInspectorFrame?.(frame)),
+            },
+          }),
   });
   return {
     relay,
@@ -273,6 +286,181 @@ it("keeps the newer route when an older connection finishes activation late", ()
   expect(routes.activate(older)).toEqual({ accepted: false });
   expect(routes.get(certificate.workspaceId, certificate.sandboxId)).toBe(newer);
 });
+
+it.effect("accepts inspector frames only through the current certificate-bound worker route", () =>
+  Effect.gen(function* () {
+    let handled: (() => void) | undefined;
+    const completed = new Promise<void>((resolve) => {
+      handled = resolve;
+    });
+    const harness = makeHarness({ onInspectorFrame: () => handled?.() });
+    const socket = new FakeSocket();
+    const connection = yield* harness.relay.open(certificate, socket);
+    socket.emit({
+      type: "inspector.frame",
+      frame: {
+        type: "inspector.ready",
+        binding: {
+          protocolVersion: 1,
+          workspaceId: certificate.workspaceId,
+          threadId: certificate.threadId,
+          attemptId: "attempt-1",
+          environmentId: certificate.environmentId,
+          environmentRevisionId: certificate.environmentRevisionId,
+          providerInstanceId: certificate.providerInstanceId,
+          providerDriver: certificate.providerDriver,
+          sandboxId: certificate.sandboxId,
+          workerId: certificate.workerId,
+          routeGeneration: 1,
+        },
+        sessionId: "session-1",
+        sequence: 0,
+        emittedAt: "2026-08-27T13:00:00.000Z",
+        capabilities: {
+          terminal: true,
+          files: true,
+          ports: true,
+          browserFrames: false,
+          browserInput: false,
+          desktopFrames: false,
+          desktopInput: false,
+          desktopBackend: "unsupported",
+        },
+      },
+    });
+    yield* Effect.promise(() => completed);
+    expect(socket.closes).toEqual([]);
+
+    socket.emit({
+      type: "inspector.frame",
+      frame: {
+        type: "inspector.ready",
+        binding: {
+          protocolVersion: 1,
+          workspaceId: "workspace-forged",
+          threadId: certificate.threadId,
+          attemptId: "attempt-1",
+          environmentId: certificate.environmentId,
+          environmentRevisionId: certificate.environmentRevisionId,
+          providerInstanceId: certificate.providerInstanceId,
+          providerDriver: certificate.providerDriver,
+          sandboxId: certificate.sandboxId,
+          workerId: certificate.workerId,
+          routeGeneration: 1,
+        },
+        sessionId: "session-1",
+        sequence: 1,
+        emittedAt: "2026-08-27T13:00:00.000Z",
+        capabilities: {
+          terminal: true,
+          files: true,
+          ports: true,
+          browserFrames: false,
+          browserInput: false,
+          desktopFrames: false,
+          desktopInput: false,
+          desktopBackend: "unsupported",
+        },
+      },
+    });
+    yield* Effect.promise(() => socket.waitForClose());
+    expect(socket.closes.at(-1)).toEqual({ code: 4400, reason: "invalid_worker_frame" });
+    connection.close();
+  }),
+);
+
+it.effect("keeps the worker route healthy after late scoped inspector frames", () =>
+  Effect.gen(function* () {
+    let handled = 0;
+    let resolveSecond: (() => void) | undefined;
+    const second = new Promise<void>((resolve) => {
+      resolveSecond = resolve;
+    });
+    const harness = makeHarness({
+      inspectorFrameHandler: {
+        handleFrame: () =>
+          Effect.sync(() => {
+            handled += 1;
+            if (handled === 2) resolveSecond?.();
+          }).pipe(Effect.andThen(Effect.fail({ _tag: "InspectorBridgeError" }))),
+      },
+    });
+    const socket = new FakeSocket();
+    const connection = yield* harness.relay.open(certificate, socket);
+    const frame = {
+      type: "inspector.ready" as const,
+      binding: {
+        protocolVersion: 1 as const,
+        workspaceId: certificate.workspaceId,
+        threadId: certificate.threadId,
+        attemptId: "attempt-1",
+        environmentId: certificate.environmentId,
+        environmentRevisionId: certificate.environmentRevisionId,
+        providerInstanceId: certificate.providerInstanceId,
+        providerDriver: certificate.providerDriver,
+        sandboxId: certificate.sandboxId,
+        workerId: certificate.workerId,
+        routeGeneration: 1,
+      },
+      sessionId: "expired-session",
+      sequence: 0,
+      emittedAt: "2026-08-27T13:00:00.000Z",
+      capabilities: {
+        terminal: true,
+        files: true,
+        ports: false,
+        browserFrames: false,
+        browserInput: false,
+        desktopFrames: false,
+        desktopInput: false,
+        desktopBackend: "unsupported" as const,
+      },
+    };
+    socket.emit({ type: "inspector.frame", frame });
+    socket.emit({ type: "inspector.frame", frame: { ...frame, sequence: 1 } });
+    yield* Effect.promise(() => second);
+    expect(socket.closes).toEqual([]);
+    expect(harness.relay.routes.get(certificate.workspaceId, certificate.sandboxId)).toBeDefined();
+    connection.close();
+  }),
+);
+
+it.effect("poisons the worker route on inspector binding forgery", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    const socket = new FakeSocket();
+    const connection = yield* harness.relay.open(certificate, socket);
+    socket.emit({
+      type: "inspector.frame",
+      frame: {
+        type: "inspector.heartbeat",
+        binding: {
+          protocolVersion: 1,
+          workspaceId: certificate.workspaceId,
+          threadId: certificate.threadId,
+          attemptId: "attempt-1",
+          environmentId: certificate.environmentId,
+          environmentRevisionId: certificate.environmentRevisionId,
+          providerInstanceId: certificate.providerInstanceId,
+          providerDriver: certificate.providerDriver,
+          sandboxId: certificate.sandboxId,
+          workerId: certificate.workerId,
+          routeGeneration: 2,
+        },
+        sessionId: "session-1",
+        sequence: 0,
+        emittedAt: "2026-08-27T13:00:00.000Z",
+        nonce: "nonce-1",
+      },
+    });
+    yield* Effect.promise(() => socket.waitForClose());
+    expect(socket.closes.at(-1)).toEqual({ code: 4400, reason: "invalid_worker_frame" });
+    expect(
+      harness.relay.routes.get(certificate.workspaceId, certificate.sandboxId),
+    ).toBeUndefined();
+    connection.close();
+  }),
+);
 
 it.effect(
   "replays from the authoritative cursor and deterministically replaces an old socket",

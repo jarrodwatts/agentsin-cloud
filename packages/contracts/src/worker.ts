@@ -34,6 +34,7 @@ import {
 } from "./cloud.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ProviderRuntimeEvent } from "./providerRuntime.ts";
+import { InspectorWorkerCommand, InspectorWorkerFrame } from "./inspector.ts";
 
 const makeWorkerId = <Brand extends string>(brand: Brand) =>
   TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(Schema.brand(brand));
@@ -361,6 +362,10 @@ export const WorkerRelayInbound = Schema.Union([
   WorkerRelayReplayComplete,
   WorkerRelayShutdown,
   WorkerProviderCredentialCommand,
+  Schema.Struct({
+    type: Schema.Literal("inspector.command"),
+    command: InspectorWorkerCommand,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
 ]);
 export type WorkerRelayInbound = typeof WorkerRelayInbound.Type;
 
@@ -511,5 +516,9 @@ export const WorkerRelayOutbound = Schema.Union([
   WorkerRelayFailure,
   WorkerRelayGitHubCommandResult,
   WorkerProviderCredentialResult,
+  Schema.Struct({
+    type: Schema.Literal("inspector.frame"),
+    frame: InspectorWorkerFrame,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
 ]);
 export type WorkerRelayOutbound = typeof WorkerRelayOutbound.Type;

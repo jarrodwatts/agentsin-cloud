@@ -52,6 +52,9 @@ export interface RequestHandlerDependencies {
   readonly cloudRpc?: {
     readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
   };
+  readonly inspector?: {
+    readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
+  };
   readonly workerBootstrap?: {
     readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
   };
@@ -323,6 +326,11 @@ const dispatch = (request: Request, dependencies: RequestHandlerDependencies) =>
       const providerCredentialResponse =
         yield* dependencies.providerCredentials.handleHttp(request);
       if (providerCredentialResponse !== undefined) return providerCredentialResponse;
+    }
+
+    if (dependencies.inspector !== undefined) {
+      const inspectorResponse = yield* dependencies.inspector.handleHttp(request);
+      if (inspectorResponse !== undefined) return inspectorResponse;
     }
 
     if (dependencies.workerBootstrap !== undefined) {

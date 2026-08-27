@@ -12,6 +12,7 @@ import {
   WorkerRelayInbound,
   type WorkerRelayOutbound,
 } from "@t3tools/contracts/worker";
+import type { InspectorWorkerCommand } from "@t3tools/contracts/inspector";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -28,6 +29,7 @@ import type {
   WorkerRelayConnection,
 } from "./ports.ts";
 import { WORKER_RELAY_FRAME_MAX_BYTES } from "./protocol.ts";
+import { InspectorRuntimeError, type WorkerInspectorRuntime } from "./InspectorRuntime.ts";
 
 const decodeBootstrap = Schema.decodeUnknownSync(WorkerBootstrap);
 const decodeCloudCommand = Schema.decodeUnknownSync(CloudThreadCommandSchema);
@@ -134,6 +136,7 @@ interface HarnessOptions {
   readonly maxTrackedConfirmations?: number;
   readonly maxPendingEventAcks?: number;
   readonly heartbeatInterval?: Effect.Effect<void>;
+  readonly inspector?: WorkerInspectorRuntime;
 }
 
 const makeHarness = (options: HarnessOptions) => {
@@ -229,6 +232,7 @@ const makeHarness = (options: HarnessOptions) => {
           credentialDirectory: "/run/agentsin/credentials",
           environmentVariableNames: ["CODEX_HOME"],
           containsWalletMaterial: false,
+          makeInspectorOutputRedactor: () => (chunk) => chunk,
           scrub: Effect.sync(() => {
             scrubs += 1;
           }),
@@ -247,6 +251,7 @@ const makeHarness = (options: HarnessOptions) => {
       Effect.sync(() => {
         observed.push(event);
       }),
+    ...(options.inspector === undefined ? {} : { inspector: options.inspector }),
     options: {
       beforeReconnect: Effect.void,
       ...(options.maxPendingEventProposals === undefined
@@ -273,6 +278,106 @@ const makeHarness = (options: HarnessOptions) => {
     counts: () => ({ providerStarts, providerStops, scrubs, relayCloses }),
   };
 };
+
+const inspectorOpenCommand = (workspaceId = bootstrap.workspaceId): InspectorWorkerCommand => ({
+  type: "inspector.open",
+  binding: {
+    protocolVersion: 1,
+    workspaceId,
+    threadId: bootstrap.threadId,
+    attemptId: "attempt-1" as never,
+    environmentId: bootstrap.environmentId,
+    environmentRevisionId: bootstrap.environmentRevisionId,
+    providerInstanceId: bootstrap.provider.instanceId,
+    providerDriver: bootstrap.provider.driver,
+    sandboxId: bootstrap.sandboxId,
+    workerId: bootstrap.workerId as never,
+    routeGeneration: 1,
+  },
+  sessionId: "session-1" as never,
+  resumeAfterSequence: -1,
+});
+
+it.effect("routes inspector commands only through the sealed worker identity", () => {
+  const handled: Array<InspectorWorkerCommand> = [];
+  let closed = 0;
+  const inspector: WorkerInspectorRuntime = {
+    handle: (command, sink) => {
+      handled.push(command);
+      return sink
+        .emit({
+          type: "inspector.ready",
+          binding: command.binding,
+          sessionId: command.sessionId,
+          sequence: 0,
+          emittedAt: "2026-08-27T00:30:00.000Z",
+          capabilities: {
+            terminal: true,
+            files: true,
+            ports: false,
+            browserFrames: false,
+            browserInput: false,
+            desktopFrames: false,
+            desktopInput: false,
+            desktopBackend: "unsupported",
+          },
+        })
+        .pipe(Effect.catch(() => Effect.void));
+    },
+    drain: Effect.void,
+    close: Effect.sync(() => {
+      closed += 1;
+    }),
+  };
+  const harness = makeHarness({
+    connections: [
+      [
+        { type: "inspector.command", command: inspectorOpenCommand() },
+        { type: "worker.shutdown", reason: "test complete" },
+      ],
+    ],
+    inspector,
+  });
+  return runCloudWorker(bootstrap, harness.dependencies).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        expect(handled).toHaveLength(1);
+        expect(harness.sent.some((message) => message.type === "inspector.frame")).toBe(true);
+        expect(closed).toBe(1);
+      }),
+    ),
+  );
+});
+
+it.effect("rejects every sealed inspector binding mismatch before dispatch", () =>
+  Effect.gen(function* () {
+    const valid = inspectorOpenCommand();
+    if (valid.type !== "inspector.open") return;
+    const mismatches = [
+      { workspaceId: "workspace-forged" as never },
+      { threadId: "thread-forged" as never },
+      { environmentId: "environment-forged" as never },
+      { environmentRevisionId: "revision-forged" as never },
+      { providerInstanceId: "provider-forged" as never },
+      { providerDriver: "claude" as never },
+      { sandboxId: "sandbox-forged" as never },
+      { workerId: "worker-forged" as never },
+    ];
+    for (const mismatch of mismatches) {
+      const command = { ...valid, binding: { ...valid.binding, ...mismatch } };
+      const harness = makeHarness({
+        connections: [
+          [
+            { type: "inspector.command", command },
+            { type: "worker.shutdown", reason: "must not be reached" },
+          ],
+        ],
+      });
+      const result = yield* Effect.result(runCloudWorker(bootstrap, harness.dependencies));
+      expect(result._tag).toBe("Failure");
+    }
+  }),
+);
 
 it.effect("deduplicates replayed commands through the authoritative relay claim", () => {
   const first = interruptCommand("command-1");
@@ -696,6 +801,7 @@ it.effect("rejects and scrubs a secret lease containing wallet material", () => 
           credentialDirectory: "/run/agentsin/credentials",
           environmentVariableNames: ["WALLET_PRIVATE_KEY"],
           containsWalletMaterial: false,
+          makeInspectorOutputRedactor: () => (chunk) => chunk,
           scrub: Effect.sync(() => {
             scrubs += 1;
           }),
@@ -707,6 +813,40 @@ it.effect("rejects and scrubs a secret lease containing wallet material", () => 
       Effect.sync(() => {
         expect(exit._tag).toBe("Failure");
         expect(scrubs).toBe(1);
+        expect(harness.connectInputs).toHaveLength(0);
+      }),
+    ),
+  );
+});
+
+it.effect("scrubs provider credentials before a failing inspector factory runs", () => {
+  const harness = makeHarness({ connections: [[]] });
+  let factoryObservedScrub = false;
+  const dependencies: CloudWorkerDependencies = {
+    ...harness.dependencies,
+    inspectorFactory: {
+      make: () =>
+        Effect.sync(() => {
+          factoryObservedScrub = harness.counts().scrubs === 1;
+        }).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new InspectorRuntimeError({
+                code: "unsupported",
+                retryable: false,
+                operation: "injected-factory-failure",
+              }),
+            ),
+          ),
+        ),
+    },
+  };
+  return Effect.exit(runCloudWorker(bootstrap, dependencies)).pipe(
+    Effect.tap((exit) =>
+      Effect.sync(() => {
+        expect(exit._tag).toBe("Failure");
+        expect(factoryObservedScrub).toBe(true);
+        expect(harness.counts()).toMatchObject({ providerStarts: 1, providerStops: 1, scrubs: 1 });
         expect(harness.connectInputs).toHaveLength(0);
       }),
     ),

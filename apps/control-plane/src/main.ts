@@ -15,6 +15,10 @@ import { makePostgresArtifactRepository } from "./artifactRepository.ts";
 import { ArtifactStorage, productionArtifactStorageLayer } from "./artifactStorage.ts";
 import { makeCloudRpc, type ThreadEventSignalHub } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
+import {
+  makePostgresCloudThreadLifecycleStore,
+  type CloudThreadLifecycleStore,
+} from "./cloudThreadLifecycleStore.ts";
 import { ControlPlaneConfig, layer as controlPlaneConfigLayer } from "./config.ts";
 import { Database, layer as databaseLayer } from "./database.ts";
 import {
@@ -22,6 +26,7 @@ import {
   type EphemeralCoordinationService,
 } from "./ephemeralCoordination.ts";
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
+import { makeInspectorBridge, type InspectorInputAuthorizer } from "./inspectorBridge.ts";
 import {
   layer as threadEventStoreLayer,
   ThreadEventStore,
@@ -34,7 +39,6 @@ import {
   type WorkspaceRepositoryService,
 } from "./workspaces.ts";
 import { createWorkerMtlsServer } from "./workerMtlsServer.ts";
-import { makePostgresCloudThreadLifecycleStore } from "./cloudThreadLifecycleStore.ts";
 import type { ProviderCredentialKeyEncryption } from "./providerCredentialEnvelope.ts";
 import type { ProviderCredentialLoginRunner } from "./providerCredentialLoginRunner.ts";
 import { makeProviderCredentialService } from "./providerCredentialService.ts";
@@ -400,6 +404,11 @@ export interface ControlPlaneApplicationDependencies {
     readonly service: ReturnType<typeof makeProviderCredentialService>;
     readonly logins: ReturnType<typeof makeProviderLoginCoordinator>;
   };
+  readonly inspector?: {
+    readonly lifecycle: CloudThreadLifecycleStore;
+    readonly artifacts: import("./artifactStorage.ts").ArtifactStorageService;
+    readonly inputAuthorizer?: InspectorInputAuthorizer;
+  };
 }
 
 /**
@@ -417,10 +426,12 @@ export const makeApplication = ({
   coordination,
   githubWorkflow,
   providerCredentialRuntime,
+  inspector,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
   readonly cloudRpc: ReturnType<typeof makeCloudRpc>;
+  readonly inspector: ReturnType<typeof makeInspectorBridge> | undefined;
 } => {
   const auth = makeAuth({
     config,
@@ -452,16 +463,32 @@ export const makeApplication = ({
           service: providerCredentialRuntime.service,
           logins: providerCredentialRuntime.logins,
         });
+  const inspectorBridge =
+    inspector === undefined || worker === undefined
+      ? undefined
+      : makeInspectorBridge({
+          auth,
+          hostedOrigin: config.betterAuthUrl.origin,
+          workspaces,
+          lifecycle: inspector.lifecycle,
+          routes: worker.relay.routes,
+          artifacts: inspector.artifacts,
+          ...(inspector.inputAuthorizer === undefined
+            ? {}
+            : { inputAuthorizer: inspector.inputAuthorizer }),
+        });
 
   return {
     auth,
     cloudRpc,
+    inspector: inspectorBridge,
     handle: makeRequestHandler({
       auth,
       config,
       database,
       workspaces,
       cloudRpc,
+      ...(inspectorBridge === undefined ? {} : { inspector: inspectorBridge }),
       ...(worker === undefined ? {} : { workerBootstrap: worker.workerBootstrap }),
       ...(githubWorkflow === undefined ? {} : { githubWorkflow }),
       ...(providerCredentials === undefined ? {} : { providerCredentials }),
@@ -632,7 +659,7 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       ),
     );
 
-    const { handle, cloudRpc } = makeApplication({
+    const { handle, cloudRpc, inspector } = makeApplication({
       config,
       database,
       workspaces,
@@ -641,7 +668,18 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       coordination,
       githubWorkflow,
       providerCredentialRuntime: { service: providerCredentials, logins: credentialLogins },
+      inspector: {
+        lifecycle: makePostgresCloudThreadLifecycleStore(database.pool),
+        artifacts: artifactStorage,
+      },
     });
+    worker.relay.setInspectorFrameHandler(inspector?.inspectorFrames);
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        worker.relay.setInspectorFrameHandler(undefined);
+        inspector?.dispose();
+      }),
+    );
     const server = yield* Effect.acquireRelease(
       listen(config, config.betterAuthUrl, handle),
       (activeServer) =>
@@ -654,6 +692,7 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       rpc: cloudRpc,
       baseUrl: config.betterAuthUrl,
       authenticationTimeoutMs: config.requestTimeoutMs,
+      ...(inspector === undefined ? {} : { inspector }),
     });
 
     yield* Effect.addFinalizer(() => Effect.sync(() => cloudRpcWebSocket.detach()));

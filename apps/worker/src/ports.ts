@@ -69,6 +69,9 @@ export interface WorkerSecretMaterialization {
   readonly credentialDirectory: string;
   readonly environmentVariableNames: ReadonlyArray<string>;
   readonly containsWalletMaterial: boolean;
+  /** Broker-owned streaming redactor; secret values never cross this interface. */
+  /** Returns an independent streaming redactor without exposing its secret set. */
+  readonly makeInspectorOutputRedactor: () => (chunk: string, final?: boolean) => string;
   readonly scrub: Effect.Effect<void, WorkerSecretLeaseError>;
 }
 

@@ -108,12 +108,17 @@ jobs:
           cache: true
           run-install: true
 
+      - name: Install Bubblewrap security boundary
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes bubblewrap
+
       - name: Prove worker and agent kernel isolation
         run: >-
           sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST=1
           "$(command -v pnpm)" --filter @agentsin-cloud/worker exec vp test run
           src/ProviderCredentialExecutor.root.test.ts
           src/ProviderRuntimeSupervisor.root.test.ts
+          src/ContainedWorkspace.root.test.ts
+          src/InspectorPtySandbox.root.test.ts
           src/main.root.test.ts
 
   test_control_plane_coordination:
