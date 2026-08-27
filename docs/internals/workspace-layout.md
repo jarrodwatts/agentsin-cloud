@@ -17,6 +17,10 @@ the task commands.
 - `apps/mobile` (`@t3tools/mobile`): Expo/React Native client. Same client runtime composition as
   web, different platform layer and UI.
 - `apps/marketing` (`@t3tools/marketing`): Astro marketing site.
+- `apps/worker` (`@agentsin-cloud/worker`): non-interactive hosted worker that runs inside the E2B
+  sandbox. It validates sealed thread identity, adapts the existing T3 provider runtime, and relays
+  provider events outbound. Durable ordering, identity, and command receipts remain control-plane
+  responsibilities.
 
 ## packages
 

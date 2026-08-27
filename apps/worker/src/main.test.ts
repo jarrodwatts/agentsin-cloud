@@ -1,0 +1,90 @@
+import { expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+
+import { WORKER_BOOTSTRAP_FILE_ENV, type WorkerBootstrapFileSource } from "./bootstrap.ts";
+import { runWorkerMain } from "./main.ts";
+import type { CloudWorkerDependencies } from "./CloudWorker.ts";
+
+const bootstrapText = `{"schemaVersion":1,"workerId":"worker-1","workspaceId":"workspace-1","environmentId":"environment-1","environmentRevisionId":"revision-1","threadId":"thread-1","sandboxId":"sandbox-1","provider":{"instanceId":"codex_personal","driver":"codex"},"workspaceDirectory":"/workspace/project","relayEndpoint":"wss://control.example.com/worker","relayCredentialRef":"relay-ref-1","secretLeaseRef":"lease-ref-1","issuedAt":"2026-08-27T00:25:00.000Z","expiresAt":"2026-08-27T00:40:00.000Z"}`;
+
+it.effect("interrupts provider work and scrubs leased credentials on termination", () =>
+  Effect.gen(function* () {
+    const providerStarted = yield* Deferred.make<void>();
+    const relayConnected = yield* Deferred.make<void>();
+    let providerStops = 0;
+    let relayCloses = 0;
+    let scrubs = 0;
+    const dependencies: CloudWorkerDependencies = {
+      relay: {
+        connect: () =>
+          Deferred.succeed(relayConnected, undefined).pipe(
+            Effect.as({
+              receive: Effect.never.pipe(Effect.as(Option.none())),
+              claimCommand: () => Effect.succeed("execute" as const),
+              send: () => Effect.void,
+              close: Effect.sync(() => {
+                relayCloses += 1;
+              }),
+            }),
+          ),
+      },
+      provider: {
+        start: () =>
+          Deferred.succeed(providerStarted, undefined).pipe(
+            Effect.as({
+              dispatch: () => Effect.void,
+              health: Effect.succeed("ready" as const),
+              stop: Effect.sync(() => {
+                providerStops += 1;
+              }),
+            }),
+          ),
+      },
+      secretLease: {
+        materialize: ({ leaseRef }) =>
+          Effect.succeed({
+            leaseRef,
+            credentialDirectory: "/run/agentsin/credentials",
+            environmentVariableNames: ["CODEX_HOME"],
+            containsWalletMaterial: false,
+            scrub: Effect.sync(() => {
+              scrubs += 1;
+            }),
+          }),
+      },
+      clock: { now: Effect.succeed("2026-08-27T00:30:00.000Z") },
+      ids: { nextProposalId: Effect.succeed("proposal-1" as never) },
+      logger: {
+        info: () => Effect.void,
+        warn: () => Effect.void,
+        error: () => Effect.void,
+      },
+    };
+    const source: WorkerBootstrapFileSource = {
+      currentUid: 501,
+      openNoFollow: () =>
+        Effect.acquireRelease(
+          Effect.succeed({
+            stat: Effect.succeed({
+              bytes: bootstrapText.length,
+              mode: 0o100600,
+              ownerUid: 501,
+              regularFile: true,
+            }),
+            readBounded: () => Effect.succeed(bootstrapText),
+          }),
+          () => Effect.void,
+        ),
+    };
+    yield* runWorkerMain(dependencies, {
+      env: { [WORKER_BOOTSTRAP_FILE_ENV]: "/run/secrets/bootstrap.json" },
+      bootstrapSource: source,
+      termination: Effect.all([Deferred.await(providerStarted), Deferred.await(relayConnected)]),
+    });
+    expect(providerStops).toBe(1);
+    expect(relayCloses).toBe(1);
+    expect(scrubs).toBe(1);
+  }),
+);

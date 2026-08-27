@@ -15,6 +15,10 @@
       "types": "./src/cloud.ts",
       "import": "./src/cloud.ts"
     },
+    "./worker": {
+      "types": "./src/worker.ts",
+      "import": "./src/worker.ts"
+    },
     "./settings": {
       "types": "./src/settings.ts",
       "import": "./src/settings.ts"
