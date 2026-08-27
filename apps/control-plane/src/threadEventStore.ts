@@ -71,6 +71,13 @@ export interface AppendThreadEventsResult {
   readonly nextSequence: number;
 }
 
+export interface ReplayThreadEventsWindow {
+  readonly events: ReadonlyArray<CloudThreadEvent>;
+  /** The sequence to request next, not the last sequence returned. */
+  readonly nextSequence: number;
+  readonly hasMore: boolean;
+}
+
 export interface PersistedThreadApproval {
   readonly workspaceId: WorkspaceId;
   readonly threadId: ThreadId;
@@ -128,6 +135,12 @@ export interface ThreadEventStoreService {
     workspaceId: WorkspaceId,
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<CloudThreadEvent>, ThreadEventStoreError>;
+  readonly replayAfter: (
+    workspaceId: WorkspaceId,
+    threadId: ThreadId,
+    afterSequence: number,
+    limit: number,
+  ) => Effect.Effect<ReplayThreadEventsWindow, ThreadEventStoreError>;
   readonly saveApproval: (
     approval: PersistedThreadApproval,
   ) => Effect.Effect<void, ThreadEventStoreError>;
@@ -853,6 +866,143 @@ export const make = Effect.fn("ThreadEventStore.make")(function* () {
     );
   };
 
+  const replayAfter: ThreadEventStoreService["replayAfter"] = (
+    workspaceId,
+    threadId,
+    afterSequence,
+    limit,
+  ) => {
+    const operation = "replay-events-after";
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < -1) {
+      return Effect.fail(fail("invalidRecord", operation, workspaceId, threadId));
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      return Effect.fail(fail("invalidRecord", operation, workspaceId, threadId));
+    }
+    return transact(database, operation, workspaceId, threadId, (client) =>
+      query(
+        client,
+        operation,
+        workspaceId,
+        threadId,
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      ).pipe(
+        Effect.flatMap(() =>
+          query<ThreadRow>(
+            client,
+            operation,
+            workspaceId,
+            threadId,
+            `SELECT environment_id, next_event_sequence::text AS next_event_sequence
+               FROM cloud_thread
+              WHERE workspace_id = $1 AND thread_id = $2`,
+            [workspaceId, threadId],
+          ),
+        ),
+        Effect.flatMap((threads) => {
+          const thread = threads[0];
+          if (thread === undefined) {
+            return Effect.fail(fail("notFound", operation, workspaceId, threadId));
+          }
+          return safeInteger(thread.next_event_sequence, operation, workspaceId, threadId).pipe(
+            Effect.flatMap((durableNextSequence) => {
+              const requestedNextSequence = afterSequence + 1;
+              if (requestedNextSequence > durableNextSequence) {
+                return Effect.fail(
+                  fail("replayGap", operation, workspaceId, threadId, {
+                    durableNextSequence,
+                    requestedNextSequence,
+                  }),
+                );
+              }
+              const expectedCount = Math.min(limit, durableNextSequence - requestedNextSequence);
+              return query<EventEnvelopeRow>(
+                client,
+                operation,
+                workspaceId,
+                threadId,
+                `SELECT sequence::text AS sequence, environment_id, event_id, fingerprint,
+                        occurred_at_text, received_at_text,
+                        occurred_at = occurred_at_text::timestamptz AS occurred_at_matches_text,
+                        received_at = received_at_text::timestamptz AS received_at_matches_text,
+                        envelope
+                   FROM cloud_thread_event
+                  WHERE workspace_id = $1 AND thread_id = $2 AND sequence >= $3
+                  ORDER BY sequence ASC
+                  LIMIT $4`,
+                [workspaceId, threadId, requestedNextSequence, limit],
+              ).pipe(
+                Effect.flatMap((rows) =>
+                  Effect.gen(function* () {
+                    if (rows.length !== expectedCount) {
+                      return yield* fail("replayGap", operation, workspaceId, threadId, {
+                        expectedCount,
+                        receivedCount: rows.length,
+                      });
+                    }
+                    const events: Array<CloudThreadEvent> = [];
+                    for (const [index, row] of rows.entries()) {
+                      const expectedSequence = requestedNextSequence + index;
+                      const sequence = yield* safeInteger(
+                        row.sequence,
+                        operation,
+                        workspaceId,
+                        threadId,
+                      );
+                      if (sequence !== expectedSequence) {
+                        return yield* fail("replayGap", operation, workspaceId, threadId, {
+                          expected: expectedSequence,
+                          received: sequence,
+                        });
+                      }
+                      const normalizedEnvelope = yield* normalizeJson(
+                        row.envelope,
+                        operation,
+                        workspaceId,
+                        threadId,
+                      );
+                      const envelope = yield* decodeCloudThreadEvent(normalizedEnvelope.value).pipe(
+                        Effect.mapError((cause) =>
+                          fail("invalidRecord", operation, workspaceId, threadId, cause),
+                        ),
+                      );
+                      if (
+                        envelope.workspaceId !== workspaceId ||
+                        envelope.threadId !== threadId ||
+                        envelope.environmentId !== thread.environment_id ||
+                        row.environment_id !== thread.environment_id ||
+                        envelope.event.sequence !== sequence
+                      ) {
+                        return yield* fail("tenantMismatch", operation, workspaceId, threadId);
+                      }
+                      if (
+                        row.event_id !== envelope.event.eventId ||
+                        row.fingerprint !== normalizedEnvelope.fingerprint ||
+                        row.occurred_at_text !== envelope.event.occurredAt ||
+                        row.received_at_text !== envelope.receivedAt ||
+                        !row.occurred_at_matches_text ||
+                        !row.received_at_matches_text
+                      ) {
+                        return yield* fail("eventConflict", operation, workspaceId, threadId);
+                      }
+                      events.push(envelope);
+                    }
+                    const nextSequence = requestedNextSequence + events.length;
+                    return {
+                      events,
+                      nextSequence,
+                      hasMore: nextSequence < durableNextSequence,
+                    };
+                  }),
+                ),
+              );
+            }),
+          );
+        }),
+      ),
+    );
+  };
+
   const saveApproval: ThreadEventStoreService["saveApproval"] = (approval) => {
     const operation = "save-approval";
     return Effect.gen(function* () {
@@ -1132,6 +1282,7 @@ export const make = Effect.fn("ThreadEventStore.make")(function* () {
     submitCommand,
     appendEvents,
     replay,
+    replayAfter,
     saveApproval,
     saveCheckpoint,
     appendLifecycle,

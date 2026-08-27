@@ -16,12 +16,14 @@
     "@t3tools/contracts": "workspace:*",
     "better-auth": "catalog:",
     "effect": "catalog:",
-    "pg": "catalog:"
+    "pg": "catalog:",
+    "ws": "8.21.0"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
     "@types/pg": "catalog:",
+    "@types/ws": "8.18.1",
     "vite-plus": "catalog:"
   },
   "engines": {

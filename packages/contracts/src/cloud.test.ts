@@ -18,7 +18,10 @@ import {
   AutomationRun,
   AutomationTrigger,
   CloudThreadCommand,
+  CloudThreadCommandSubmissionRequest,
   CloudThreadEvent,
+  CloudThreadStreamClientFrame,
+  CloudThreadStreamServerFrame,
   DesktopAuthExchangeRequest,
   DesktopAuthInitiateRequest,
   DesktopLease,
@@ -284,6 +287,11 @@ const decodeSandboxRequest = Schema.decodeUnknownSync(SandboxProviderRequest);
 const decodeSandboxResult = Schema.decodeUnknownSync(SandboxProviderResult);
 const decodeCloudThreadCommand = Schema.decodeUnknownSync(CloudThreadCommand);
 const decodeCloudThreadEvent = Schema.decodeUnknownSync(CloudThreadEvent);
+const decodeCloudThreadCommandSubmission = Schema.decodeUnknownSync(
+  CloudThreadCommandSubmissionRequest,
+);
+const decodeCloudThreadStreamClientFrame = Schema.decodeUnknownSync(CloudThreadStreamClientFrame);
+const decodeCloudThreadStreamServerFrame = Schema.decodeUnknownSync(CloudThreadStreamServerFrame);
 const decodePluginManifest = Schema.decodeUnknownSync(PluginManifest);
 const decodeUsageSample = Schema.decodeUnknownSync(UsageSample);
 
@@ -610,6 +618,56 @@ describe("cloud thread envelopes", () => {
   it("requires workspace identity on cloud thread envelopes", () => {
     expect(() => decodeCloudThreadCommand({ ...command, workspaceId: undefined })).toThrow();
     expect(() => decodeCloudThreadEvent({ ...event, workspaceId: undefined })).toThrow();
+  });
+
+  it("bounds and versions desktop command and stream RPC frames", () => {
+    expect(
+      decodeCloudThreadCommandSubmission({
+        protocolVersion: 1,
+        idempotencyKey: "desktop-request-1",
+        envelope: command,
+      }).idempotencyKey,
+    ).toBe("desktop-request-1");
+    expect(
+      decodeCloudThreadStreamClientFrame({
+        protocolVersion: 1,
+        type: "subscribe",
+        threadId: "thread-1",
+        afterSequence: -1,
+      }).type,
+    ).toBe("subscribe");
+    expect(
+      decodeCloudThreadStreamServerFrame({
+        protocolVersion: 1,
+        type: "event",
+        event,
+      }).type,
+    ).toBe("event");
+
+    expect(() =>
+      decodeCloudThreadCommandSubmission({
+        protocolVersion: 2,
+        idempotencyKey: "desktop-request-1",
+        envelope: command,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeCloudThreadStreamClientFrame({
+        protocolVersion: 1,
+        type: "subscribe",
+        threadId: "thread-1",
+        afterSequence: -2,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeCloudThreadStreamClientFrame({
+        protocolVersion: 1,
+        type: "subscribe",
+        threadId: "thread-1",
+        afterSequence: -1,
+        workspaceId: "spoofed-workspace",
+      }),
+    ).toThrow();
   });
 
   it("rejects project commands at the thread boundary", () => {

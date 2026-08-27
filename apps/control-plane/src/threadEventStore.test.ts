@@ -384,6 +384,8 @@ class FakePostgres {
       sql.startsWith("SELECT sequence::text AS sequence, environment_id, event_id, fingerprint")
     ) {
       const [workspaceId, threadId] = values.map(String);
+      const requestedNextSequence = values.length >= 3 ? Number(values[2]) : 0;
+      const limit = values.length >= 4 ? Number(values[3]) : Number.MAX_SAFE_INTEGER;
       return {
         rows: [...state.events.values()]
           .filter(
@@ -392,6 +394,8 @@ class FakePostgres {
               String((event.envelope as { threadId: string }).threadId) === threadId,
           )
           .sort((left, right) => left.sequence - right.sequence)
+          .filter((persistedEvent) => persistedEvent.sequence >= requestedNextSequence)
+          .slice(0, limit)
           .map((event) => ({
             sequence: String(event.sequence),
             environment_id: String(
@@ -604,6 +608,32 @@ it.effect("replays in sequence and rejects a corrupted gap", () => {
     postgres.corruptEventSequence(workspaceA, "event-1", 2);
     const gap = yield* store.replay(workspaceA, threadId).pipe(Effect.flip);
     expect(gap.code).toBe("replayGap");
+  });
+});
+
+it.effect("replays bounded windows after an explicit durable sequence cursor", () => {
+  const postgres = new FakePostgres();
+  return Effect.gen(function* () {
+    const store = yield* makeStore(postgres);
+    yield* store.createThread(identity());
+    yield* store.appendEvents({
+      identity: identity(),
+      events: [event(0), event(1), event(2), event(3)],
+    });
+
+    const first = yield* store.replayAfter(workspaceA, threadId, -1, 2);
+    expect(first.events.map((envelope) => envelope.event.sequence)).toEqual([0, 1]);
+    expect(first).toMatchObject({ nextSequence: 2, hasMore: true });
+
+    const second = yield* store.replayAfter(workspaceA, threadId, 1, 2);
+    expect(second.events.map((envelope) => envelope.event.sequence)).toEqual([2, 3]);
+    expect(second).toMatchObject({ nextSequence: 4, hasMore: false });
+
+    const caughtUp = yield* store.replayAfter(workspaceA, threadId, 3, 2);
+    expect(caughtUp).toEqual({ events: [], nextSequence: 4, hasMore: false });
+
+    const futureCursor = yield* store.replayAfter(workspaceA, threadId, 4, 2).pipe(Effect.flip);
+    expect(futureCursor.code).toBe("replayGap");
   });
 });
 

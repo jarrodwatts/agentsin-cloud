@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import { type ControlPlaneConfigShape } from "./config.ts";
 import { type DatabaseService } from "./database.ts";
 import { makeApplication } from "./main.ts";
+import { type ThreadEventStoreService } from "./threadEventStore.ts";
 import { type WorkspaceRepositoryService } from "./workspaces.ts";
 
 const config: ControlPlaneConfigShape = {
@@ -36,6 +37,11 @@ const workspaces: WorkspaceRepositoryService = {
   findForUser: () => Effect.void.pipe(Effect.as(undefined)),
 };
 
+const threadEvents = {
+  submitCommand: () => Effect.die("not used by the health-route composition test"),
+  replayAfter: () => Effect.die("not used by the health-route composition test"),
+} as unknown as ThreadEventStoreService;
+
 it.effect("wires auth, services, and HTTP routes without opening a listener", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -48,7 +54,7 @@ it.effect("wires auth, services, and HTTP routes without opening a listener", ()
         query: <Row>() => Effect.succeed([] as ReadonlyArray<Row>),
         ping: Effect.void,
       };
-      const application = makeApplication({ config, database, workspaces });
+      const application = makeApplication({ config, database, workspaces, threadEvents });
       const response = yield* Effect.promise(() =>
         application.handle(new Request("https://control.example.com/healthz")),
       );

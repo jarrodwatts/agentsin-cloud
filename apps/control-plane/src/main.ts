@@ -8,9 +8,16 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { makeAuth } from "./auth.ts";
+import { makeCloudRpc, type ThreadEventSignalHub } from "./cloudRpc.ts";
+import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import { ControlPlaneConfig, layer as controlPlaneConfigLayer } from "./config.ts";
 import { Database, layer as databaseLayer } from "./database.ts";
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
+import {
+  layer as threadEventStoreLayer,
+  ThreadEventStore,
+  type ThreadEventStoreService,
+} from "./threadEventStore.ts";
 import {
   ensureWorkspaceForUser,
   layer as workspaceRepositoryLayer,
@@ -313,15 +320,18 @@ const listen = (
     catch: (cause) => new ServerStartupError({ cause }),
   });
 
-export const runtimeLayer = workspaceRepositoryLayer.pipe(
+const persistenceLayer = Layer.merge(workspaceRepositoryLayer, threadEventStoreLayer).pipe(
   Layer.provideMerge(databaseLayer),
-  Layer.provideMerge(controlPlaneConfigLayer),
 );
+
+export const runtimeLayer = persistenceLayer.pipe(Layer.provideMerge(controlPlaneConfigLayer));
 
 export interface ControlPlaneApplicationDependencies {
   readonly config: import("./config.ts").ControlPlaneConfigShape;
   readonly database: import("./database.ts").DatabaseService;
   readonly workspaces: WorkspaceRepositoryService;
+  readonly threadEvents: ThreadEventStoreService;
+  readonly threadEventSignals?: ThreadEventSignalHub;
 }
 
 /**
@@ -333,9 +343,12 @@ export const makeApplication = ({
   config,
   database,
   workspaces,
+  threadEvents,
+  threadEventSignals,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
+  readonly cloudRpc: ReturnType<typeof makeCloudRpc>;
 } => {
   const auth = makeAuth({
     config,
@@ -349,9 +362,18 @@ export const makeApplication = ({
       ),
   });
 
+  const cloudRpc = makeCloudRpc({
+    auth,
+    hostedOrigin: config.betterAuthUrl.origin,
+    workspaces,
+    eventStore: threadEvents,
+    ...(threadEventSignals === undefined ? {} : { signals: threadEventSignals }),
+  });
+
   return {
     auth,
-    handle: makeRequestHandler({ auth, config, database, workspaces }),
+    cloudRpc,
+    handle: makeRequestHandler({ auth, config, database, workspaces, cloudRpc }),
   };
 };
 
@@ -359,11 +381,19 @@ export const program = Effect.gen(function* () {
   const config = yield* ControlPlaneConfig;
   const database = yield* Database;
   const workspaces = yield* WorkspaceRepository;
-  const { handle } = makeApplication({ config, database, workspaces });
+  const threadEvents = yield* ThreadEventStore;
+  const { handle, cloudRpc } = makeApplication({ config, database, workspaces, threadEvents });
   const server = yield* listen(config, config.betterAuthUrl, handle);
+  const cloudRpcWebSocket = attachCloudRpcWebSocket({
+    server,
+    rpc: cloudRpc,
+    baseUrl: config.betterAuthUrl,
+    authenticationTimeoutMs: config.requestTimeoutMs,
+  });
 
   yield* Effect.addFinalizer(() =>
     Effect.callback<void, never>((resume) => {
+      cloudRpcWebSocket.detach();
       server.close(() => resume(Effect.void));
     }),
   );

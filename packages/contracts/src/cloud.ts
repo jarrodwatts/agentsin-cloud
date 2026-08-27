@@ -934,6 +934,101 @@ export const CloudThreadEvent = Schema.Struct({
 );
 export type CloudThreadEvent = typeof CloudThreadEvent.Type;
 
+/** Wire version for the hosted desktop command and event-stream endpoints. */
+export const CLOUD_DESKTOP_RPC_VERSION = 1 as const;
+
+const CloudRpcIdempotencyKey = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+
+/**
+ * HTTPS request for an idempotent thread command. The control plane derives
+ * the authenticated workspace and rejects an envelope for any other tenant.
+ */
+export const CloudThreadCommandSubmissionRequest = Schema.Struct({
+  protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+  idempotencyKey: CloudRpcIdempotencyKey,
+  envelope: CloudThreadCommand,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type CloudThreadCommandSubmissionRequest = typeof CloudThreadCommandSubmissionRequest.Type;
+
+export const CloudThreadCommandSubmissionResult = Schema.Struct({
+  protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+  disposition: Schema.Literals(["accepted", "duplicate"]),
+  commandId: CommandId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type CloudThreadCommandSubmissionResult = typeof CloudThreadCommandSubmissionResult.Type;
+
+/** -1 means no event has been observed yet; otherwise this is the last sequence received. */
+export const CloudThreadEventCursor = Schema.Int.check(
+  Schema.isBetween({ minimum: -1, maximum: Number.MAX_SAFE_INTEGER }),
+);
+export type CloudThreadEventCursor = typeof CloudThreadEventCursor.Type;
+
+export const CloudThreadStreamSubscribe = Schema.Struct({
+  protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+  type: Schema.Literal("subscribe"),
+  threadId: ThreadId,
+  afterSequence: CloudThreadEventCursor,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type CloudThreadStreamSubscribe = typeof CloudThreadStreamSubscribe.Type;
+
+export const CloudThreadStreamHeartbeatAck = Schema.Struct({
+  protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+  type: Schema.Literal("heartbeatAck"),
+  nonce: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type CloudThreadStreamHeartbeatAck = typeof CloudThreadStreamHeartbeatAck.Type;
+
+export const CloudThreadStreamClientFrame = Schema.Union([
+  CloudThreadStreamSubscribe,
+  CloudThreadStreamHeartbeatAck,
+]);
+export type CloudThreadStreamClientFrame = typeof CloudThreadStreamClientFrame.Type;
+
+export const CloudThreadStreamErrorCode = Schema.Literals([
+  "unauthorized",
+  "forbidden",
+  "invalidRequest",
+  "notFound",
+  "replayGap",
+  "slowConsumer",
+  "connectionLimit",
+  "internalError",
+]);
+export type CloudThreadStreamErrorCode = typeof CloudThreadStreamErrorCode.Type;
+
+export const CloudThreadStreamServerFrame = Schema.Union([
+  Schema.Struct({
+    protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+    type: Schema.Literal("subscribed"),
+    threadId: ThreadId,
+    afterSequence: CloudThreadEventCursor,
+  }),
+  Schema.Struct({
+    protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+    type: Schema.Literal("event"),
+    event: CloudThreadEvent,
+  }),
+  Schema.Struct({
+    protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+    type: Schema.Literal("caughtUp"),
+    threadId: ThreadId,
+    lastSequence: CloudThreadEventCursor,
+  }),
+  Schema.Struct({
+    protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+    type: Schema.Literal("heartbeat"),
+    nonce: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+    sentAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    protocolVersion: Schema.Literal(CLOUD_DESKTOP_RPC_VERSION),
+    type: Schema.Literal("error"),
+    code: CloudThreadStreamErrorCode,
+    retryable: Schema.Boolean,
+  }),
+]);
+export type CloudThreadStreamServerFrame = typeof CloudThreadStreamServerFrame.Type;
+
 const AgentConnectionAdapterRequestFields = {
   requestId: CommandId,
   workspaceId: WorkspaceId,
