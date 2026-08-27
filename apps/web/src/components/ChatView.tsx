@@ -171,6 +171,14 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
 import { CloudDesktopInspector } from "./cloud/CloudDesktopInspector";
+import { CloudThreadStatusBar, CloudThreadTimelineFrame } from "./cloud/CloudThreadTimeline";
+import {
+  cloudComposerBlockedReason,
+  cloudThreadReplayBlockedReason,
+  DISABLED_CLOUD_THREAD_TIMELINE_CAPABILITY,
+  inspectCloudThreadEventIntegrity,
+  type CloudThreadTimelineCapability,
+} from "./cloud/cloudThreadTimelineModel";
 import { AgentsPanel } from "./AgentsPanel";
 import {
   deriveAgentPanelModel,
@@ -581,6 +589,7 @@ type ChatViewProps =
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: ThreadSyncPhase | null;
       cloudDesktopCapability?: CloudDesktopCapability;
+      cloudThreadCapability?: CloudThreadTimelineCapability;
       routeKind: "server";
       draftId?: never;
     }
@@ -592,6 +601,7 @@ type ChatViewProps =
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: never;
       cloudDesktopCapability?: CloudDesktopCapability;
+      cloudThreadCapability?: CloudThreadTimelineCapability;
       routeKind: "draft";
       draftId: DraftId;
     };
@@ -1282,10 +1292,34 @@ function ChatViewContent(props: ChatViewProps) {
     reserveTitleBarControlInset = true,
     forceExpandedMobileComposer = false,
     cloudDesktopCapability = DEFAULT_CLOUD_DESKTOP_CAPABILITY,
+    cloudThreadCapability = DISABLED_CLOUD_THREAD_TIMELINE_CAPABILITY,
   } = props;
   // This is intentionally an explicit capability input. Relay-managed is a
   // connection mode, not proof that a cloud desktop lease or stream exists.
   const cloudDesktopAvailable = cloudDesktopCapability.enabled;
+  const cloudThreadEvents = cloudThreadCapability.enabled
+    ? cloudThreadCapability.view.events
+    : null;
+  const cloudThreadIntegrity = useMemo(
+    () => (cloudThreadEvents === null ? null : inspectCloudThreadEventIntegrity(cloudThreadEvents)),
+    [cloudThreadEvents],
+  );
+  const cloudThreadRuntime =
+    cloudThreadCapability.enabled && cloudThreadCapability.view.phase === "ready"
+      ? cloudThreadCapability.view.runtime
+      : cloudThreadCapability.enabled && cloudThreadCapability.view.phase === "error"
+        ? (cloudThreadCapability.view.runtime ?? null)
+        : null;
+  const cloudComposerDisabledReason = cloudThreadCapability.enabled
+    ? cloudThreadCapability.view.phase === "loading"
+      ? "Restoring cloud thread"
+      : cloudThreadCapability.view.phase === "error"
+        ? "Cloud thread is unavailable"
+        : ((cloudThreadIntegrity === null
+            ? null
+            : cloudThreadReplayBlockedReason(cloudThreadIntegrity)) ??
+          cloudComposerBlockedReason(cloudThreadCapability.view.runtime.composerState))
+    : null;
   const draftId = routeKind === "draft" ? props.draftId : null;
   const threadSyncPhase = routeKind === "server" ? (props.threadSyncPhase ?? null) : null;
   const threadDetailLoading = threadSyncPhase === "loading";
@@ -6850,6 +6884,45 @@ function ChatViewContent(props: ChatViewProps) {
   });
   const externalComposerDrawerAttached =
     composerBannerItems.length > 0 || Boolean(threadSyncPhase && !activeEnvironmentUnavailable);
+  // Cloud delivery wraps the same canonical orchestration events. Keep one
+  // virtualized timeline so plans, approvals, tools, and checkpoint diffs do
+  // not acquire a second presentation model or a non-virtualized cloud path.
+  const messagesTimeline = (
+    <MessagesTimeline
+      agentPanelModel={agentPanelModel}
+      onOpenAgents={addAgentsSurface}
+      key={activeThread.id}
+      isWorking={isWorking}
+      workingStepLabel={workingStepLabel}
+      activeTurnStartedAt={activeWorkStartedAt}
+      listRef={legendListRef}
+      timelineEntries={timelineEntries}
+      latestTurn={activeLatestTurn}
+      runningTurnId={activeRunningTurnId}
+      turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
+      activeThreadEnvironmentId={activeThread.environmentId}
+      routeThreadKey={routeThreadKey}
+      onOpenTurnDiff={onOpenTurnDiff}
+      revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
+      onRevertUserMessage={onRevertUserMessage}
+      isRevertingCheckpoint={isRevertingCheckpoint}
+      onImageExpand={onExpandTimelineImage}
+      markdownCwd={gitCwd ?? undefined}
+      resolvedTheme={resolvedTheme}
+      timestampFormat={timestampFormat}
+      workspaceRoot={activeWorkspaceRoot}
+      skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
+      anchorMessageId={timelineAnchorMessageId}
+      onAnchorReady={onTimelineAnchorReady}
+      contentInsetEndAdjustment={composerOverlayHeight}
+      liveFollowEnabled={timelineLiveFollowEnabled}
+      onIsAtEndChange={onIsAtEndChange}
+      onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+      hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
+      topFadeEnabled={!hasTimelineTopBanner}
+      loadEarlier={loadEarlierTurns}
+    />
+  );
 
   return (
     <div
@@ -6946,40 +7019,19 @@ function ChatViewContent(props: ChatViewProps) {
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
-              <MessagesTimeline
-                agentPanelModel={agentPanelModel}
-                onOpenAgents={addAgentsSurface}
-                key={activeThread.id}
-                isWorking={isWorking}
-                workingStepLabel={workingStepLabel}
-                activeTurnStartedAt={activeWorkStartedAt}
-                listRef={legendListRef}
-                timelineEntries={timelineEntries}
-                latestTurn={activeLatestTurn}
-                runningTurnId={activeRunningTurnId}
-                turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
-                activeThreadEnvironmentId={activeThread.environmentId}
-                routeThreadKey={routeThreadKey}
-                onOpenTurnDiff={onOpenTurnDiff}
-                revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
-                onRevertUserMessage={onRevertUserMessage}
-                isRevertingCheckpoint={isRevertingCheckpoint}
-                onImageExpand={onExpandTimelineImage}
-                markdownCwd={gitCwd ?? undefined}
-                resolvedTheme={resolvedTheme}
-                timestampFormat={timestampFormat}
-                workspaceRoot={activeWorkspaceRoot}
-                skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
-                anchorMessageId={timelineAnchorMessageId}
-                onAnchorReady={onTimelineAnchorReady}
-                contentInsetEndAdjustment={composerOverlayHeight}
-                liveFollowEnabled={timelineLiveFollowEnabled}
-                onIsAtEndChange={onIsAtEndChange}
-                onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
-                hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
-                topFadeEnabled={!hasTimelineTopBanner}
-                loadEarlier={loadEarlierTurns}
-              />
+              {cloudThreadCapability.enabled ? (
+                <CloudThreadTimelineFrame
+                  view={cloudThreadCapability.view}
+                  {...(cloudThreadIntegrity === null ? {} : { integrity: cloudThreadIntegrity })}
+                  {...(cloudThreadCapability.onRetry
+                    ? { onRetry: cloudThreadCapability.onRetry }
+                    : {})}
+                >
+                  {messagesTimeline}
+                </CloudThreadTimelineFrame>
+              ) : (
+                messagesTimeline
+              )}
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
               {showScrollToBottom && (
@@ -7082,7 +7134,7 @@ function ChatViewContent(props: ChatViewProps) {
                                 ? "Sending feedback"
                                 : threadDetailLoading
                                   ? "Messages loading"
-                                  : null
+                                  : cloudComposerDisabledReason
                             }
                             isPreparingWorktree={isPreparingWorktree}
                             externalDrawerAttached={externalComposerDrawerAttached}
@@ -7182,6 +7234,9 @@ function ChatViewContent(props: ChatViewProps) {
                             </div>
                           )}
                         </div>
+                        {cloudThreadRuntime ? (
+                          <CloudThreadStatusBar runtime={cloudThreadRuntime} />
+                        ) : null}
                       </div>
                     </div>
                     <div
