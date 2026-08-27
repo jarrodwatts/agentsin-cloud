@@ -338,6 +338,25 @@ class FakePostgres {
       });
       return { rows: [] };
     }
+    if (sql.startsWith("SELECT outbox_id::text AS outbox_id, payload, attempt_count")) {
+      const [workspaceId, addressedThreadId, limit] = values;
+      return {
+        rows: [...state.outbox.values()]
+          .filter(
+            (entry) =>
+              entry.workspaceId === String(workspaceId) &&
+              entry.topic === "thread.command" &&
+              entry.aggregateId === String(addressedThreadId) &&
+              entry.deliveredAt === undefined,
+          )
+          .slice(0, Number(limit))
+          .map((entry) => ({
+            outbox_id: entry.outboxId,
+            payload: entry.payload,
+            attempt_count: 0,
+          })),
+      };
+    }
     if (sql.startsWith("INSERT INTO cloud_thread_approval")) {
       const [workspaceId, addressedThreadId, requestId] = values.map(String);
       const key = `${workspaceId}/${requestId}`;
@@ -508,6 +527,28 @@ it.effect("enforces workspace-scoped command idempotency under concurrent retrie
       .pipe(Effect.flip);
     expect(conflict).toBeInstanceOf(ThreadEventStoreError);
     expect(conflict.code).toBe("idempotencyConflict");
+  });
+});
+
+it.effect("replays only authoritative pending commands for the addressed worker thread", () => {
+  const postgres = new FakePostgres();
+  return Effect.gen(function* () {
+    const store = yield* makeStore(postgres);
+    yield* store.createThread(identity());
+    yield* store.submitCommand({
+      idempotencyKey: "worker-replay-request",
+      envelope: command("worker-replay-command"),
+    });
+
+    const pending = yield* store.listPendingThreadCommands(workspaceA, threadId, 256);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.command.command.commandId).toBe("worker-replay-command");
+    expect(pending[0]?.outboxId).toBe("outbox-1");
+
+    const otherTenant = yield* store
+      .listPendingThreadCommands(workspaceB, threadId, 256)
+      .pipe(Effect.flip);
+    expect(otherTenant.code).toBe("notFound");
   });
 });
 

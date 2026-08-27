@@ -264,6 +264,7 @@ export interface SandboxCleanupOrphanRecord {
 }
 
 export interface SandboxCreateReconciliationRecord {
+  readonly workspaceId: WorkspaceId;
   readonly reservationId: CommandId;
   readonly reason: "remote-create-cleanup-uncertain";
   readonly providerHandle?: string;
@@ -280,10 +281,12 @@ export interface SandboxIdentityStore {
   readonly reserve: (record: SandboxIdentityReservation) => Promise<void>;
   /** Atomically replaces the pending reservation with its active sandbox identity. */
   readonly activateReservation: (
+    workspaceId: WorkspaceId,
     reservationId: CommandId,
     record: SandboxIdentityRecord,
   ) => Promise<void>;
   readonly markReservationFailed: (
+    workspaceId: WorkspaceId,
     reservationId: CommandId,
     failedAt: string,
     reason: "remote-create-failed" | "remote-reclaimed",
@@ -292,11 +295,26 @@ export interface SandboxIdentityStore {
   readonly markReservationCleanupRequired: (
     record: SandboxCreateReconciliationRecord,
   ) => Promise<void>;
-  readonly get: (sandboxId: SandboxId) => Promise<SandboxIdentityRecord | undefined>;
-  readonly markDestroyed: (sandboxId: SandboxId, destroyedAt: string) => Promise<void>;
+  readonly get: (
+    workspaceId: WorkspaceId,
+    sandboxId: SandboxId,
+  ) => Promise<SandboxIdentityRecord | undefined>;
+  readonly markDestroyed: (
+    workspaceId: WorkspaceId,
+    sandboxId: SandboxId,
+    destroyedAt: string,
+  ) => Promise<void>;
   readonly recordCleanupOrphan: (record: SandboxCleanupOrphanRecord) => Promise<void>;
-  readonly recordCleanupFailure: (orphanId: string, attemptedAt: string) => Promise<void>;
-  readonly markCleanupOrphanReclaimed: (orphanId: string, reclaimedAt: string) => Promise<void>;
+  readonly recordCleanupFailure: (
+    workspaceId: WorkspaceId,
+    orphanId: string,
+    attemptedAt: string,
+  ) => Promise<void>;
+  readonly markCleanupOrphanReclaimed: (
+    workspaceId: WorkspaceId,
+    orphanId: string,
+    reclaimedAt: string,
+  ) => Promise<void>;
 }
 
 export interface ArtifactWriteInput {

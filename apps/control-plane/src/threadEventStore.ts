@@ -121,6 +121,12 @@ export interface ThreadOutboxMessage {
   readonly createdAt: string;
 }
 
+export interface PendingThreadCommand {
+  readonly outboxId: string;
+  readonly command: CloudThreadCommand;
+  readonly attemptCount: number;
+}
+
 export interface ThreadEventStoreService {
   readonly createThread: (
     identity: CloudThreadIdentity,
@@ -154,6 +160,11 @@ export interface ThreadEventStoreService {
     workspaceId: WorkspaceId,
     limit: number,
   ) => Effect.Effect<ReadonlyArray<ThreadOutboxMessage>, ThreadEventStoreError>;
+  readonly listPendingThreadCommands: (
+    workspaceId: WorkspaceId,
+    threadId: ThreadId,
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<PendingThreadCommand>, ThreadEventStoreError>;
   readonly markOutboxDelivered: (
     workspaceId: WorkspaceId,
     outboxId: string,
@@ -318,6 +329,12 @@ interface OutboxRow extends QueryResultRow {
   readonly payload: unknown;
   readonly attempt_count: number;
   readonly created_at: string;
+}
+
+interface PendingCommandOutboxRow extends QueryResultRow {
+  readonly outbox_id: string;
+  readonly payload: unknown;
+  readonly attempt_count: number;
 }
 
 const safeInteger = (
@@ -1217,6 +1234,73 @@ export const make = Effect.fn("ThreadEventStore.make")(function* () {
       );
   };
 
+  const listPendingThreadCommands: ThreadEventStoreService["listPendingThreadCommands"] = (
+    workspaceId,
+    threadId,
+    limit,
+  ) => {
+    const operation = "list-pending-thread-commands";
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      return Effect.fail(fail("invalidRecord", operation, workspaceId, threadId));
+    }
+    return transact(database, operation, workspaceId, threadId, (client) =>
+      query<ThreadRow>(
+        client,
+        operation,
+        workspaceId,
+        threadId,
+        `SELECT environment_id, next_event_sequence::text AS next_event_sequence
+           FROM cloud_thread
+          WHERE workspace_id = $1 AND thread_id = $2`,
+        [workspaceId, threadId],
+      ).pipe(
+        Effect.flatMap((threads) => {
+          const thread = threads[0];
+          if (thread === undefined) {
+            return Effect.fail(fail("notFound", operation, workspaceId, threadId));
+          }
+          return query<PendingCommandOutboxRow>(
+            client,
+            operation,
+            workspaceId,
+            threadId,
+            `SELECT outbox_id::text AS outbox_id, payload, attempt_count
+               FROM cloud_thread_outbox
+              WHERE workspace_id = $1
+                AND topic = 'thread.command'
+                AND aggregate_id = $2
+                AND delivered_at IS NULL
+                AND available_at <= now()
+              ORDER BY available_at ASC, created_at ASC, outbox_id ASC
+              LIMIT $3`,
+            [workspaceId, threadId, limit],
+          ).pipe(
+            Effect.flatMap((rows) =>
+              Effect.forEach(rows, (row) =>
+                decodeCloudThreadCommand(row.payload).pipe(
+                  Effect.mapError((cause) =>
+                    fail("invalidRecord", operation, workspaceId, threadId, cause),
+                  ),
+                  Effect.flatMap((command) =>
+                    command.workspaceId !== workspaceId ||
+                    command.threadId !== threadId ||
+                    command.environmentId !== thread.environment_id
+                      ? Effect.fail(fail("tenantMismatch", operation, workspaceId, threadId))
+                      : Effect.succeed({
+                          outboxId: row.outbox_id,
+                          command,
+                          attemptCount: row.attempt_count,
+                        }),
+                  ),
+                ),
+              ),
+            ),
+          );
+        }),
+      ),
+    );
+  };
+
   const markOutboxDelivered: ThreadEventStoreService["markOutboxDelivered"] = (
     workspaceId,
     outboxId,
@@ -1287,6 +1371,7 @@ export const make = Effect.fn("ThreadEventStore.make")(function* () {
     saveCheckpoint,
     appendLifecycle,
     listPendingOutbox,
+    listPendingThreadCommands,
     markOutboxDelivered,
     pruneExpiredCommandLocks,
   });

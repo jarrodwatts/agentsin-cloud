@@ -145,6 +145,9 @@ importers:
       '@t3tools/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@t3tools/e2b-sandbox':
+        specifier: workspace:*
+        version: link:../../packages/e2b-sandbox
       better-auth:
         specifier: 'catalog:'
         version: 1.7.2(ab299ec35092317a0fd89b588c6469e4)

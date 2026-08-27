@@ -226,7 +226,7 @@ export const makeE2bSandboxProvider = (
   }) =>
     Effect.gen(function* () {
       const identity = yield* attempt("identity lookup", () =>
-        dependencies.identities.get(request.sandboxId),
+        dependencies.identities.get(request.workspaceId, request.sandboxId),
       );
       if (identity === undefined) {
         return yield* Effect.fail(
@@ -351,6 +351,7 @@ export const makeE2bSandboxProvider = (
             const reclaim = yield* Effect.exit(
               attempt("reservation cleanup-required transition", () =>
                 dependencies.identities.markReservationCleanupRequired({
+                  workspaceId: reservation.workspaceId,
                   reservationId: reservation.reservationId,
                   reason: "remote-create-cleanup-uncertain",
                   ...(cleanupRequired?.providerHandle === undefined
@@ -381,6 +382,7 @@ export const makeE2bSandboxProvider = (
           const reconciled = yield* Effect.exit(
             attempt("reservation create failure", () =>
               dependencies.identities.markReservationFailed(
+                reservation.workspaceId,
                 reservation.reservationId,
                 iso(dependencies.clock.now()),
                 "remote-create-failed",
@@ -409,6 +411,7 @@ export const makeE2bSandboxProvider = (
             const reconciliation = yield* Effect.exit(
               attempt("reservation reclaim", () =>
                 dependencies.identities.markReservationFailed(
+                  reservation.workspaceId,
                   reservation.reservationId,
                   iso(dependencies.clock.now()),
                   "remote-reclaimed",
@@ -465,6 +468,7 @@ export const makeE2bSandboxProvider = (
             const reconciliation = yield* Effect.exit(
               attempt("reservation reclaim", () =>
                 dependencies.identities.markReservationFailed(
+                  reservation.workspaceId,
                   reservation.reservationId,
                   iso(dependencies.clock.now()),
                   "remote-reclaimed",
@@ -498,7 +502,11 @@ export const makeE2bSandboxProvider = (
         }
         const registration = yield* Effect.exit(
           attempt("identity activation", () =>
-            dependencies.identities.activateReservation(reservation.reservationId, identity),
+            dependencies.identities.activateReservation(
+              reservation.workspaceId,
+              reservation.reservationId,
+              identity,
+            ),
           ),
         );
         if (Exit.isFailure(registration)) {
@@ -526,6 +534,7 @@ export const makeE2bSandboxProvider = (
             const reservationReclaimed = yield* Effect.exit(
               attempt("reservation reclaim", () =>
                 dependencies.identities.markReservationFailed(
+                  reservation.workspaceId,
                   reservation.reservationId,
                   iso(dependencies.clock.now()),
                   "remote-reclaimed",
@@ -536,6 +545,7 @@ export const makeE2bSandboxProvider = (
               yield* Effect.exit(
                 attempt("cleanup orphan reclaim", () =>
                   dependencies.identities.markCleanupOrphanReclaimed(
+                    reservation.workspaceId,
                     orphanId,
                     iso(dependencies.clock.now()),
                   ),
@@ -565,6 +575,7 @@ export const makeE2bSandboxProvider = (
             yield* Effect.exit(
               attempt("cleanup orphan failure receipt", () =>
                 dependencies.identities.recordCleanupFailure(
+                  reservation.workspaceId,
                   orphanId,
                   iso(dependencies.clock.now()),
                 ),
@@ -940,7 +951,11 @@ export const makeE2bSandboxProvider = (
           );
           yield* attempt("destroy", () => dependencies.client.destroy(identity.providerHandle));
           yield* attempt("identity destroy", () =>
-            dependencies.identities.markDestroyed(request.sandboxId, iso(dependencies.clock.now())),
+            dependencies.identities.markDestroyed(
+              request.workspaceId,
+              request.sandboxId,
+              iso(dependencies.clock.now()),
+            ),
           );
         }
         return {

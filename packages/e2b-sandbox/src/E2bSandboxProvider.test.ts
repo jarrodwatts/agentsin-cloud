@@ -325,7 +325,7 @@ const makeHarness = (options?: {
         }
         reservations.set(record.reservationId, { ...record, state: "pending" });
       },
-      activateReservation: async (reservationId, record) => {
+      activateReservation: async (_workspaceId, reservationId, record) => {
         if (options?.identityActivationFailure === true) {
           throw new Error("identity activation failed");
         }
@@ -340,7 +340,7 @@ const makeHarness = (options?: {
           providerHandle: record.providerHandle,
         });
       },
-      markReservationFailed: async (reservationId, _failedAt, _reason) => {
+      markReservationFailed: async (_workspaceId, reservationId, _failedAt, _reason) => {
         if (options?.reservationFailureUpdateFailure === true) {
           throw new Error("reservation failure update failed");
         }
@@ -361,8 +361,8 @@ const makeHarness = (options?: {
           reclaimMetadata: reconciliation.reclaimMetadata,
         });
       },
-      get: async (sandboxId) => records.get(sandboxId),
-      markDestroyed: async (sandboxId, destroyedAt) => {
+      get: async (_workspaceId, sandboxId) => records.get(sandboxId),
+      markDestroyed: async (_workspaceId, sandboxId, destroyedAt) => {
         const record = records.get(sandboxId);
         if (record !== undefined) records.set(sandboxId, { ...record, destroyedAt });
       },
@@ -372,13 +372,13 @@ const makeHarness = (options?: {
         }
         cleanupOrphans.set(record.orphanId, record);
       },
-      recordCleanupFailure: async (orphanId, attemptedAt) => {
+      recordCleanupFailure: async (_workspaceId, orphanId, attemptedAt) => {
         const record = cleanupOrphans.get(orphanId);
         if (record !== undefined) {
           cleanupOrphans.set(orphanId, { ...record, cleanupFailedAt: attemptedAt });
         }
       },
-      markCleanupOrphanReclaimed: async (orphanId, reclaimedAt) => {
+      markCleanupOrphanReclaimed: async (_workspaceId, orphanId, reclaimedAt) => {
         const record = cleanupOrphans.get(orphanId);
         if (record !== undefined) {
           cleanupOrphans.set(orphanId, { ...record, reclaimedAt });
