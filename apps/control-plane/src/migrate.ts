@@ -34,8 +34,10 @@ const migrate = async () => {
       "0003-thread-integrity-locks.sql",
       "0004-cloud-thread-lifecycle.sql",
       "0005-worker-mtls.sql",
-      // 0006 is reserved for C5 and 0007 for D1 in the integration branch.
+      "0006-github-thread-workflow.sql",
+      // 0007 is reserved for D1 in the integration branch.
       "0008-thread-route-generation.sql",
+      "0009-github-worker-route-binding.sql",
     ];
     for (const filename of applicationMigrations) {
       const migration = await NodeFSP.readFile(

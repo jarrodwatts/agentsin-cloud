@@ -148,6 +148,9 @@ importers:
       '@t3tools/e2b-sandbox':
         specifier: workspace:*
         version: link:../../packages/e2b-sandbox
+      '@t3tools/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       better-auth:
         specifier: 'catalog:'
         version: 1.7.2(ab299ec35092317a0fd89b588c6469e4)

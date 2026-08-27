@@ -9,6 +9,7 @@
 import * as Schema from "effect/Schema";
 
 import {
+  ApprovalRequestId,
   CommandId,
   EnvironmentId,
   EventId,
@@ -22,6 +23,10 @@ import {
   CloudThreadCommand,
   CloudThreadEvent,
   EnvironmentRevisionId,
+  GitHubRepositoryRef,
+  GitHubThreadBranchName,
+  GitHubWorkflowAction,
+  GitObjectSha,
   SandboxId,
   WorkspaceId,
 } from "./cloud.ts";
@@ -41,6 +46,16 @@ export const WorkerSecretLeaseRef = makeWorkerId("WorkerSecretLeaseRef");
 export type WorkerSecretLeaseRef = typeof WorkerSecretLeaseRef.Type;
 export const WorkerRelayCredentialRef = makeWorkerId("WorkerRelayCredentialRef");
 export type WorkerRelayCredentialRef = typeof WorkerRelayCredentialRef.Type;
+export const WorkerGitHubOperationId = makeWorkerId("WorkerGitHubOperationId");
+export type WorkerGitHubOperationId = typeof WorkerGitHubOperationId.Type;
+export const WorkerGitHubTokenLeaseRef = makeWorkerId("WorkerGitHubTokenLeaseRef");
+export type WorkerGitHubTokenLeaseRef = typeof WorkerGitHubTokenLeaseRef.Type;
+export const WORKER_GITHUB_TOKEN_REDEEM_PATH = "/api/v1/worker-github-token-leases/redeem" as const;
+export const WorkerGitHubApprovalGeneration = makeWorkerId("WorkerGitHubApprovalGeneration");
+export type WorkerGitHubApprovalGeneration = typeof WorkerGitHubApprovalGeneration.Type;
+
+const WorkerProcessInstanceId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+const WorkerCertificateFingerprint = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 
 /** `-1` is the only empty-log cursor; durable event sequences begin at zero. */
 export const WorkerEventCursor = Schema.Int.check(
@@ -143,6 +158,104 @@ export const WorkerRelayCommandDelivery = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type WorkerRelayCommandDelivery = typeof WorkerRelayCommandDelivery.Type;
 
+const WorkerGitHubCommandIdentity = {
+  operationId: WorkerGitHubOperationId,
+  commandId: CommandId,
+  workspaceId: WorkspaceId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  sandboxId: SandboxId,
+  repository: GitHubRepositoryRef,
+} as const;
+
+/** Exact durable relay route selected by the control plane for one GitHub write. */
+export const WorkerGitHubRouteBinding = Schema.Struct({
+  workerId: WorkerInstanceId,
+  reservationId: CommandId,
+  environmentRevisionId: EnvironmentRevisionId,
+  providerInstanceId: ProviderInstanceId,
+  providerDriver: ProviderDriverKind,
+  processInstanceId: WorkerProcessInstanceId,
+  certificateFingerprint: WorkerCertificateFingerprint,
+  certificateGeneration: PositiveInt,
+  leaseGeneration: PositiveInt,
+  routeGeneration: PositiveInt,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerGitHubRouteBinding = typeof WorkerGitHubRouteBinding.Type;
+
+/**
+ * Bounded Git operations executed by the authenticated thread worker. The
+ * workspace path and raw GitHub token are intentionally absent: the worker
+ * derives the path from its sealed bootstrap and materializes an opaque token
+ * lease only for the duration of a push.
+ */
+export const WorkerGitHubCommand = Schema.Union([
+  Schema.Struct({
+    ...WorkerGitHubCommandIdentity,
+    type: Schema.Literal("github.git.prepare-branch"),
+    branch: GitHubThreadBranchName,
+    baseSha: GitObjectSha,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    ...WorkerGitHubCommandIdentity,
+    type: Schema.Literal("github.git.prepare-checkpoint"),
+    branch: GitHubThreadBranchName,
+    expectedParentSha: GitObjectSha,
+    message: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+    committedAt: IsoDateTime,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    ...WorkerGitHubCommandIdentity,
+    type: Schema.Literal("github.git.push"),
+    branch: GitHubThreadBranchName,
+    localSha: GitObjectSha,
+    expectedRemoteSha: Schema.NullOr(GitObjectSha),
+    tokenLeaseRef: WorkerGitHubTokenLeaseRef,
+    approvalId: ApprovalRequestId,
+    approvalGeneration: WorkerGitHubApprovalGeneration,
+    approvalAction: GitHubWorkflowAction,
+    leaseExpiresAt: IsoDateTime,
+    routeBinding: WorkerGitHubRouteBinding,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+]);
+export type WorkerGitHubCommand = typeof WorkerGitHubCommand.Type;
+
+export const WorkerRelayGitHubCommandDelivery = Schema.Struct({
+  type: Schema.Literal("github.command"),
+  command: WorkerGitHubCommand,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerRelayGitHubCommandDelivery = typeof WorkerRelayGitHubCommandDelivery.Type;
+
+const WorkerGitHubTokenLeaseBinding = {
+  leaseRef: WorkerGitHubTokenLeaseRef,
+  operationId: WorkerGitHubOperationId,
+  commandId: CommandId,
+  workspaceId: WorkspaceId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  sandboxId: SandboxId,
+  repository: GitHubRepositoryRef,
+  approvalId: ApprovalRequestId,
+  approvalGeneration: WorkerGitHubApprovalGeneration,
+  approvalAction: GitHubWorkflowAction,
+  leaseExpiresAt: IsoDateTime,
+  routeBinding: WorkerGitHubRouteBinding,
+} as const;
+
+export const WorkerGitHubTokenRedeemRequest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  ...WorkerGitHubTokenLeaseBinding,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerGitHubTokenRedeemRequest = typeof WorkerGitHubTokenRedeemRequest.Type;
+
+/** Secret response sent only over the authenticated, pinned worker mTLS channel. */
+export const WorkerGitHubTokenRedeemResponse = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  token: TrimmedNonEmptyString.check(Schema.isMaxLength(4096)),
+  expiresAt: IsoDateTime,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type WorkerGitHubTokenRedeemResponse = typeof WorkerGitHubTokenRedeemResponse.Type;
+
 /** A durable control-plane confirmation; the worker never constructs it. */
 export const WorkerRelayEventConfirmation = Schema.Struct({
   type: Schema.Literal("thread.events.confirmed"),
@@ -165,6 +278,7 @@ export type WorkerRelayShutdown = typeof WorkerRelayShutdown.Type;
 
 export const WorkerRelayInbound = Schema.Union([
   WorkerRelayCommandDelivery,
+  WorkerRelayGitHubCommandDelivery,
   WorkerRelayEventConfirmation,
   WorkerRelayReplayComplete,
   WorkerRelayShutdown,
@@ -268,6 +382,47 @@ export const WorkerRelayFailure = Schema.Struct({
 });
 export type WorkerRelayFailure = typeof WorkerRelayFailure.Type;
 
+export const WorkerGitHubCommandFailureCode = Schema.Literals([
+  "identityMismatch",
+  "repositoryMismatch",
+  "invalidHistory",
+  "ambiguousIntent",
+  "secretPath",
+  "nonFastForward",
+  "tokenExpired",
+  "gitFailure",
+]);
+export type WorkerGitHubCommandFailureCode = typeof WorkerGitHubCommandFailureCode.Type;
+
+export const WorkerRelayGitHubCommandResult = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("github.command.result"),
+    operationId: WorkerGitHubOperationId,
+    commandId: CommandId,
+    status: Schema.Literal("prepared"),
+    localSha: GitObjectSha,
+    completedAt: IsoDateTime,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    type: Schema.Literal("github.command.result"),
+    operationId: WorkerGitHubOperationId,
+    commandId: CommandId,
+    status: Schema.Literal("pushed"),
+    completedAt: IsoDateTime,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    type: Schema.Literal("github.command.result"),
+    operationId: WorkerGitHubOperationId,
+    commandId: CommandId,
+    status: Schema.Literal("failed"),
+    code: WorkerGitHubCommandFailureCode,
+    retryable: Schema.Boolean,
+    detail: TrimmedNonEmptyString.check(Schema.isMaxLength(500)),
+    completedAt: IsoDateTime,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+]);
+export type WorkerRelayGitHubCommandResult = typeof WorkerRelayGitHubCommandResult.Type;
+
 export const WorkerRelayOutbound = Schema.Union([
   WorkerRelayCommandAck,
   WorkerRelayEventProposal,
@@ -275,5 +430,6 @@ export const WorkerRelayOutbound = Schema.Union([
   WorkerRelayHeartbeat,
   WorkerRelayReady,
   WorkerRelayFailure,
+  WorkerRelayGitHubCommandResult,
 ]);
 export type WorkerRelayOutbound = typeof WorkerRelayOutbound.Type;

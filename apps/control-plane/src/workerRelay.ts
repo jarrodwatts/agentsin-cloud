@@ -9,6 +9,7 @@ import {
   type WorkerCommandClaimResponse,
   type WorkerDeliveryId,
   type WorkerRelayInbound,
+  type WorkerRelayGitHubCommandResult,
 } from "@t3tools/contracts/worker";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -106,6 +107,11 @@ export interface WorkerRouteActivation {
   readonly displaced?: ActiveWorkerRoute;
 }
 
+export interface WorkerRouteRemoval {
+  readonly route: ActiveWorkerRoute;
+  readonly reason: "deactivated" | "replaced" | "sandbox-closed" | "cleared";
+}
+
 export interface WorkerRouteRegistry {
   readonly activate: (route: ActiveWorkerRoute) => WorkerRouteActivation;
   readonly deactivate: (lease: ActiveWorkerLease) => void;
@@ -124,20 +130,26 @@ export interface WorkerRouteRegistry {
     reason: string,
   ) => void;
   readonly clear: () => void;
+  readonly subscribeRemoval: (listener: (removal: WorkerRouteRemoval) => void) => () => void;
   readonly size: () => number;
 }
 
 export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
   const routes = new Map<string, ActiveWorkerRoute>();
+  const removalListeners = new Set<(removal: WorkerRouteRemoval) => void>();
   const key = (workspaceId: string, sandboxId: string) => `${workspaceId}\0${sandboxId}`;
+  const removed = (route: ActiveWorkerRoute, reason: WorkerRouteRemoval["reason"]) => {
+    for (const listener of removalListeners) listener({ route, reason });
+  };
   return {
     activate: (route) => {
       const routeKey = key(route.lease.workspaceId, route.lease.sandboxId);
       const previous = routes.get(routeKey);
-      if (previous !== undefined && previous.lease.leaseGeneration >= route.lease.leaseGeneration) {
+      if (previous !== undefined && previous.lease.routeGeneration >= route.lease.routeGeneration) {
         return { accepted: false };
       }
       routes.set(routeKey, route);
+      if (previous !== undefined) removed(previous, "replaced");
       return {
         accepted: true,
         ...(previous === undefined ? {} : { displaced: previous }),
@@ -145,8 +157,10 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
     },
     deactivate: (lease) => {
       const routeKey = key(lease.workspaceId, lease.sandboxId);
-      if (routes.get(routeKey)?.lease.leaseGeneration === lease.leaseGeneration) {
+      if (routes.get(routeKey)?.lease.routeGeneration === lease.routeGeneration) {
+        const route = routes.get(routeKey);
         routes.delete(routeKey);
+        if (route !== undefined) removed(route, "deactivated");
       }
     },
     get: (workspaceId, sandboxId) => routes.get(key(workspaceId, sandboxId)),
@@ -154,6 +168,7 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
       const route = routes.get(key(workspaceId, sandboxId));
       if (route === undefined) return;
       routes.delete(key(workspaceId, sandboxId));
+      removed(route, "sandbox-closed");
       route.close(4003, reason);
     },
     closeThread: (workspaceId, threadId, reason) => {
@@ -164,8 +179,15 @@ export const makeInMemoryWorkerRouteRegistry = (): WorkerRouteRegistry => {
       }
     },
     clear: () => {
-      for (const route of routes.values()) route.close(1012, "relay_restart");
+      for (const route of routes.values()) {
+        removed(route, "cleared");
+        route.close(1012, "relay_restart");
+      }
       routes.clear();
+    },
+    subscribeRemoval: (listener) => {
+      removalListeners.add(listener);
+      return () => removalListeners.delete(listener);
     },
     size: () => routes.size,
   };
@@ -260,6 +282,12 @@ class BoundedWriter {
 export interface MakeWorkerRelayOptions {
   readonly identities: WorkerIdentityService;
   readonly recovery: WorkerRecoverySource;
+  readonly githubResults?: {
+    readonly handleResult: (
+      identity: ActiveWorkerLease,
+      result: WorkerRelayGitHubCommandResult,
+    ) => Effect.Effect<void, { readonly _tag: string }>;
+  };
   readonly processInstanceId?: string;
   readonly routes?: WorkerRouteRegistry;
   readonly coordination?: EphemeralCoordinationService;
@@ -395,7 +423,26 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
             armHeartbeatDeadline();
           }
 
-          const acceptance = yield* options.recovery.handleOutbound(certificate, message);
+          const acceptance = yield* message.type === "github.command.result"
+            ? options.githubResults === undefined
+              ? Effect.fail(
+                  new WorkerRelayServerError({
+                    code: "invalidFrame",
+                    operation: "github-result-unconfigured",
+                  }),
+                )
+              : options.githubResults.handleResult(lease, message).pipe(
+                  Effect.as({ type: "accepted" } as const),
+                  Effect.mapError(
+                    (cause) =>
+                      new WorkerRelayServerError({
+                        code: "identityMismatch",
+                        operation: "github-result",
+                        cause,
+                      }),
+                  ),
+                )
+            : options.recovery.handleOutbound(certificate, message);
           if (message.type === "thread.events.ack") {
             if (
               acceptance.type !== "event-cursor" ||

@@ -8,6 +8,8 @@ import {
   WorkerCommandClaimResponse,
   WorkerEventCursor,
   WorkerRelayEventProposal,
+  WorkerGitHubCommand,
+  WorkerRelayGitHubCommandResult,
 } from "./worker.ts";
 
 const decodeBootstrap = Schema.decodeUnknownSync(WorkerBootstrap);
@@ -16,6 +18,8 @@ const decodeEventCursor = Schema.decodeUnknownSync(WorkerEventCursor);
 const decodeCertificateBootstrap = Schema.decodeUnknownSync(WorkerCertificateBootstrapRequest);
 const decodeCertificateGrant = Schema.decodeUnknownSync(WorkerCertificateGrant);
 const decodeClaimResponse = Schema.decodeUnknownSync(WorkerCommandClaimResponse);
+const decodeGitHubCommand = Schema.decodeUnknownSync(WorkerGitHubCommand);
+const decodeGitHubResult = Schema.decodeUnknownSync(WorkerRelayGitHubCommandResult);
 
 it("uses -1 as the sole empty event-log cursor", () => {
   expect(decodeEventCursor(-1)).toBe(-1);
@@ -113,5 +117,76 @@ describe("worker mTLS wire contracts", () => {
     ).toBe(1);
     expect(decodeClaimResponse({ schemaVersion: 1, claim: "in-flight" }).claim).toBe("in-flight");
     expect(() => decodeClaimResponse({ schemaVersion: 1, claim: "unknown" })).toThrow();
+  });
+});
+
+describe("worker GitHub command boundary", () => {
+  const identity = {
+    operationId: "github-operation-1",
+    commandId: "github-command-1",
+    workspaceId: "workspace-1",
+    environmentId: "environment-1",
+    threadId: "thread-1",
+    sandboxId: "sandbox-1",
+    repository: {
+      provider: "github",
+      host: "github.com",
+      installationId: "installation-1",
+      owner: "jarrodwatts",
+      name: "agentsin-cloud",
+      canonicalKey: "github.com/jarrodwatts/agentsin-cloud",
+    },
+  } as const;
+  const routeBinding = {
+    workerId: "worker-1",
+    reservationId: "command-reserve-1",
+    environmentRevisionId: "revision-1",
+    providerInstanceId: "codex_personal",
+    providerDriver: "codex",
+    processInstanceId: "process-1",
+    certificateFingerprint: "fingerprint-1",
+    certificateGeneration: 1,
+    leaseGeneration: 1,
+    routeGeneration: 1,
+  } as const;
+
+  it("allows only bounded operations and opaque token leases", () => {
+    expect(
+      decodeGitHubCommand({
+        ...identity,
+        type: "github.git.push",
+        branch: "agents/fix-123456789abc",
+        localSha: "a".repeat(40),
+        expectedRemoteSha: null,
+        tokenLeaseRef: "token-lease-1",
+        approvalId: "approval-1",
+        approvalGeneration: "approval-generation-1",
+        approvalAction: "pushCheckpoint",
+        leaseExpiresAt: "2026-08-27T01:00:00.000Z",
+        routeBinding,
+      }).type,
+    ).toBe("github.git.push");
+    expect(() =>
+      decodeGitHubCommand({
+        ...identity,
+        type: "github.git.prepare-branch",
+        branch: "agents/fix-123456789abc",
+        baseSha: "a".repeat(40),
+        workspaceDirectory: "/client/supplied",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects raw token fields in results", () => {
+    expect(() =>
+      decodeGitHubResult({
+        type: "github.command.result",
+        operationId: "github-operation-1",
+        commandId: "github-command-1",
+        status: "pushed",
+        completedAt: "2026-08-27T00:00:00.000Z",
+        token: "forbidden",
+      }),
+    ).toThrow();
   });
 });

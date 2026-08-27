@@ -12,6 +12,7 @@ export {
   type CloudWorkerDependencies,
   type CloudWorkerOptions,
 } from "./CloudWorker.ts";
+export { executeGitHubWorkerCommand } from "./githubCommandHandler.ts";
 export {
   CloudWorkerError,
   WorkerBootstrapError,
@@ -43,6 +44,7 @@ export {
 export {
   DEFAULT_NODE_MTLS_RELAY_LIMITS,
   certificateSpkiPin,
+  makeNodeMtlsGitHubTokenLeaseBroker,
   makeNodeMtlsRelayConnector,
   type MakeNodeMtlsRelayConnectorOptions,
   type NodeMtlsRelayLimits,
@@ -69,3 +71,10 @@ export {
   eventMatchesBootstrap,
 } from "./protocol.ts";
 export { containsForbiddenBootstrapMaterial, redactLogFields } from "./redaction.ts";
+export {
+  isForbiddenCheckpointPath,
+  makeGitHubGitExecutor,
+  type GitHubGitExecutor,
+  type WorkerGitHubTokenLeaseBroker,
+  type WorkerGitHubTokenMaterialization,
+} from "./GitHubGitExecutor.ts";

@@ -111,6 +111,12 @@ export const LedgerEntryId = makeCloudEntityId("LedgerEntryId");
 export type LedgerEntryId = typeof LedgerEntryId.Type;
 export const SettlementId = makeCloudEntityId("SettlementId");
 export type SettlementId = typeof SettlementId.Type;
+export const GitHubInstallationId = makeCloudEntityId("GitHubInstallationId");
+export type GitHubInstallationId = typeof GitHubInstallationId.Type;
+export const GitHubWorkflowEventId = makeCloudEntityId("GitHubWorkflowEventId");
+export type GitHubWorkflowEventId = typeof GitHubWorkflowEventId.Type;
+export const GitHubWorkflowEffectId = makeCloudEntityId("GitHubWorkflowEffectId");
+export type GitHubWorkflowEffectId = typeof GitHubWorkflowEffectId.Type;
 
 export const EvmAddress = TrimmedNonEmptyString.check(Schema.isPattern(/^0x[0-9a-fA-F]{40}$/)).pipe(
   Schema.brand("EvmAddress"),
@@ -956,6 +962,153 @@ export const CloudThreadCommandSubmissionResult = Schema.Struct({
   commandId: CommandId,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type CloudThreadCommandSubmissionResult = typeof CloudThreadCommandSubmissionResult.Type;
+
+const GitHubOwnerOrRepositoryName = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(100),
+  Schema.isPattern(/^[A-Za-z0-9_.-]+$/),
+);
+export const GitObjectSha = Schema.String.check(Schema.isPattern(/^[0-9a-f]{40}$/));
+export type GitObjectSha = typeof GitObjectSha.Type;
+export const GitHubThreadBranchName = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(128),
+  Schema.isPattern(/^agents\/[a-z0-9][a-z0-9/_-]*-[0-9a-f]{12}$/),
+);
+export type GitHubThreadBranchName = typeof GitHubThreadBranchName.Type;
+
+/** GitHub.com is the only source-control host supported by hosted v1. */
+export const GitHubRepositoryRef = Schema.Struct({
+  provider: Schema.Literal("github"),
+  host: Schema.Literal("github.com"),
+  installationId: GitHubInstallationId,
+  owner: GitHubOwnerOrRepositoryName,
+  name: GitHubOwnerOrRepositoryName,
+  canonicalKey: TrimmedNonEmptyString.check(
+    Schema.isMaxLength(240),
+    Schema.isPattern(/^github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+  ),
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.canonicalKey.toLowerCase() ===
+        `github.com/${input.owner}/${input.name}`.toLowerCase() ||
+      "canonicalKey must identify the GitHub owner and repository",
+    { identifier: "GitHubRepositoryCanonicalIdentity" },
+  ),
+);
+export type GitHubRepositoryRef = typeof GitHubRepositoryRef.Type;
+
+export const GitHubWorkflowAction = Schema.Literals([
+  "createBranch",
+  "pushCheckpoint",
+  "openDraftPullRequest",
+  "markPullRequestReady",
+]);
+export type GitHubWorkflowAction = typeof GitHubWorkflowAction.Type;
+
+/** A bounded, expiring authorization for hosted GitHub external writes. */
+export const GitHubWorkflowApproval = Schema.Struct({
+  approvalId: ApprovalRequestId,
+  workspaceId: WorkspaceId,
+  threadId: ThreadId,
+  repository: GitHubRepositoryRef,
+  actions: Schema.Array(GitHubWorkflowAction).check(Schema.isMinLength(1)),
+  decidedByUserId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  decidedBy: AuthSessionId,
+  approvedAt: IsoDateTime,
+  expiresAt: IsoDateTime,
+}).check(
+  Schema.makeFilter(
+    (input) => input.approvedAt < input.expiresAt || "approval must expire after it is granted",
+    { identifier: "GitHubWorkflowApprovalLifetime" },
+  ),
+);
+export type GitHubWorkflowApproval = typeof GitHubWorkflowApproval.Type;
+
+const GitHubWorkflowCommandBaseFields = {
+  commandId: CommandId,
+  workspaceId: WorkspaceId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  repository: GitHubRepositoryRef,
+  approvalId: ApprovalRequestId,
+  requestedAt: IsoDateTime,
+} as const;
+
+export const GitHubThreadWorkflowCommand = Schema.Union([
+  Schema.Struct({
+    ...GitHubWorkflowCommandBaseFields,
+    type: Schema.Literal("github.branch.create"),
+    threadSlug: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+    baseSha: GitObjectSha,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    ...GitHubWorkflowCommandBaseFields,
+    type: Schema.Literal("github.checkpoint.push"),
+    message: TrimmedNonEmptyString.check(Schema.isMaxLength(200)),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    ...GitHubWorkflowCommandBaseFields,
+    type: Schema.Literal("github.pull-request.open-draft"),
+    title: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+    body: Schema.String.check(Schema.isMaxLength(65_536)),
+    baseBranch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    ...GitHubWorkflowCommandBaseFields,
+    type: Schema.Literal("github.pull-request.mark-ready"),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+]);
+export type GitHubThreadWorkflowCommand = typeof GitHubThreadWorkflowCommand.Type;
+
+export const GitHubThreadWorkflowSubmissionRequest = Schema.Struct({
+  idempotencyKey: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  command: GitHubThreadWorkflowCommand,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type GitHubThreadWorkflowSubmissionRequest =
+  typeof GitHubThreadWorkflowSubmissionRequest.Type;
+
+export const GitHubThreadWorkflowEvent = Schema.Struct({
+  eventId: GitHubWorkflowEventId,
+  workspaceId: WorkspaceId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  sequence: NonNegativeInt,
+  type: Schema.Literals([
+    "github.branch-created",
+    "github.checkpoint-pushed",
+    "github.pull-request-opened",
+    "github.pull-request-ready",
+    "github.conflict",
+    "github.operation-failed",
+  ]),
+  visible: Schema.Literal(true),
+  summary: TrimmedNonEmptyString.check(Schema.isMaxLength(500)),
+  retryable: Schema.Boolean,
+  payload: Schema.Record(Schema.String, Schema.Unknown),
+  occurredAt: IsoDateTime,
+});
+export type GitHubThreadWorkflowEvent = typeof GitHubThreadWorkflowEvent.Type;
+
+export const GitHubThreadWorkflowView = Schema.Struct({
+  workspaceId: WorkspaceId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  repository: GitHubRepositoryRef,
+  baseSha: GitObjectSha,
+  branchName: GitHubThreadBranchName,
+  remoteHeadSha: Schema.NullOr(GitObjectSha),
+  status: Schema.Literals(["active", "paused-conflict"]),
+  checkpointCount: NonNegativeInt,
+  pullRequest: Schema.NullOr(
+    Schema.Struct({
+      number: PositiveInt,
+      url: TrimmedNonEmptyString,
+      draft: Schema.Boolean,
+    }),
+  ),
+  events: Schema.Array(GitHubThreadWorkflowEvent),
+});
+export type GitHubThreadWorkflowView = typeof GitHubThreadWorkflowView.Type;
 
 /** -1 means no event has been observed yet; otherwise this is the last sequence received. */
 export const CloudThreadEventCursor = Schema.Int.check(

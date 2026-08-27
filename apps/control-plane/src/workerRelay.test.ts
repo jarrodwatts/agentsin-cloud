@@ -225,12 +225,12 @@ it("keeps the newer route when an older connection finishes activation late", ()
     routeGeneration: 1,
   };
   const newer = {
-    lease: { ...lease, leaseGeneration: 3 },
+    lease: { ...lease, leaseGeneration: 3, routeGeneration: 3 },
     send: () => true,
     close: () => undefined,
   };
   const older = {
-    lease: { ...lease, leaseGeneration: 2 },
+    lease: { ...lease, leaseGeneration: 2, routeGeneration: 2 },
     send: () => true,
     close: () => undefined,
   };

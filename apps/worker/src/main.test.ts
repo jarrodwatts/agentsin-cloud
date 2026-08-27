@@ -17,12 +17,18 @@ const bootstrapText = `{"schemaVersion":1,"workerId":"worker-1","workspaceId":"w
 it.effect("selects the concrete Node mTLS relay only in fail-closed hosted mode", () =>
   Effect.gen(function* () {
     const injectedRelay = {} as CloudWorkerDependencies["relay"];
-    const dependencies = { relay: injectedRelay } as CloudWorkerDependencies;
+    const injectedGitHub = {} as NonNullable<CloudWorkerDependencies["github"]>;
+    const dependencies = {
+      relay: injectedRelay,
+      github: injectedGitHub,
+    } as CloudWorkerDependencies;
     const hosted = yield* selectWorkerProcessDependencies(dependencies, {
       [WORKER_EXECUTION_MODE_ENV]: "hosted",
       [WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV]: "/run/agentsin/mtls",
     });
     expect(hosted.relay).not.toBe(injectedRelay);
+    expect(hosted.github).toBeDefined();
+    expect(hosted.github).not.toBe(injectedGitHub);
 
     const missingDirectory = yield* Effect.result(
       selectWorkerProcessDependencies(dependencies, {

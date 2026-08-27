@@ -17,12 +17,23 @@ import {
 import { makePostgresWorkerIdentityRepository } from "./workerIdentityPostgres.ts";
 import { makeThreadEventStoreWorkerLifecycleRecorder } from "./workerLifecycle.ts";
 import { makeWorkerBootstrapHandler } from "./workerMtlsServer.ts";
-import { makeWorkerRelay, type WorkerRecoverySource, type WorkerRelay } from "./workerRelay.ts";
+import {
+  makeInMemoryWorkerRouteRegistry,
+  makeWorkerRelay,
+  type WorkerRecoverySource,
+  type WorkerRelay,
+} from "./workerRelay.ts";
 import type { ThreadEventStoreService } from "./threadEventStore.ts";
 import {
   CloudThreadLifecycleDependencyError,
   type WorkerRouteLifecycle,
 } from "./cloudThreadLifecycle.ts";
+import type { GitHubAppClient, GitHubInstallationTokenIssuer } from "./githubAppClient.ts";
+import type { GitHubSingleUseTokenVault } from "./githubTokenLeaseBroker.ts";
+import {
+  makeGitHubWorkerDispatcher,
+  type GitHubWorkerDispatcher,
+} from "./githubWorkerDispatcher.ts";
 
 /**
  * The certificate issuer is implemented by the deployment's KMS adapter. The
@@ -38,6 +49,11 @@ export interface WorkerProductionDependencies {
   readonly signer: KmsBackedCertificateSigner;
   readonly reservations: SandboxReservationVerifier;
   readonly recovery: WorkerRecoverySource;
+  readonly github: {
+    readonly client: GitHubAppClient;
+    readonly tokens: GitHubInstallationTokenIssuer;
+    readonly tokenVault: GitHubSingleUseTokenVault;
+  };
 }
 
 export class WorkerProductionConfigurationError extends Schema.TaggedErrorClass<WorkerProductionConfigurationError>()(
@@ -49,6 +65,7 @@ export interface WorkerControlPlaneRuntime {
   readonly identities: ReturnType<typeof makeWorkerIdentityService>;
   readonly relay: WorkerRelay;
   readonly routeLifecycle: WorkerRouteLifecycle;
+  readonly githubWorker: GitHubWorkerDispatcher;
   readonly workerBootstrap: {
     readonly handleHttp: ReturnType<typeof makeWorkerBootstrapHandler>;
   };
@@ -87,11 +104,15 @@ export const makeWorkerControlPlaneRuntime = (input: {
       lifecycle,
       clock: { now: DateTime.now.pipe(Effect.map(DateTime.formatIso)) },
     });
+    const routes = makeInMemoryWorkerRouteRegistry();
+    const githubWorker = makeGitHubWorkerDispatcher({ routes });
     const relay = makeWorkerRelay({
       identities,
       recovery: input.production.recovery,
       processInstanceId: input.config.workerProcessInstanceId,
       coordination: input.coordination,
+      routes,
+      githubResults: githubWorker,
     });
     const routeLifecycle: WorkerRouteLifecycle = {
       fenceSandboxForReplacement: (request) =>
@@ -118,6 +139,7 @@ export const makeWorkerControlPlaneRuntime = (input: {
       identities,
       relay,
       routeLifecycle,
+      githubWorker,
       workerBootstrap: {
         handleHttp: makeWorkerBootstrapHandler({ identities }),
       },

@@ -26,6 +26,8 @@ import {
   DesktopAuthInitiateRequest,
   DesktopLease,
   EnvironmentRevision,
+  GitHubThreadWorkflowCommand,
+  GitHubThreadWorkflowView,
   LedgerEntry,
   PluginGrant,
   PluginManifest,
@@ -52,17 +54,21 @@ const PAYER_ADDRESS = "0x3333333333333333333333333333333333333333";
 const MERCHANT_ADDRESS = "0x4444444444444444444444444444444444444444";
 const RECEIPT_TX_HASH = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SETTLEMENT_TX_HASH = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const decodeGitHubWorkflowCommand = Schema.decodeUnknownSync(GitHubThreadWorkflowCommand);
+const decodeGitHubWorkflowView = Schema.decodeUnknownSync(GitHubThreadWorkflowView);
+const decodeDesktopAuthInitiateRequest = Schema.decodeUnknownSync(DesktopAuthInitiateRequest);
+const decodeDesktopAuthExchangeRequest = Schema.decodeUnknownSync(DesktopAuthExchangeRequest);
 
 describe("desktop auth handoff contracts", () => {
   it("accepts canonical S256 PKCE inputs", () => {
     expect(
-      Schema.decodeUnknownSync(DesktopAuthInitiateRequest)({
+      decodeDesktopAuthInitiateRequest({
         codeChallenge: "a".repeat(43),
         state: "s".repeat(32),
       }),
     ).toEqual({ codeChallenge: "a".repeat(43), state: "s".repeat(32) });
     expect(
-      Schema.decodeUnknownSync(DesktopAuthExchangeRequest)({
+      decodeDesktopAuthExchangeRequest({
         handoff: "signed-handoff",
         codeVerifier: "v".repeat(64),
       }),
@@ -71,15 +77,106 @@ describe("desktop auth handoff contracts", () => {
 
   it("rejects padded, short, or empty handoff inputs", () => {
     expect(() =>
-      Schema.decodeUnknownSync(DesktopAuthInitiateRequest)({
+      decodeDesktopAuthInitiateRequest({
         codeChallenge: `${"a".repeat(42)}=`,
         state: "short",
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(DesktopAuthExchangeRequest)({
+      decodeDesktopAuthExchangeRequest({
         handoff: "",
         codeVerifier: "short",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("GitHub thread workflow contracts", () => {
+  const repository = {
+    provider: "github",
+    host: "github.com",
+    installationId: "installation-42",
+    owner: "jarrodwatts",
+    name: "agentsin-cloud",
+    canonicalKey: "github.com/jarrodwatts/agentsin-cloud",
+  } as const;
+  it("accepts a GitHub-only branch command with an authoritative approval id", () => {
+    const decoded = decodeGitHubWorkflowCommand({
+      type: "github.branch.create",
+      commandId: "command-github-1",
+      workspaceId: WORKSPACE_ID,
+      environmentId: "environment-1",
+      threadId: "thread-github-1",
+      repository,
+      approvalId: "approval-github-1",
+      requestedAt: NOW,
+      threadSlug: "Fix checkout",
+      baseSha: "a".repeat(40),
+    });
+
+    expect(decoded.repository.provider).toBe("github");
+  });
+
+  it("rejects untrusted paths and non-GitHub repository substitution", () => {
+    expect(() =>
+      decodeGitHubWorkflowCommand({
+        type: "github.branch.create",
+        commandId: "command-github-1",
+        workspaceId: "workspace-other",
+        environmentId: "environment-1",
+        threadId: "thread-github-1",
+        repository,
+        approvalId: "approval-github-1",
+        requestedAt: NOW,
+        threadSlug: "Fix checkout",
+        baseSha: "a".repeat(40),
+        workspaceDirectory: "/workspace/repository",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeGitHubWorkflowCommand({
+        type: "github.branch.create",
+        commandId: "command-github-1",
+        workspaceId: WORKSPACE_ID,
+        environmentId: "environment-1",
+        threadId: "thread-github-1",
+        repository: { ...repository, canonicalKey: "gitlab.com/jarrodwatts/agentsin-cloud" },
+        approvalId: "approval-github-1",
+        requestedAt: NOW,
+        threadSlug: "Fix checkout",
+        baseSha: "a".repeat(40),
+      }),
+    ).toThrow();
+  });
+
+  it("requires visible, ordered workflow events", () => {
+    expect(() =>
+      decodeGitHubWorkflowView({
+        workspaceId: WORKSPACE_ID,
+        environmentId: "environment-1",
+        threadId: "thread-github-1",
+        repository,
+        baseSha: "a".repeat(40),
+        branchName: "agents/fix-checkout-123456789abc",
+        remoteHeadSha: null,
+        status: "paused-conflict",
+        checkpointCount: 0,
+        pullRequest: null,
+        events: [
+          {
+            eventId: "event-github-1",
+            workspaceId: WORKSPACE_ID,
+            environmentId: "environment-1",
+            threadId: "thread-github-1",
+            sequence: 0,
+            type: "github.conflict",
+            visible: false,
+            summary: "Remote changed",
+            retryable: false,
+            payload: { code: "staleRemote" },
+            occurredAt: NOW,
+          },
+        ],
       }),
     ).toThrow();
   });
@@ -294,10 +391,63 @@ const decodeCloudThreadStreamClientFrame = Schema.decodeUnknownSync(CloudThreadS
 const decodeCloudThreadStreamServerFrame = Schema.decodeUnknownSync(CloudThreadStreamServerFrame);
 const decodePluginManifest = Schema.decodeUnknownSync(PluginManifest);
 const decodeUsageSample = Schema.decodeUnknownSync(UsageSample);
+const decodeSandboxProviderCapabilities = Schema.decodeUnknownSync(SandboxProviderCapabilities);
+const decodeSandboxProviderPortsResult = Schema.decodeUnknownSync(SandboxProviderPortsResult);
+const decodeSandboxProviderExecuteResult = Schema.decodeUnknownSync(SandboxProviderExecuteResult);
+const decodeSandboxProviderPtyResult = Schema.decodeUnknownSync(SandboxProviderPtyResult);
+const decodeThreadSandboxBindings = Schema.decodeUnknownSync(ThreadSandboxBindings);
+const decodeAgentConnectionProfile = Schema.decodeUnknownSync(AgentConnectionProfile);
+const decodeAgentConnectionBeginLoginResult = Schema.decodeUnknownSync(
+  AgentConnectionBeginLoginResult,
+);
+const decodeAgentConnectionPollLoginResult = Schema.decodeUnknownSync(
+  AgentConnectionPollLoginResult,
+);
+const decodeAgentConnectionSealProfileResult = Schema.decodeUnknownSync(
+  AgentConnectionSealProfileResult,
+);
+const decodeAgentConnectionMaterializeResult = Schema.decodeUnknownSync(
+  AgentConnectionMaterializeResult,
+);
+const decodeAgentConnectionValidateResult = Schema.decodeUnknownSync(AgentConnectionValidateResult);
+const decodeAgentConnectionRefreshResult = Schema.decodeUnknownSync(AgentConnectionRefreshResult);
+const decodeAgentConnectionRevokeResult = Schema.decodeUnknownSync(AgentConnectionRevokeResult);
+const decodeAgentConnectionAdapterExchange = Schema.decodeUnknownSync(
+  AgentConnectionAdapterExchange,
+);
+const decodeDesktopLease = Schema.decodeUnknownSync(DesktopLease);
+const decodeAgentConnection = Schema.decodeUnknownSync(AgentConnection);
+const decodePluginGrant = Schema.decodeUnknownSync(PluginGrant);
+const decodeAutomationRecipe = Schema.decodeUnknownSync(AutomationRecipe);
+const decodeAutomationRun = Schema.decodeUnknownSync(AutomationRun);
+const decodeAutomationTrigger = Schema.decodeUnknownSync(AutomationTrigger);
+const decodeAutomationApprovalPolicy = Schema.decodeUnknownSync(AutomationApprovalPolicy);
+const decodeAutomationApprovalEnvelope = Schema.decodeUnknownSync(AutomationApprovalEnvelope);
+const decodeUsageReceipt = Schema.decodeUnknownSync(UsageReceipt);
+const decodeLedgerEntry = Schema.decodeUnknownSync(LedgerEntry);
+const decodeUsageLedgerPosting = Schema.decodeUnknownSync(UsageLedgerPosting);
+const decodeSettlement = Schema.decodeUnknownSync(Settlement);
+const decodeUsageReceiptAccepted = Schema.decodeUnknownSync(UsageReceiptAccepted);
+const decodePluginMcpServer = Schema.decodeUnknownSync(PluginMcpServer);
+const revisionJsonCodec = Schema.toCodecJson(EnvironmentRevision);
+const requestJsonCodec = Schema.toCodecJson(SandboxProviderRequest);
+const resultJsonCodec = Schema.toCodecJson(SandboxProviderResult);
+const decodeRevisionJson = Schema.decodeUnknownSync(revisionJsonCodec);
+const decodeRequestJson = Schema.decodeUnknownSync(requestJsonCodec);
+const decodeResultJson = Schema.decodeUnknownSync(resultJsonCodec);
+const billingRecordsJsonCodec = Schema.toCodecJson(
+  Schema.Struct({
+    usageSample: UsageSample,
+    receipt: UsageReceipt,
+    entry: LedgerEntry,
+    settlement: Settlement,
+  }),
+);
+const decodeBillingRecordsJson = Schema.decodeUnknownSync(billingRecordsJsonCodec);
 
 describe("cloud provider contracts", () => {
   it("covers the complete sandbox provider capability surface", () => {
-    const capabilities = Schema.decodeUnknownSync(SandboxProviderCapabilities)([
+    const capabilities = decodeSandboxProviderCapabilities([
       "create",
       "connect",
       "execute",
@@ -363,10 +513,6 @@ describe("cloud provider contracts", () => {
   });
 
   it("round-trips immutable revisions and provider messages through JSON codecs", () => {
-    const revisionCodec = Schema.toCodecJson(EnvironmentRevision);
-    const requestCodec = Schema.toCodecJson(SandboxProviderRequest);
-    const resultCodec = Schema.toCodecJson(SandboxProviderResult);
-
     const decodedRevision = decodeRevision(revision);
     const decodedRequest = decodeSandboxRequest({
       type: "create",
@@ -386,17 +532,13 @@ describe("cloud provider contracts", () => {
     });
 
     expect(
-      Schema.decodeUnknownSync(revisionCodec)(
-        Schema.encodeUnknownSync(revisionCodec)(decodedRevision),
-      ),
+      decodeRevisionJson(Schema.encodeUnknownSync(revisionJsonCodec)(decodedRevision)),
     ).toStrictEqual(decodedRevision);
     expect(
-      Schema.decodeUnknownSync(requestCodec)(
-        Schema.encodeUnknownSync(requestCodec)(decodedRequest),
-      ),
+      decodeRequestJson(Schema.encodeUnknownSync(requestJsonCodec)(decodedRequest)),
     ).toStrictEqual(decodedRequest);
     expect(
-      Schema.decodeUnknownSync(resultCodec)(Schema.encodeUnknownSync(resultCodec)(decodedResult)),
+      decodeResultJson(Schema.encodeUnknownSync(resultJsonCodec)(decodedResult)),
     ).toStrictEqual(decodedResult);
   });
 
@@ -462,7 +604,7 @@ describe("cloud provider contracts", () => {
 
   it("rejects provider ports outside the canonical port range", () => {
     expect(() =>
-      Schema.decodeUnknownSync(SandboxProviderPortsResult)({
+      decodeSandboxProviderPortsResult({
         type: "ports",
         requestId: "command-1",
         workspaceId: WORKSPACE_ID,
@@ -502,22 +644,18 @@ describe("cloud provider contracts", () => {
       completedAt: NOW,
     } as const;
 
-    expect(Schema.decodeUnknownSync(SandboxProviderExecuteResult)(execute).stdoutSummary).toBe(
-      "complete",
-    );
-    expect(Schema.decodeUnknownSync(SandboxProviderPtyResult)(pty).outputSummary).toBe("ready");
+    expect(decodeSandboxProviderExecuteResult(execute).stdoutSummary).toBe("complete");
+    expect(decodeSandboxProviderPtyResult(pty).outputSummary).toBe("ready");
     expect(() =>
-      Schema.decodeUnknownSync(SandboxProviderExecuteResult)({
+      decodeSandboxProviderExecuteResult({
         ...execute,
         stdoutSummary: "x".repeat(4097),
       }),
     ).toThrow();
     const { stdoutArtifact: _stdoutArtifact, ...executeWithoutStdoutArtifact } = execute;
-    expect(() =>
-      Schema.decodeUnknownSync(SandboxProviderExecuteResult)(executeWithoutStdoutArtifact),
-    ).toThrow();
+    expect(() => decodeSandboxProviderExecuteResult(executeWithoutStdoutArtifact)).toThrow();
     const { outputArtifact: _outputArtifact, ...ptyWithoutArtifact } = pty;
-    expect(() => Schema.decodeUnknownSync(SandboxProviderPtyResult)(ptyWithoutArtifact)).toThrow();
+    expect(() => decodeSandboxProviderPtyResult(ptyWithoutArtifact)).toThrow();
   });
 
   it("rejects a sandbox binding that does not match its one workspace thread", () => {
@@ -553,7 +691,7 @@ describe("cloud provider contracts", () => {
 
   it("rejects registry snapshots that assign one thread to multiple sandboxes", () => {
     expect(() =>
-      Schema.decodeUnknownSync(ThreadSandboxBindings)([
+      decodeThreadSandboxBindings([
         { workspaceId: WORKSPACE_ID, threadId: "thread-1", sandboxId: "sandbox-1" },
         { workspaceId: WORKSPACE_ID, threadId: "thread-1", sandboxId: "sandbox-2" },
       ]),
@@ -695,7 +833,7 @@ describe("cloud thread envelopes", () => {
 
 describe("cloud lifecycle records", () => {
   it("decodes every agent connection adapter lifecycle result", () => {
-    const profile = Schema.decodeUnknownSync(AgentConnectionProfile)({
+    const profile = decodeAgentConnectionProfile({
       profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
       driver: "codex",
@@ -705,7 +843,7 @@ describe("cloud lifecycle records", () => {
       createdAt: NOW,
       updatedAt: NOW,
     });
-    const begin = Schema.decodeUnknownSync(AgentConnectionBeginLoginResult)({
+    const begin = decodeAgentConnectionBeginLoginResult({
       loginId: "login-1",
       workspaceId: WORKSPACE_ID,
       driver: "codex",
@@ -714,17 +852,17 @@ describe("cloud lifecycle records", () => {
       expiresAt: "2026-08-27T12:05:00.000Z",
       pollAfterMs: 1000,
     });
-    const poll = Schema.decodeUnknownSync(AgentConnectionPollLoginResult)({
+    const poll = decodeAgentConnectionPollLoginResult({
       status: "authorized",
       loginId: "login-1",
       workspaceId: WORKSPACE_ID,
       credentialHandle: "ephemeral/login-1",
     });
-    const sealed = Schema.decodeUnknownSync(AgentConnectionSealProfileResult)({
+    const sealed = decodeAgentConnectionSealProfileResult({
       workspaceId: WORKSPACE_ID,
       profile,
     });
-    const materialized = Schema.decodeUnknownSync(AgentConnectionMaterializeResult)({
+    const materialized = decodeAgentConnectionMaterializeResult({
       materializationId: "materialization-1",
       profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
@@ -732,18 +870,18 @@ describe("cloud lifecycle records", () => {
       materializationRef: "sandbox-secrets/materialization-1",
       materializedAt: NOW,
     });
-    const validated = Schema.decodeUnknownSync(AgentConnectionValidateResult)({
+    const validated = decodeAgentConnectionValidateResult({
       profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
       status: "valid",
       checkedAt: NOW,
     });
-    const refreshed = Schema.decodeUnknownSync(AgentConnectionRefreshResult)({
+    const refreshed = decodeAgentConnectionRefreshResult({
       workspaceId: WORKSPACE_ID,
       profile,
       refreshedAt: NOW,
     });
-    const revoked = Schema.decodeUnknownSync(AgentConnectionRevokeResult)({
+    const revoked = decodeAgentConnectionRevokeResult({
       profileId: "profile-1",
       workspaceId: WORKSPACE_ID,
       revokedAt: NOW,
@@ -775,17 +913,15 @@ describe("cloud lifecycle records", () => {
       },
     } as const;
 
-    expect(Schema.decodeUnknownSync(AgentConnectionAdapterExchange)(exchange).operation).toBe(
-      "pollLogin",
-    );
+    expect(decodeAgentConnectionAdapterExchange(exchange).operation).toBe("pollLogin");
     expect(() =>
-      Schema.decodeUnknownSync(AgentConnectionAdapterExchange)({
+      decodeAgentConnectionAdapterExchange({
         ...exchange,
         result: { ...exchange.result, workspaceId: "workspace-2" },
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(AgentConnectionAdapterExchange)({
+      decodeAgentConnectionAdapterExchange({
         ...exchange,
         result: { ...exchange.result, loginId: "login-2" },
       }),
@@ -793,7 +929,7 @@ describe("cloud lifecycle records", () => {
   });
 
   it("decodes leases, agent connections, plugin grants, and automation runs", () => {
-    const lease = Schema.decodeUnknownSync(DesktopLease)({
+    const lease = decodeDesktopLease({
       leaseId: "lease-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -812,7 +948,7 @@ describe("cloud lifecycle records", () => {
       heartbeatAt: NOW,
       expiresAt: "2026-08-27T12:05:00.000Z",
     });
-    const connection = Schema.decodeUnknownSync(AgentConnection)({
+    const connection = decodeAgentConnection({
       connectionId: "connection-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -824,7 +960,7 @@ describe("cloud lifecycle records", () => {
       updatedAt: NOW,
       connectedAt: NOW,
     });
-    const grant = Schema.decodeUnknownSync(PluginGrant)({
+    const grant = decodePluginGrant({
       grantId: "grant-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -837,7 +973,7 @@ describe("cloud lifecycle records", () => {
       grantedBy: "auth-session-1",
       grantedAt: NOW,
     });
-    const recipe = Schema.decodeUnknownSync(AutomationRecipe)({
+    const recipe = decodeAutomationRecipe({
       schemaVersion: 1,
       recipeId: "recipe-1",
       workspaceId: WORKSPACE_ID,
@@ -873,7 +1009,7 @@ describe("cloud lifecycle records", () => {
       createdAt: NOW,
       updatedAt: NOW,
     });
-    const run = Schema.decodeUnknownSync(AutomationRun)({
+    const run = decodeAutomationRun({
       runId: "run-1",
       recipeId: "recipe-1",
       workspaceId: WORKSPACE_ID,
@@ -904,7 +1040,7 @@ describe("cloud lifecycle records", () => {
 
   it("rejects a lease heartbeat after its expiry", () => {
     expect(() =>
-      Schema.decodeUnknownSync(DesktopLease)({
+      decodeDesktopLease({
         leaseId: "lease-1",
         workspaceId: WORKSPACE_ID,
         environmentId: "environment-1",
@@ -924,7 +1060,7 @@ describe("cloud lifecycle records", () => {
 
   it("rejects inactive leases with incompatible release reasons", () => {
     expect(() =>
-      Schema.decodeUnknownSync(DesktopLease)({
+      decodeDesktopLease({
         leaseId: "lease-1",
         workspaceId: WORKSPACE_ID,
         environmentId: "environment-1",
@@ -960,28 +1096,26 @@ describe("cloud lifecycle records", () => {
     } as const;
 
     expect(() =>
-      Schema.decodeUnknownSync(PluginGrant)({
+      decodePluginGrant({
         ...grant,
         permissions: [{ type: "future-permission", scope: "future" }],
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(PluginGrant)({
+      decodePluginGrant({
         ...grant,
         permissions: [
           { type: "file", access: ["read"], paths: ["/workspace"], futureRestriction: true },
         ],
       }),
     ).toThrow();
-    expect(() =>
-      Schema.decodeUnknownSync(PluginGrant)({ ...grant, manifestSchemaVersion: 2 }),
-    ).toThrow();
+    expect(() => decodePluginGrant({ ...grant, manifestSchemaVersion: 2 })).toThrow();
   });
 });
 
 describe("automation triggers", () => {
   it("decodes schedule, GitHub, Sentry issue, signed webhook, and manual triggers", () => {
-    const decodeTrigger = Schema.decodeUnknownSync(AutomationTrigger);
+    const decodeTrigger = decodeAutomationTrigger;
     const triggers = [
       { type: "schedule", rrule: "FREQ=HOURLY", timeZone: "UTC" },
       {
@@ -1031,14 +1165,14 @@ describe("automation triggers", () => {
 
   it("forbids merge/deploy boundaries and rejects runs over budget", () => {
     expect(() =>
-      Schema.decodeUnknownSync(AutomationApprovalPolicy)({
+      decodeAutomationApprovalPolicy({
         mode: "always",
         boundary: { ...approvalBoundary, merge: true },
         allowedSecretRefs: [],
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(AutomationRun)({
+      decodeAutomationRun({
         runId: "run-over-budget",
         recipeId: "recipe-1",
         workspaceId: WORKSPACE_ID,
@@ -1064,7 +1198,7 @@ describe("automation triggers", () => {
   });
 
   it("rejects requested writes outside an approval envelope boundary", () => {
-    const decodeEnvelope = Schema.decodeUnknownSync(AutomationApprovalEnvelope);
+    const decodeEnvelope = decodeAutomationApprovalEnvelope;
     const envelope = {
       requestId: "approval-1",
       workspaceId: WORKSPACE_ID,
@@ -1091,7 +1225,7 @@ describe("automation triggers", () => {
   });
 
   it("discriminates approval status fields and caps payment approvals", () => {
-    const decodeEnvelope = Schema.decodeUnknownSync(AutomationApprovalEnvelope);
+    const decodeEnvelope = decodeAutomationApprovalEnvelope;
     const base = {
       requestId: "approval-payment",
       workspaceId: WORKSPACE_ID,
@@ -1131,7 +1265,7 @@ describe("automation triggers", () => {
 
   it("requires a thread id once a fresh-thread run starts", () => {
     expect(() =>
-      Schema.decodeUnknownSync(AutomationRun)({
+      decodeAutomationRun({
         runId: "run-started",
         recipeId: "recipe-1",
         workspaceId: WORKSPACE_ID,
@@ -1179,18 +1313,16 @@ describe("automation triggers", () => {
       queuedAt: NOW,
     } as const;
 
-    expect(Schema.decodeUnknownSync(AutomationRun)(waitingRun).state).toBe("waitingForApproval");
+    expect(decodeAutomationRun(waitingRun).state).toBe("waitingForApproval");
     expect(() =>
-      Schema.decodeUnknownSync(AutomationRun)({
+      decodeAutomationRun({
         ...waitingRun,
         approval: { ...waitingRun.approval, runId: "run-replayed" },
       }),
     ).toThrow();
+    expect(() => decodeAutomationRun({ ...waitingRun, state: "queued" })).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(AutomationRun)({ ...waitingRun, state: "queued" }),
-    ).toThrow();
-    expect(() =>
-      Schema.decodeUnknownSync(AutomationRun)({
+      decodeAutomationRun({
         ...waitingRun,
         state: "cancelled",
         threadId: "thread-1",
@@ -1206,7 +1338,7 @@ describe("automation triggers", () => {
       }),
     ).toThrow();
     expect(
-      Schema.decodeUnknownSync(AutomationRun)({
+      decodeAutomationRun({
         ...waitingRun,
         state: "approvalRejected",
         approval: {
@@ -1226,7 +1358,7 @@ describe("automation triggers", () => {
 describe("cloud usage accounting", () => {
   it("round-trips the sample-to-settlement record chain", () => {
     const decodedSample = decodeUsageSample(usageSampleFixture);
-    const receipt = Schema.decodeUnknownSync(UsageReceipt)({
+    const receipt = decodeUsageReceipt({
       receiptId: "receipt-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -1251,7 +1383,7 @@ describe("cloud usage accounting", () => {
       ledgerEntryId: "entry-1",
       recordedAt: NOW,
     });
-    const entry = Schema.decodeUnknownSync(LedgerEntry)({
+    const entry = decodeLedgerEntry({
       entryId: "entry-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -1263,8 +1395,8 @@ describe("cloud usage accounting", () => {
       usageReceiptId: "receipt-1",
       recordedAt: NOW,
     });
-    const posting = Schema.decodeUnknownSync(UsageLedgerPosting)({ receipt, entry });
-    const settlement = Schema.decodeUnknownSync(Settlement)({
+    const posting = decodeUsageLedgerPosting({ receipt, entry });
+    const settlement = decodeSettlement({
       settlementId: "settlement-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -1280,34 +1412,26 @@ describe("cloud usage accounting", () => {
       finalizedAt: NOW,
     });
 
-    const codec = Schema.toCodecJson(
-      Schema.Struct({
-        usageSample: UsageSample,
-        receipt: UsageReceipt,
-        entry: LedgerEntry,
-        settlement: Settlement,
-      }),
-    );
     const records = { usageSample: decodedSample, receipt, entry, settlement };
 
-    expect(Schema.decodeUnknownSync(codec)(Schema.encodeUnknownSync(codec)(records))).toStrictEqual(
-      records,
-    );
+    expect(
+      decodeBillingRecordsJson(Schema.encodeUnknownSync(billingRecordsJsonCodec)(records)),
+    ).toStrictEqual(records);
     expect(posting.entry.amountMicroUsdc).toBe(-posting.receipt.totalMicroUsdc);
     expect(() =>
-      Schema.decodeUnknownSync(UsageReceipt)({
+      decodeUsageReceipt({
         ...receipt,
         infrastructureProvider: "agent-subscription",
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(Settlement)({
+      decodeSettlement({
         ...settlement,
         chainIdentity: { ...settlement.chainIdentity, chainId: 1 },
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(Settlement)({
+      decodeSettlement({
         ...settlement,
         chainIdentity: {
           ...settlement.chainIdentity,
@@ -1316,7 +1440,7 @@ describe("cloud usage accounting", () => {
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(Settlement)({
+      decodeSettlement({
         ...settlement,
         chainIdentity: { ...settlement.chainIdentity, settlementContract: "0xnot-an-address" },
       }),
@@ -1339,7 +1463,7 @@ describe("cloud usage accounting", () => {
 
   it("rejects an invalid signed receipt total", () => {
     expect(() =>
-      Schema.decodeUnknownSync(UsageReceipt)({
+      decodeUsageReceipt({
         receiptId: "receipt-1",
         workspaceId: WORKSPACE_ID,
         environmentId: "environment-1",
@@ -1396,7 +1520,7 @@ describe("cloud usage accounting", () => {
       },
       recordedAt: NOW,
     } as const;
-    const accepted = Schema.decodeUnknownSync(UsageReceipt)({
+    const accepted = decodeUsageReceipt({
       ...base,
       status: "accepted",
       upstreamMicroUsdc: 1000,
@@ -1420,11 +1544,11 @@ describe("cloud usage accounting", () => {
       recordedAt: NOW,
     } as const;
 
-    expect(
-      Schema.decodeUnknownSync(UsageReceipt)({ ...base, status: "rejected", reason: "bad" }).status,
-    ).toBe("rejected");
+    expect(decodeUsageReceipt({ ...base, status: "rejected", reason: "bad" }).status).toBe(
+      "rejected",
+    );
     expect(() =>
-      Schema.decodeUnknownSync(UsageReceipt)({
+      decodeUsageReceipt({
         ...base,
         status: "rejected",
         reason: "bad",
@@ -1433,35 +1557,33 @@ describe("cloud usage accounting", () => {
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(UsageReceipt)({
+      decodeUsageReceipt({
         ...base,
         status: "duplicate",
         duplicateOfReceiptId: "receipt-1",
         upstreamMicroUsdc: 1000,
       }),
     ).toThrow();
-    expect(
-      Schema.decodeUnknownSync(UsageLedgerPosting)({ receipt: accepted, entry }).entry.entryId,
-    ).toBe("entry-status");
+    expect(decodeUsageLedgerPosting({ receipt: accepted, entry }).entry.entryId).toBe(
+      "entry-status",
+    );
     expect(() =>
-      Schema.decodeUnknownSync(UsageLedgerPosting)({
+      decodeUsageLedgerPosting({
         receipt: accepted,
         entry: { ...entry, amountMicroUsdc: -1049 },
       }),
     ).toThrow();
     expect(() =>
-      Schema.decodeUnknownSync(UsageLedgerPosting)({
+      decodeUsageLedgerPosting({
         receipt: accepted,
         entry: { ...entry, workspaceId: "workspace-2" },
       }),
     ).toThrow();
-    expect(() =>
-      Schema.decodeUnknownSync(LedgerEntry)({ ...entry, amountMicroUsdc: 1050 }),
-    ).toThrow();
+    expect(() => decodeLedgerEntry({ ...entry, amountMicroUsdc: 1050 })).toThrow();
   });
 
   it("rounds the fixed 5% markup half-up to the nearest micro-USDC", () => {
-    const receipt = Schema.decodeUnknownSync(UsageReceiptAccepted)({
+    const receipt = decodeUsageReceiptAccepted({
       receiptId: "receipt-rounding",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
@@ -1549,7 +1671,7 @@ describe("cloud usage accounting", () => {
       debitMicroUsdc: 1050,
       createdAt: NOW,
     } as const;
-    const decodeSettlement = Schema.decodeUnknownSync(Settlement);
+    const decodeSettlementRecord = decodeSettlement;
     const rejectedReceipt = {
       receiptId: "receipt-rejected",
       workspaceId: WORKSPACE_ID,
@@ -1575,13 +1697,13 @@ describe("cloud usage accounting", () => {
     expect(() => decodeSettlement({ ...settlement, usagePostings: [] })).toThrow();
     expect(() => decodeSettlement({ ...settlement, ledgerEntryIds: [] })).toThrow();
     expect(() =>
-      decodeSettlement({
+      decodeSettlementRecord({
         ...settlement,
         receiptRefs: [{ ...settlement.receiptRefs[0], receiptId: "receipt-arbitrary" }],
       }),
     ).toThrow();
     expect(() =>
-      decodeSettlement({
+      decodeSettlementRecord({
         ...settlement,
         receiptRefs: [
           {
@@ -1604,14 +1726,14 @@ describe("cloud usage accounting", () => {
       decodeSettlement({ ...settlement, creditMicroUsdc: 25, netMicroUsdc: 1025 }),
     ).toThrow();
     expect(() =>
-      decodeSettlement({
+      decodeSettlementRecord({
         ...settlement,
         debitMicroUsdc: 100,
         transfer: { ...settlement.transfer, amountMicroUsdc: 100 },
       }),
     ).toThrow();
     expect(() =>
-      decodeSettlement({
+      decodeSettlementRecord({
         ...settlement,
         usagePostings: [posting, posting],
         receiptRefs: [settlement.receiptRefs[0], settlement.receiptRefs[0]],
@@ -1637,7 +1759,7 @@ describe("cloud usage accounting", () => {
 
 describe("cloud contract forward compatibility", () => {
   it("validates MCP transports and binds executable hashes to stdio commands", () => {
-    const decodeMcp = Schema.decodeUnknownSync(PluginMcpServer);
+    const decodeMcp = decodePluginMcpServer;
 
     expect(() =>
       decodeMcp({

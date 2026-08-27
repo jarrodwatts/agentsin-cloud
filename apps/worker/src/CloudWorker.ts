@@ -13,6 +13,7 @@ import {
   type WorkerRelayInbound,
   type WorkerRelayOutbound,
   type WorkerRelayState,
+  type WorkerGitHubCommand,
 } from "@t3tools/contracts/worker";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -45,6 +46,8 @@ import {
   eventMatchesBootstrap,
 } from "./protocol.ts";
 import { isForbiddenBootstrapKey, redactLogFields } from "./redaction.ts";
+import type { GitHubGitExecutor } from "./GitHubGitExecutor.ts";
+import { executeGitHubWorkerCommand } from "./githubCommandHandler.ts";
 
 export interface CloudWorkerOptions {
   readonly maxPendingEventProposals: number;
@@ -61,6 +64,9 @@ export interface CloudWorkerDependencies {
   readonly clock: WorkerClock;
   readonly ids: WorkerIds;
   readonly logger: WorkerLogger;
+  readonly github?: {
+    readonly makeExecutor: (bootstrap: WorkerBootstrap) => GitHubGitExecutor;
+  };
   readonly onCloudEvent?: (event: CloudThreadEvent) => Effect.Effect<void>;
   readonly options?: Partial<CloudWorkerOptions>;
 }
@@ -173,6 +179,7 @@ export const runCloudWorker = (
       }
 
       const logger = safeLogger(dependencies.logger);
+      const github = dependencies.github?.makeExecutor(bootstrap);
       const materialization = yield* dependencies.secretLease
         .materialize({
           identity: bootstrap,
@@ -489,6 +496,24 @@ export const runCloudWorker = (
           yield* restartProvider;
         }).pipe(Effect.ensuring(Ref.set(queuedCommandsRef, 0)));
 
+      const processGitHubCommand = (command: WorkerGitHubCommand) =>
+        github === undefined
+          ? dependencies.clock.now.pipe(
+              Effect.flatMap((completedAt) =>
+                send({
+                  type: "github.command.result",
+                  operationId: command.operationId,
+                  commandId: command.commandId,
+                  status: "failed",
+                  code: "gitFailure",
+                  retryable: false,
+                  detail: "hosted worker Git executor is not configured",
+                  completedAt,
+                }),
+              ),
+            )
+          : executeGitHubWorkerCommand(github, command).pipe(Effect.flatMap(send));
+
       const acknowledgeState = (state: ConfirmationState, pending: PendingEventAck) => {
         const acknowledgedSequences = new Set(state.acknowledgedSequences);
         for (const sequence of pending.sequences) {
@@ -696,6 +721,9 @@ export const runCloudWorker = (
             switch (message.type) {
               case "thread.command":
                 yield* processCommand(connection, message);
+                break;
+              case "github.command":
+                yield* processGitHubCommand(message.command);
                 break;
               case "thread.events.confirmed":
                 yield* observeConfirmation(message);

@@ -8,14 +8,21 @@ import * as NodeTls from "node:tls";
 import {
   WorkerCertificateGrant,
   WorkerCommandClaimResponse,
+  WorkerGitHubTokenRedeemResponse,
   WorkerRelayOutbound,
+  WORKER_GITHUB_TOKEN_REDEEM_PATH,
 } from "@t3tools/contracts/worker";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import WebSocket, { type RawData } from "ws";
 
 import { WorkerRelayError } from "./errors.ts";
+import {
+  WorkerGitHubTokenLeaseError,
+  type WorkerGitHubTokenLeaseBroker,
+} from "./GitHubGitExecutor.ts";
 import {
   generateWorkerKeyPair,
   persistBootstrappedWorkerMtlsCredential,
@@ -86,6 +93,7 @@ export const makeOutboundFrameBudget = (
 
 const decodeGrant = Schema.decodeUnknownSync(WorkerCertificateGrant);
 const decodeClaim = Schema.decodeUnknownSync(WorkerCommandClaimResponse);
+const decodeGitHubToken = Schema.decodeUnknownSync(WorkerGitHubTokenRedeemResponse);
 const encodeOutbound = Schema.encodeUnknownSync(Schema.fromJsonString(WorkerRelayOutbound));
 
 const failure = (operation: string, retryable: boolean, cause?: unknown) =>
@@ -405,5 +413,48 @@ export const makeNodeMtlsRelayConnector = (
         }),
         (connection) => connection.close,
       ),
+  };
+};
+
+/** Redeems one approval-bound token over the same pinned worker mTLS channel. */
+export const makeNodeMtlsGitHubTokenLeaseBroker = (input: {
+  readonly credentials: WorkerMtlsCredentialStore;
+  readonly limits?: Partial<NodeMtlsRelayLimits>;
+}): WorkerGitHubTokenLeaseBroker => {
+  const limits = { ...DEFAULT_NODE_MTLS_RELAY_LIMITS, ...input.limits };
+  return {
+    materialize: (request, identity) =>
+      Effect.gen(function* () {
+        const credential = yield* input.credentials
+          .loadCertificate(identity.relayCredentialRef)
+          .pipe(
+            Effect.mapError(
+              () => new WorkerGitHubTokenLeaseError({ reason: "worker certificate unavailable" }),
+            ),
+          );
+        if (credential === undefined) {
+          return yield* new WorkerGitHubTokenLeaseError({
+            reason: "worker certificate unavailable",
+          });
+        }
+        const response = yield* Effect.tryPromise({
+          try: () =>
+            httpsJson({
+              url: directUrl(identity.relayEndpoint, WORKER_GITHUB_TOKEN_REDEEM_PATH),
+              body: request,
+              maxResponseBytes: limits.maxResponseBytes,
+              timeoutMs: limits.requestTimeoutMs,
+              decoder: decodeGitHubToken,
+              pin: identity.relayServerSpkiSha256,
+              credential,
+            }),
+          catch: () => new WorkerGitHubTokenLeaseError({ reason: "token lease redemption failed" }),
+        });
+        return {
+          token: Redacted.make(response.token),
+          expiresAt: response.expiresAt,
+          scrub: Effect.void,
+        };
+      }),
   };
 };

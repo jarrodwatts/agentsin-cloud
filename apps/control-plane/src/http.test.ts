@@ -179,6 +179,64 @@ it.effect("returns the authenticated user's workspace", () =>
   }),
 );
 
+it.effect("derives GitHub workflow actor and session identity from Better Auth", () =>
+  Effect.gen(function* () {
+    let received: Record<string, unknown> | undefined;
+    const handler = makeRequestHandler({
+      auth: makeAuth({
+        user: { id: "user-1", name: "Ada" },
+        session: { id: "session-authoritative" },
+      }),
+      config,
+      database: makeDatabase(),
+      workspaces,
+      githubWorkflow: {
+        execute: (input) =>
+          Effect.sync(() => {
+            received = input;
+            return { disposition: "accepted" };
+          }),
+      },
+    });
+    const response = yield* Effect.promise(() =>
+      handler(
+        request("/api/v1/github/thread-workflow", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: encodeJson({
+            idempotencyKey: "idem-http-1",
+            command: {
+              type: "github.branch.create",
+              commandId: "command-http-1",
+              workspaceId: "workspace-1",
+              environmentId: "environment-1",
+              threadId: "thread-1",
+              repository: {
+                provider: "github",
+                host: "github.com",
+                installationId: "installation-1",
+                owner: "jarrodwatts",
+                name: "agentsin-cloud",
+                canonicalKey: "github.com/jarrodwatts/agentsin-cloud",
+              },
+              approvalId: "approval-http-1",
+              requestedAt: "2026-08-27T12:00:00.000Z",
+              threadSlug: "HTTP workflow",
+              baseSha: "a".repeat(40),
+            },
+          }),
+        }),
+      ),
+    );
+    expect(response.status).toBe(200);
+    expect(received).toMatchObject({
+      actorUserId: "user-1",
+      authSessionId: "session-authoritative",
+      workspaceId: "workspace-1",
+    });
+  }),
+);
+
 it.effect("returns a generic error when an auth handler fails", () =>
   Effect.gen(function* () {
     const handler = makeRequestHandler({

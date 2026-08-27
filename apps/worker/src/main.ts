@@ -7,8 +7,12 @@ import * as Effect from "effect/Effect";
 import { loadWorkerBootstrap, type WorkerBootstrapFileSource } from "./bootstrap.ts";
 import { runCloudWorker, type CloudWorkerDependencies } from "./CloudWorker.ts";
 import { WorkerBootstrapError, type CloudWorkerError } from "./errors.ts";
+import { makeGitHubGitExecutor } from "./GitHubGitExecutor.ts";
 import { makeNodeWorkerMtlsCredentialStore } from "./MtlsCredentials.ts";
-import { makeNodeMtlsRelayConnector } from "./NodeMtlsRelayConnector.ts";
+import {
+  makeNodeMtlsGitHubTokenLeaseBroker,
+  makeNodeMtlsRelayConnector,
+} from "./NodeMtlsRelayConnector.ts";
 
 export const WORKER_EXECUTION_MODE_ENV = "AGENTSIN_WORKER_MODE";
 export const WORKER_MTLS_CREDENTIAL_DIRECTORY_ENV = "AGENTSIN_WORKER_MTLS_DIRECTORY";
@@ -37,12 +41,20 @@ export const selectWorkerProcessDependencies = (
     );
   }
   return Effect.try({
-    try: () => ({
-      ...dependencies,
-      relay: makeNodeMtlsRelayConnector({
-        credentials: makeNodeWorkerMtlsCredentialStore(directory),
-      }),
-    }),
+    try: () => {
+      const credentials = makeNodeWorkerMtlsCredentialStore(directory);
+      return {
+        ...dependencies,
+        relay: makeNodeMtlsRelayConnector({ credentials }),
+        github: {
+          makeExecutor: (bootstrap) =>
+            makeGitHubGitExecutor({
+              bootstrap,
+              tokenLeases: makeNodeMtlsGitHubTokenLeaseBroker({ credentials }),
+            }),
+        },
+      };
+    },
     catch: (cause) =>
       new WorkerBootstrapError({ reason: "hosted worker relay could not be configured", cause }),
   });

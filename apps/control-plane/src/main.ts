@@ -36,6 +36,10 @@ import {
 } from "./workerProduction.ts";
 import { loadWorkerMtlsTlsOptions } from "./workerTlsFiles.ts";
 import { productionLayer as valkeyProductionLayer } from "./valkeyCoordination.ts";
+import { makeGitHubWorkflowStore } from "./githubThreadWorkflowStore.ts";
+import { makeGitHubWorkflowAuthority } from "./githubWorkflowAuthority.ts";
+import { makeGitHubThreadWorkflow } from "./githubThreadWorkflow.ts";
+import { makePostgresGitHubTokenLeaseBroker } from "./githubTokenLeaseBroker.ts";
 
 const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -368,6 +372,7 @@ export interface ControlPlaneApplicationDependencies {
   readonly threadEventSignals?: ThreadEventSignalHub;
   readonly worker?: WorkerControlPlaneRuntime;
   readonly coordination: EphemeralCoordinationService;
+  readonly githubWorkflow?: ReturnType<typeof makeGitHubThreadWorkflow>;
 }
 
 /**
@@ -383,6 +388,7 @@ export const makeApplication = ({
   threadEventSignals,
   worker,
   coordination,
+  githubWorkflow,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
@@ -419,6 +425,7 @@ export const makeApplication = ({
       workspaces,
       cloudRpc,
       ...(worker === undefined ? {} : { workerBootstrap: worker.workerBootstrap }),
+      ...(githubWorkflow === undefined ? {} : { githubWorkflow }),
     }),
   };
 };
@@ -446,15 +453,32 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
       coordination,
     });
     yield* worker.relay.initialize;
+    const githubTokenLeases = makePostgresGitHubTokenLeaseBroker({
+      database,
+      vault: production.github.tokenVault,
+    });
+    const githubWorkflow = makeGitHubThreadWorkflow({
+      workspaces,
+      store: makeGitHubWorkflowStore(database),
+      authority: makeGitHubWorkflowAuthority(database),
+      tokens: production.github.tokens,
+      tokenLeases: githubTokenLeases,
+      github: production.github.client,
+      worker: worker.githubWorker,
+      clock: { now: Date.now },
+    });
 
     const workerTls = yield* loadWorkerMtlsTlsOptions(config);
     const workerMtls = createWorkerMtlsServer({
       tls: workerTls,
       identities: worker.identities,
       relay: worker.relay,
+      githubTokenLeases,
     });
     yield* Effect.acquireRelease(listenWorkerMtls(workerMtls, config), () =>
-      closeWorkerMtls(workerMtls),
+      closeWorkerMtls(workerMtls).pipe(
+        Effect.ensuring(Effect.sync(() => worker.githubWorker.close())),
+      ),
     );
 
     const { handle, cloudRpc } = makeApplication({
@@ -464,6 +488,7 @@ export const makeProgram = (production: WorkerProductionDependencies) =>
       threadEvents,
       worker,
       coordination,
+      githubWorkflow,
     });
     const server = yield* Effect.acquireRelease(
       listen(config, config.betterAuthUrl, handle),

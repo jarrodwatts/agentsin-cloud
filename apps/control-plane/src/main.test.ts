@@ -78,6 +78,11 @@ const workerProduction: WorkerProductionDependencies = {
     claimCommand: () =>
       Effect.fail(new WorkerRelayServerError({ code: "internal", operation: "composition-test" })),
   },
+  github: {
+    client: {} as WorkerProductionDependencies["github"]["client"],
+    tokens: {} as WorkerProductionDependencies["github"]["tokens"],
+    tokenVault: {} as WorkerProductionDependencies["github"]["tokenVault"],
+  },
 };
 
 it.effect("wires auth, services, and HTTP routes without opening a listener", () =>

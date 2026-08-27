@@ -10,12 +10,16 @@ import {
   WorkerCertificateBootstrapRequest,
   WorkerCertificateRotationRequest,
   WorkerCommandClaimRequest,
+  WorkerGitHubTokenRedeemRequest,
+  WORKER_GITHUB_TOKEN_REDEEM_PATH,
 } from "@t3tools/contracts/worker";
 import * as Effect from "effect/Effect";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 
 import type { WorkerIdentityService } from "./workerIdentity.ts";
+import type { GitHubTokenLeaseBroker } from "./githubTokenLeaseBroker.ts";
 import type { WorkerRelay, WorkerRelaySocket } from "./workerRelay.ts";
 
 export const WORKER_BOOTSTRAP_PATH = "/api/v1/worker-certificates/bootstrap";
@@ -95,6 +99,7 @@ export const makeWorkerMtlsConnectionAdmission = (
 const bootstrapDecoder = Schema.decodeUnknownSync(WorkerCertificateBootstrapRequest);
 const rotationDecoder = Schema.decodeUnknownSync(WorkerCertificateRotationRequest);
 const claimDecoder = Schema.decodeUnknownSync(WorkerCommandClaimRequest);
+const githubTokenRedeemDecoder = Schema.decodeUnknownSync(WorkerGitHubTokenRedeemRequest);
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 class WorkerMtlsTransportError extends Schema.TaggedErrorClass<WorkerMtlsTransportError>()(
@@ -271,6 +276,7 @@ export interface CreateWorkerMtlsServerOptions {
   readonly tls: NodeTls.TlsOptions;
   readonly identities: WorkerIdentityService;
   readonly relay: WorkerRelay;
+  readonly githubTokenLeases?: Pick<GitHubTokenLeaseBroker, "redeem">;
   readonly limits?: Partial<WorkerMtlsServerLimits>;
 }
 
@@ -303,7 +309,9 @@ export const createWorkerMtlsServer = (options: CreateWorkerMtlsServerOptions) =
       const socket = request.socket as NodeTls.TLSSocket;
       const url = new URL(request.url ?? "/", "https://worker.invalid");
       if (
-        ![WORKER_ROTATE_PATH, WORKER_CLAIM_PATH].includes(url.pathname) ||
+        ![WORKER_ROTATE_PATH, WORKER_CLAIM_PATH, WORKER_GITHUB_TOKEN_REDEEM_PATH].includes(
+          url.pathname,
+        ) ||
         request.method !== "POST"
       ) {
         response.writeHead(404, { "cache-control": "no-store" }).end();
@@ -323,6 +331,19 @@ export const createWorkerMtlsServer = (options: CreateWorkerMtlsServerOptions) =
             publicKeySpkiDerBase64: body.publicKeySpkiDerBase64,
           });
           return noStoreJson(grant);
+        }
+        if (url.pathname === WORKER_GITHUB_TOKEN_REDEEM_PATH) {
+          if (options.githubTokenLeases === undefined) {
+            return yield* new WorkerMtlsTransportError({ operation: "github-token-unconfigured" });
+          }
+          const body = yield* Effect.try(() => githubTokenRedeemDecoder(unknown));
+          const now = yield* options.identities.clock.now;
+          const materialized = yield* options.githubTokenLeases.redeem(certificate, body, now);
+          return noStoreJson({
+            schemaVersion: 1,
+            token: Redacted.value(materialized.token),
+            expiresAt: materialized.expiresAt,
+          });
         }
         const body = yield* Effect.try(() => claimDecoder(unknown));
         const claim = yield* options.relay.claimCommand(certificate, body.command);

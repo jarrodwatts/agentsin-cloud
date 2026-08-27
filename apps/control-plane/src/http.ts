@@ -1,4 +1,9 @@
-import { DesktopAuthExchangeRequest, DesktopAuthInitiateRequest } from "@t3tools/contracts/cloud";
+import {
+  DesktopAuthExchangeRequest,
+  DesktopAuthInitiateRequest,
+  GitHubThreadWorkflowSubmissionRequest,
+} from "@t3tools/contracts/cloud";
+import type { AuthSessionId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -19,6 +24,7 @@ import {
 } from "./workspaces.ts";
 
 export interface AuthSession {
+  readonly session?: { readonly id: string };
   readonly user: {
     readonly id: string;
     readonly name: string;
@@ -48,6 +54,15 @@ export interface RequestHandlerDependencies {
   };
   readonly workerBootstrap?: {
     readonly handleHttp: (request: Request) => Effect.Effect<Response | undefined, never>;
+  };
+  readonly githubWorkflow?: {
+    readonly execute: (input: {
+      readonly actorUserId: string;
+      readonly authSessionId: AuthSessionId;
+      readonly workspaceId: GitHubThreadWorkflowSubmissionRequest["command"]["workspaceId"];
+      readonly idempotencyKey: string;
+      readonly command: GitHubThreadWorkflowSubmissionRequest["command"];
+    }) => Effect.Effect<unknown, { readonly code: string }>;
   };
 }
 
@@ -245,6 +260,55 @@ const dispatch = (request: Request, dependencies: RequestHandlerDependencies) =>
         name: session.user.name,
       }).pipe(Effect.provideService(WorkspaceRepository, dependencies.workspaces));
       return jsonResponse({ workspace });
+    }
+
+    if (pathname === "/api/v1/github/thread-workflow" && request.method === "POST") {
+      if (dependencies.githubWorkflow === undefined)
+        return jsonResponse({ error: "not_found" }, 404);
+      const session = yield* Effect.tryPromise({
+        try: () =>
+          dependencies.auth.api.getSession({ headers: request.headers, signal: request.signal }),
+        catch: (cause) => new RequestHandlerError({ cause }),
+      });
+      if (session === null || session.session?.id === undefined)
+        return jsonResponse({ error: "unauthorized" }, 401);
+      const body = yield* decodeJsonBody<GitHubThreadWorkflowSubmissionRequest>(
+        GitHubThreadWorkflowSubmissionRequest,
+        request,
+      );
+      const workspace = yield* dependencies.workspaces
+        .findForUser(session.user.id)
+        .pipe(Effect.mapError((cause) => new RequestHandlerError({ cause })));
+      if (workspace === undefined || workspace.id !== body.command.workspaceId)
+        return jsonResponse({ error: "forbidden" }, 403);
+      const result = yield* dependencies.githubWorkflow
+        .execute({
+          actorUserId: session.user.id,
+          authSessionId: session.session.id as AuthSessionId,
+          workspaceId: body.command.workspaceId,
+          idempotencyKey: body.idempotencyKey,
+          command: body.command,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new RequestHandlerError({
+                cause,
+                status:
+                  cause.code === "unauthorized" || cause.code === "repositoryDenied"
+                    ? 403
+                    : cause.code === "notFound"
+                      ? 404
+                      : cause.code === "conflict"
+                        ? 409
+                        : cause.code === "approvalRequired" || cause.code === "approvalExpired"
+                          ? 412
+                          : 503,
+                publicCode: cause.code,
+              }),
+          ),
+        );
+      return jsonResponse(result);
     }
 
     if (dependencies.cloudRpc !== undefined) {
