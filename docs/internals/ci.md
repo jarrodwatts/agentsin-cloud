@@ -19,8 +19,13 @@ quality gates on pull requests and pushes to `main`:
   has no host mounts, network, capabilities, inherited credentials, or writable root filesystem. A
   base-owned, hash-verified probe and the host harness independently verify identity, groups,
   capabilities, mount/network/PID namespaces, host-file and secret denial, network denial, and the
-  final exit status. The ordinary **Test Worker Isolation Compatibility** job remains an
-  unprivileged semantic check and does not itself elevate the test command. Like every ordinary
+  final exit status. The trusted base is materialized without a Git checkout because `.repos`
+  contains vendored gitlinks that are intentionally not registered as root submodules. The workflow
+  anonymously fetches the event-bound base SHA, archives the tree without `.repos`, and hashes the
+  base-owned workflow and harness before setup. Exact commit identity and post-setup hash
+  verification preserve the trust boundary without leaving checkout metadata for cleanup to
+  traverse. The ordinary **Test Worker Isolation Compatibility** job remains an unprivileged
+  semantic check and does not itself elevate the test command. Like every ordinary
   `pull_request` job on a [GitHub-hosted Linux runner][runner-admin],
   it is compatibility feedback rather than a security boundary: the runner account has ambient
   passwordless `sudo`, so its result is never security evidence for untrusted code. The five
