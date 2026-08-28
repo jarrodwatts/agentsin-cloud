@@ -22,6 +22,7 @@ const applicationMigrationFilenames = [
   "0012-user-wallets.sql",
   "0013-cloud-thread-runtime.sql",
   "0014-usage-ledger.sql",
+  "0015-e2b-template-identity.sql",
 ] as const;
 const expectedRouteBindingDefinition =
   "CHECK (((used_at IS NOT NULL) OR ((environment_revision_id IS NOT NULL) AND (reservation_id IS NOT NULL) AND (worker_id IS NOT NULL) AND (provider_instance_id IS NOT NULL) AND (provider_driver IS NOT NULL) AND (process_instance_id IS NOT NULL) AND (certificate_fingerprint IS NOT NULL) AND (certificate_generation > 0) AND (worker_lease_generation > 0) AND (route_generation > 0))))";

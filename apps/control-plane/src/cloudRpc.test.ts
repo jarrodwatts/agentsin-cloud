@@ -3,6 +3,7 @@ import {
   type CloudThreadCommand,
   type CloudThreadEvent,
   CloudThreadStreamServerFrame,
+  CreateCloudThreadRequest,
   type WorkspaceId,
 } from "@t3tools/contracts/cloud";
 import { expect, it } from "@effect/vitest";
@@ -23,6 +24,9 @@ const threadId = "thread-b3" as ThreadId;
 const environmentId = "environment-b3" as EnvironmentId;
 const decodeServerFrameJson = Schema.decodeUnknownSync(
   Schema.fromJsonString(CloudThreadStreamServerFrame),
+);
+const encodeCreateThreadJson = Schema.encodeUnknownSync(
+  Schema.fromJsonString(CreateCloudThreadRequest),
 );
 
 const command = (commandId: string, routedWorkspace = workspaceId): CloudThreadCommand => ({
@@ -309,6 +313,63 @@ it.effect("authenticates B1 desktop bearers and preserves command idempotency", 
       (yield* Effect.promise(() => duplicate!.json())) as { disposition: string },
     ).toMatchObject({ disposition: "duplicate" });
     expect(store.commands).toHaveLength(1);
+  });
+});
+
+it.effect("routes authenticated hosted thread creation into the production lifecycle", () => {
+  const store = new FakeThreadStore();
+  const calls: Array<unknown> = [];
+  const rpc = makeCloudRpc({
+    auth: auth(),
+    hostedOrigin: "https://control.example.com",
+    workspaces,
+    eventStore: store.service,
+    lifecycle: {
+      createThread: (userId, input) => {
+        calls.push({ userId, input });
+        return Effect.succeed({
+          threadId: input.threadId,
+          environmentId: input.environmentId,
+          environmentRevisionId: input.environmentRevisionId,
+          state: "ready",
+          replayCursor: -1,
+        });
+      },
+    },
+  });
+  return Effect.gen(function* () {
+    const preflight = yield* rpc.handleHttp(
+      new Request("https://control.example.com/api/v1/threads", {
+        method: "OPTIONS",
+        headers: { origin: "agentsincloud://app" },
+      }),
+    );
+    expect(preflight?.status).toBe(204);
+    expect(preflight?.headers.get("access-control-allow-methods")).toBe("POST, OPTIONS");
+
+    const body = {
+      requestId: "create-cloud-thread-1",
+      idempotencyKey: "create-cloud-thread-once",
+      threadId,
+      environmentId,
+      environmentRevisionId: "revision-1",
+      projectId: "project-1",
+      providerInstanceId: "codex_default",
+    };
+    const response = yield* rpc.handleHttp(
+      new Request("https://control.example.com/api/v1/threads", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authorizationHeaders() },
+        body: encodeCreateThreadJson(body),
+      }),
+    );
+
+    expect(response?.status).toBe(201);
+    expect(calls).toEqual([{ userId: "user-1", input: body }]);
+    expect(yield* Effect.promise(() => response!.json())).toMatchObject({
+      threadId,
+      state: "ready",
+    });
   });
 });
 

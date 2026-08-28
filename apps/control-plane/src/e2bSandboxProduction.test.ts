@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 
 import { CommandId, type EnvironmentId, type ThreadId } from "@t3tools/contracts";
 import { SandboxProviderCreateRequest, SandboxId, SandboxPtyId } from "@t3tools/contracts/cloud";
+import { WorkerInstanceId } from "@t3tools/contracts/worker";
 import {
   e2bIdentityMetadataFor,
   type E2bClient,
@@ -19,8 +20,10 @@ import type { Pool } from "pg";
 
 import type { DatabaseService } from "./database.ts";
 import {
+  E2bProviderServiceError,
   makeE2bProviderService,
   makeHostedE2bProviderService,
+  makeMaterializingWorkerGateway,
   type SealedBootstrapMaterializer,
 } from "./e2bSandboxProduction.ts";
 
@@ -68,7 +71,7 @@ const createRequest = Schema.decodeUnknownSync(SandboxProviderCreateRequest)({
           remoteUrl: "https://github.com/jarrodwatts/agentsin-cloud",
         },
       },
-      image: `e2b://template/agentsin-cloud-base:build-${BUILD_ID}`,
+      image: `e2b://template/template-1@build-${BUILD_ID}`,
       workspaceDirectory: "/workspace",
       resources: { cpuCores: 4, memoryMiB: 8_192, storageMiB: 32_768 },
       setupCommands: [],
@@ -120,6 +123,7 @@ const artifacts = {
 const makeIdentityStore = () => {
   const reservations = new Map<string, SandboxIdentityReservation>();
   const records = new Map<string, SandboxIdentityRecord>();
+  const states = new Map<string, "active" | "cleanup_required" | "destroyed">();
   const store: SandboxIdentityStore = {
     reserve: async (record) => {
       if (
@@ -136,16 +140,22 @@ const makeIdentityStore = () => {
     activateReservation: async (_workspaceId, reservationId, record) => {
       if (!reservations.has(reservationId)) throw new Error("reservation missing");
       records.set(record.sandboxId, record);
+      states.set(record.sandboxId, "active");
     },
     markReservationFailed: async () => undefined,
     markReservationCleanupRequired: async () => undefined,
-    get: async (_workspaceId, sandboxId) => records.get(sandboxId),
+    get: async (_workspaceId, sandboxId) => {
+      const identity = records.get(sandboxId);
+      return identity === undefined
+        ? undefined
+        : { state: states.get(sandboxId) ?? "active", identity };
+    },
     markDestroyed: async () => undefined,
     recordCleanupOrphan: async () => undefined,
     recordCleanupFailure: async () => undefined,
     markCleanupOrphanReclaimed: async () => undefined,
   };
-  return { store, records };
+  return { store, records, states };
 };
 
 const makeClient = (options?: {
@@ -188,7 +198,7 @@ const makeClient = (options?: {
   snapshot: async () => ({ snapshotId: "snapshot-1", state: "paused" }),
   desktop: async () => undefined,
   ports: async () => [],
-  usage: async () => [],
+  observability: async () => [],
   reconcilePtys: async () => undefined,
   shutdownPtys: async () => undefined,
   destroy: async () => true,
@@ -271,17 +281,23 @@ it.effect("materializes only an opaque reference into the exact bound running sa
       projectId: createRequest.workspace.projectId,
       threadId: createRequest.workspace.threadId,
       revisionId: createRequest.revision.revisionId,
+      providerTemplateId: "template-1",
+      providerBuildId: BUILD_ID,
       repositoryIdentity: createRequest.workspace.repositoryIdentity,
       workspaceDirectory: createRequest.workspace.workspaceDirectory,
       providerHandle: "sandbox-1",
       createdAt: NOW,
     };
     identities.records.set(sandboxId, identity);
+    identities.states.set(sandboxId, "active");
     let remote: E2bSandboxDescription = {
       sandboxId: "sandbox-1",
-      templateId: `agentsin-cloud-base:build-${BUILD_ID}`,
+      templateId: "template-1",
       state: "running",
-      metadata: e2bIdentityMetadataFor(createRequest),
+      metadata: e2bIdentityMetadataFor(createRequest, {
+        templateId: "template-1",
+        buildId: BUILD_ID,
+      }),
       startedAt: date(NOW),
       endAt: date(END),
     };
@@ -325,6 +341,20 @@ it.effect("materializes only an opaque reference into the exact bound running sa
     expect(wrongThread).toMatchObject({ _tag: "Failure" });
     expect(materializations).toEqual([]);
 
+    identities.states.set(sandboxId, "cleanup_required");
+    const quarantined = yield* Effect.exit(
+      service.materializeSealedBootstrap({
+        workspaceId: identity.workspaceId,
+        environmentId: identity.environmentId,
+        threadId: identity.threadId,
+        sandboxId,
+        sealedBootstrapRef: "sealed://bootstrap/attempt-1",
+      }),
+    );
+    expect(quarantined).toMatchObject({ _tag: "Failure" });
+    expect(materializations).toEqual([]);
+    identities.states.set(sandboxId, "active");
+
     remote = {
       ...remote,
       metadata: { ...remote.metadata, agentsin_cloud_thread_id: "other-thread" },
@@ -341,7 +371,34 @@ it.effect("materializes only an opaque reference into the exact bound running sa
     expect(mismatchedRemote).toMatchObject({ _tag: "Failure" });
     expect(materializations).toEqual([]);
 
-    remote = { ...remote, metadata: e2bIdentityMetadataFor(createRequest) };
+    remote = {
+      ...remote,
+      templateId: "template-forged",
+      metadata: e2bIdentityMetadataFor(createRequest, {
+        templateId: "template-1",
+        buildId: BUILD_ID,
+      }),
+    };
+    const wrongTemplate = yield* Effect.exit(
+      service.materializeSealedBootstrap({
+        workspaceId: identity.workspaceId,
+        environmentId: identity.environmentId,
+        threadId: identity.threadId,
+        sandboxId,
+        sealedBootstrapRef: "sealed://bootstrap/attempt-1",
+      }),
+    );
+    expect(wrongTemplate).toMatchObject({ _tag: "Failure" });
+    expect(materializations).toEqual([]);
+
+    remote = {
+      ...remote,
+      templateId: "template-1",
+      metadata: e2bIdentityMetadataFor(createRequest, {
+        templateId: "template-1",
+        buildId: BUILD_ID,
+      }),
+    };
     const result = yield* service.materializeSealedBootstrap({
       workspaceId: identity.workspaceId,
       environmentId: identity.environmentId,
@@ -361,6 +418,73 @@ it.effect("materializes only an opaque reference into the exact bound running sa
         sealedBootstrapRef: "sealed://bootstrap/attempt-1",
       },
     ]);
+  }),
+);
+
+it.effect("materializes the sealed bootstrap before the hosted lifecycle starts its worker", () =>
+  Effect.gen(function* () {
+    const order: Array<string> = [];
+    const input = {
+      workspaceId: createRequest.workspaceId,
+      environmentId: createRequest.environmentId,
+      threadId: createRequest.workspace.threadId,
+      sandboxId: SandboxId.make("sandbox-1"),
+      workerId: WorkerInstanceId.make("worker-1"),
+      sealedBootstrapRef: "sealed://bootstrap/attempt-1",
+    };
+    const upstream = {
+      start: () => Effect.sync(() => order.push("start")).pipe(Effect.asVoid),
+      inspect: () => Effect.succeed("absent" as const),
+      authorizeReconnect: () => Effect.die(new Error("unused by this startup test")),
+    };
+    const gateway = makeMaterializingWorkerGateway(
+      {
+        materializeSealedBootstrap: (materializeInput) =>
+          Effect.sync(() => {
+            expect(materializeInput).toMatchObject({
+              workspaceId: input.workspaceId,
+              environmentId: input.environmentId,
+              threadId: input.threadId,
+              sandboxId: input.sandboxId,
+              sealedBootstrapRef: input.sealedBootstrapRef,
+            });
+            order.push("materialize");
+            return { status: "materialized" as const, completedAt: NOW };
+          }),
+      },
+      upstream,
+    );
+
+    yield* gateway.start(input);
+    expect(order).toEqual(["materialize", "start"]);
+
+    let blockedStartCalls = 0;
+    const blocked = makeMaterializingWorkerGateway(
+      {
+        materializeSealedBootstrap: () =>
+          Effect.fail(
+            new E2bProviderServiceError({
+              code: "unavailable",
+              operation: "materialize-bootstrap-reference",
+              retryable: true,
+            }),
+          ),
+      },
+      {
+        ...upstream,
+        start: () =>
+          Effect.sync(() => {
+            blockedStartCalls += 1;
+          }),
+      },
+    );
+    const failure = yield* Effect.flip(blocked.start(input));
+    expect(failure).toMatchObject({
+      code: "e2b-bootstrap-unavailable",
+      retryable: true,
+      outcome: "uncertain",
+    });
+    expect(blockedStartCalls).toBe(0);
   }),
 );
 
@@ -403,6 +527,7 @@ it.effect("fails hosted composition before E2B I/O when secret-broker gates are 
           materializeReference: () => Effect.void,
         },
         sdk: {
+          immutableBuildLaunch: true,
           create: async () => {
             sdkCalls += 1;
             throw new Error("must not run");
@@ -418,6 +543,13 @@ it.effect("fails hosted composition before E2B I/O when secret-broker gates are 
           pause: async () => false,
           kill: async () => false,
           getMetrics: async () => [],
+          getBuildStatus: async ({ templateId, buildId }) => ({
+            templateID: templateId,
+            buildID: buildId,
+            status: "ready",
+            logEntries: [],
+            logs: [],
+          }),
         },
       }),
     );

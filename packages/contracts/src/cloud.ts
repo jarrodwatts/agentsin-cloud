@@ -553,6 +553,7 @@ export const SandboxProviderPortsRequest = Schema.Struct({
 });
 export type SandboxProviderPortsRequest = typeof SandboxProviderPortsRequest.Type;
 
+/** Requests resource observability gauges. These values are never authoritative billing evidence. */
 export const SandboxProviderUsageRequest = Schema.Struct({
   type: Schema.Literal("usage"),
   ...SandboxProviderRequestBaseFields,
@@ -810,6 +811,7 @@ export const SandboxProviderPortsResult = Schema.Struct({
 });
 export type SandboxProviderPortsResult = typeof SandboxProviderPortsResult.Type;
 
+/** Non-billable resource observability measurement. */
 export const SandboxProviderUsageMeasurement = Schema.Struct({
   meter: TrimmedNonEmptyString,
   quantity: NonNegativeFiniteNumber,
@@ -834,6 +836,43 @@ export const SandboxProviderUsageResult = Schema.Struct({
   completedAt: IsoDateTime,
 });
 export type SandboxProviderUsageResult = typeof SandboxProviderUsageResult.Type;
+
+export const CloudThreadLifecycleState = Schema.Literals([
+  "reserved",
+  "create_dispatched",
+  "sandbox_ready",
+  "bootstrap_dispatched",
+  "bootstrap_ready",
+  "worker_start_dispatched",
+  "ready",
+  "cleanup_required",
+  "failed",
+]);
+export type CloudThreadLifecycleState = typeof CloudThreadLifecycleState.Type;
+
+/** Authenticated hosted request. Workspace authority and provider driver are server-derived. */
+export const CreateCloudThreadRequest = Schema.Struct({
+  requestId: CommandId,
+  idempotencyKey: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  environmentRevisionId: EnvironmentRevisionId,
+  projectId: ProjectId,
+  providerInstanceId: ProviderInstanceRef.fields.instanceId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type CreateCloudThreadRequest = typeof CreateCloudThreadRequest.Type;
+
+export const CloudThreadLifecycleView = Schema.Struct({
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  environmentRevisionId: EnvironmentRevisionId,
+  state: CloudThreadLifecycleState,
+  sandboxId: Schema.optionalKey(SandboxId),
+  workerId: Schema.optionalKey(TrimmedNonEmptyString),
+  failureCode: Schema.optionalKey(TrimmedNonEmptyString),
+  replayCursor: Schema.Int,
+});
+export type CloudThreadLifecycleView = typeof CloudThreadLifecycleView.Type;
 
 export const SandboxProviderDestroyResult = Schema.Struct({
   type: Schema.Literal("destroyed"),

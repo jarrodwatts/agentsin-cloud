@@ -31,6 +31,8 @@ interface IdentityRow extends QueryResultRow {
   readonly environment_id: string;
   readonly project_id: string;
   readonly revision_id: string;
+  readonly provider_template_id: string;
+  readonly provider_build_id: string;
   readonly repository_identity: unknown;
   readonly workspace_directory: string;
   readonly sandbox_id: string | null;
@@ -42,7 +44,8 @@ interface IdentityRow extends QueryResultRow {
 }
 
 const selectIdentity = `SELECT reservation_id, workspace_id::text AS workspace_id, thread_id,
-       environment_id, project_id, revision_id, repository_identity, workspace_directory,
+       environment_id, project_id, revision_id, provider_template_id, provider_build_id,
+       repository_identity, workspace_directory,
        sandbox_id, provider_handle, state, requested_at::text AS requested_at,
        activated_at::text AS activated_at, destroyed_at::text AS destroyed_at
   FROM cloud_e2b_sandbox_identity`;
@@ -55,6 +58,8 @@ type ReservationIdentity = Pick<
   | "environmentId"
   | "projectId"
   | "revisionId"
+  | "providerTemplateId"
+  | "providerBuildId"
   | "repositoryIdentity"
   | "workspaceDirectory"
 >;
@@ -66,6 +71,8 @@ const sameReservation = (row: IdentityRow, record: ReservationIdentity) =>
   row.environment_id === record.environmentId &&
   row.project_id === record.projectId &&
   row.revision_id === record.revisionId &&
+  row.provider_template_id === record.providerTemplateId &&
+  row.provider_build_id === record.providerBuildId &&
   row.workspace_directory === record.workspaceDirectory &&
   canonicalJson(decodeRepositoryIdentity(row.repository_identity)) ===
     canonicalJson(record.repositoryIdentity);
@@ -86,6 +93,8 @@ const toIdentity = (row: IdentityRow): SandboxIdentityRecord | undefined => {
     projectId: row.project_id as SandboxIdentityRecord["projectId"],
     threadId: row.thread_id as SandboxIdentityRecord["threadId"],
     revisionId: row.revision_id as SandboxIdentityRecord["revisionId"],
+    providerTemplateId: row.provider_template_id,
+    providerBuildId: row.provider_build_id,
     repositoryIdentity: decodeRepositoryIdentity(row.repository_identity),
     workspaceDirectory: row.workspace_directory,
     providerHandle: row.provider_handle,
@@ -130,8 +139,9 @@ export const makePostgresSandboxIdentityStore = (pool: Pool): SandboxIdentitySto
       const inserted = await client.query(
         `INSERT INTO cloud_e2b_sandbox_identity
           (reservation_id, workspace_id, thread_id, environment_id, project_id, revision_id,
-           repository_identity, workspace_directory, state, requested_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, 'reserved', $9)
+           provider_template_id, provider_build_id, repository_identity, workspace_directory,
+           state, requested_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, 'reserved', $11)
          ON CONFLICT (workspace_id, reservation_id) DO NOTHING`,
         [
           record.reservationId,
@@ -140,6 +150,8 @@ export const makePostgresSandboxIdentityStore = (pool: Pool): SandboxIdentitySto
           record.environmentId,
           record.projectId,
           record.revisionId,
+          record.providerTemplateId,
+          record.providerBuildId,
           JSON.stringify(record.repositoryIdentity),
           record.workspaceDirectory,
           record.requestedAt,
@@ -233,7 +245,15 @@ export const makePostgresSandboxIdentityStore = (pool: Pool): SandboxIdentitySto
       [workspaceId, sandboxId],
     );
     const row = result.rows[0];
-    return row === undefined ? undefined : toIdentity(row);
+    if (row === undefined || !["active", "cleanup_required", "destroyed"].includes(row.state)) {
+      return undefined;
+    }
+    const identity = toIdentity(row);
+    if (identity === undefined) return undefined;
+    return {
+      state: row.state as "active" | "cleanup_required" | "destroyed",
+      identity,
+    };
   },
 
   markDestroyed: (workspaceId, sandboxId, destroyedAt) =>

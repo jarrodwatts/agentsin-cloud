@@ -28,6 +28,7 @@ export interface E2bSandboxDescription {
 
 export interface E2bCreateInput {
   readonly templateId: string;
+  readonly buildId: string;
   readonly metadata: Readonly<Record<string, string>>;
   readonly timeoutMs: number;
 }
@@ -143,6 +144,7 @@ export interface E2bMetric {
 /** A sanitized upstream error. Its message must never contain request options or credentials. */
 export class E2bClientFailure extends Error {
   readonly code:
+    | "authentication"
     | "notFound"
     | "rateLimited"
     | "timeout"
@@ -212,7 +214,8 @@ export interface E2bClient {
     activeTimeoutMs: number,
   ) => Promise<E2bDesktopConnection | undefined>;
   readonly ports: (sandboxId: string, activeTimeoutMs: number) => Promise<ReadonlyArray<E2bPort>>;
-  readonly usage: (
+  /** Resource observability gauges only; never authoritative billing evidence. */
+  readonly observability: (
     sandboxId: string,
     since: Date,
     until: Date,
@@ -223,6 +226,7 @@ export interface E2bClient {
     activeTimeoutMs: number,
   ) => Promise<void>;
   readonly shutdownPtys: (mode: "handoff" | "terminate", activeTimeoutMs: number) => Promise<void>;
+  /** True means the upstream sandbox is absent, including an already-absent sandbox. */
   readonly destroy: (sandboxId: string) => Promise<boolean>;
 }
 
@@ -234,6 +238,8 @@ export interface SandboxIdentityReservation {
   readonly projectId: ProjectId;
   readonly threadId: ThreadId;
   readonly revisionId: EnvironmentRevisionId;
+  readonly providerTemplateId: string;
+  readonly providerBuildId: string;
   readonly repositoryIdentity: RepositoryIdentity;
   readonly workspaceDirectory: string;
   readonly requestedAt: string;
@@ -248,11 +254,18 @@ export interface SandboxIdentityRecord {
   readonly projectId: ProjectId;
   readonly threadId: ThreadId;
   readonly revisionId: EnvironmentRevisionId;
+  readonly providerTemplateId: string;
+  readonly providerBuildId: string;
   readonly repositoryIdentity: RepositoryIdentity;
   readonly workspaceDirectory: string;
   readonly providerHandle: string;
   readonly createdAt: string;
   readonly destroyedAt?: string;
+}
+
+export interface SandboxIdentityLookup {
+  readonly state: "active" | "cleanup_required" | "destroyed";
+  readonly identity: SandboxIdentityRecord;
 }
 
 export interface SandboxCleanupOrphanRecord {
@@ -303,7 +316,7 @@ export interface SandboxIdentityStore {
   readonly get: (
     workspaceId: WorkspaceId,
     sandboxId: SandboxId,
-  ) => Promise<SandboxIdentityRecord | undefined>;
+  ) => Promise<SandboxIdentityLookup | undefined>;
   readonly markDestroyed: (
     workspaceId: WorkspaceId,
     sandboxId: SandboxId,

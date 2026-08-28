@@ -39,17 +39,19 @@ const error = (
 const mapFailure = (operation: string, cause: unknown): SandboxProviderError => {
   if (cause instanceof E2bClientFailure) {
     const code =
-      cause.code === "notFound"
-        ? "E2B_SANDBOX_NOT_FOUND"
-        : cause.code === "outputLimit"
-          ? "E2B_OUTPUT_LIMIT_EXCEEDED"
-          : cause.code === "invalidRequest"
-            ? "E2B_INVALID_REQUEST"
-            : cause.code === "rateLimited"
-              ? "E2B_RATE_LIMITED"
-              : cause.code === "timeout"
-                ? "E2B_TIMEOUT"
-                : "E2B_UNAVAILABLE";
+      cause.code === "authentication"
+        ? "E2B_AUTHENTICATION_FAILED"
+        : cause.code === "notFound"
+          ? "E2B_SANDBOX_NOT_FOUND"
+          : cause.code === "outputLimit"
+            ? "E2B_OUTPUT_LIMIT_EXCEEDED"
+            : cause.code === "invalidRequest"
+              ? "E2B_INVALID_REQUEST"
+              : cause.code === "rateLimited"
+                ? "E2B_RATE_LIMITED"
+                : cause.code === "timeout"
+                  ? "E2B_TIMEOUT"
+                  : "E2B_UNAVAILABLE";
     return error(code, cause.message, cause.retryable, {
       operation,
       ...(cause.createDisposition === undefined
@@ -193,14 +195,24 @@ export const makeE2bSandboxProvider = (
     readonly environmentId: SandboxIdentityRecord["environmentId"];
   }) =>
     Effect.gen(function* () {
-      const identity = yield* attempt("identity lookup", () =>
+      const lookup = yield* attempt("identity lookup", () =>
         dependencies.identities.get(request.workspaceId, request.sandboxId),
       );
-      if (identity === undefined) {
+      if (lookup === undefined) {
         return yield* Effect.fail(
           error("E2B_SANDBOX_NOT_FOUND", "No E2B sandbox identity is registered", false),
         );
       }
+      if (lookup.state === "cleanup_required") {
+        return yield* Effect.fail(
+          error(
+            "E2B_RECONCILIATION_REQUIRED",
+            "The E2B sandbox is quarantined pending operator reconciliation",
+            false,
+          ),
+        );
+      }
+      const identity = lookup.identity;
       if (
         identity.provider !== "e2b" ||
         identity.sandboxId !== request.sandboxId ||
@@ -274,8 +286,8 @@ export const makeE2bSandboxProvider = (
     ],
     create: (request) =>
       Effect.gen(function* () {
-        const templateId = parseE2bTemplateReference(request.revision.blueprint.image);
-        if (templateId === undefined) {
+        const template = parseE2bTemplateReference(request.revision.blueprint.image);
+        if (template === undefined) {
           return yield* Effect.fail(
             error(
               "E2B_TEMPLATE_REQUIRED",
@@ -292,6 +304,8 @@ export const makeE2bSandboxProvider = (
           projectId: request.workspace.projectId,
           threadId: request.workspace.threadId,
           revisionId: request.revision.revisionId,
+          providerTemplateId: template.templateId,
+          providerBuildId: template.buildId,
           repositoryIdentity: request.workspace.repositoryIdentity,
           workspaceDirectory: request.workspace.workspaceDirectory,
           requestedAt: request.requestedAt,
@@ -335,10 +349,11 @@ export const makeE2bSandboxProvider = (
         const creation = yield* Effect.result(
           attempt("create", () =>
             dependencies.client.create({
-              templateId,
+              templateId: template.templateId,
+              buildId: template.buildId,
               timeoutMs: activeTimeoutMs,
               metadata: {
-                ...e2bIdentityMetadataFor(request),
+                ...e2bIdentityMetadataFor(request, template),
               },
             }),
           ),
@@ -361,7 +376,7 @@ export const makeE2bSandboxProvider = (
                     ? {}
                     : { providerHandle: cleanupRequired.providerHandle }),
                   reclaimMetadata:
-                    cleanupRequired?.reclaimMetadata ?? e2bIdentityMetadataFor(request),
+                    cleanupRequired?.reclaimMetadata ?? e2bIdentityMetadataFor(request, template),
                   recordedAt: iso(dependencies.clock.now()),
                 }),
               ),
@@ -377,7 +392,7 @@ export const makeE2bSandboxProvider = (
                     ? {}
                     : { providerHandle: cleanupRequired.providerHandle }),
                   reclaimMetadata:
-                    cleanupRequired?.reclaimMetadata ?? e2bIdentityMetadataFor(request),
+                    cleanupRequired?.reclaimMetadata ?? e2bIdentityMetadataFor(request, template),
                   durableFenceRecorded: true,
                   durableReclaimRecorded: Exit.isSuccess(reclaim),
                 },
@@ -459,6 +474,8 @@ export const makeE2bSandboxProvider = (
           projectId: request.workspace.projectId,
           threadId: request.workspace.threadId,
           revisionId: request.revision.revisionId,
+          providerTemplateId: template.templateId,
+          providerBuildId: template.buildId,
           repositoryIdentity: request.workspace.repositoryIdentity,
           workspaceDirectory: request.workspace.workspaceDirectory,
           providerHandle: remote.sandboxId,
@@ -913,17 +930,33 @@ export const makeE2bSandboxProvider = (
         const since = dateFromIso(request.since);
         const until = dateFromIso(request.until);
         const metrics = yield* attempt("usage", () =>
-          dependencies.client.usage(identity.providerHandle, since, until),
+          dependencies.client.observability(identity.providerHandle, since, until),
         );
         const measurements = metrics.flatMap((metric, index) => {
           const intervalStart = index === 0 ? since : metrics[index - 1]!.timestamp;
           const intervalEnd = metric.timestamp;
           return [
-            { meter: "e2b.sandbox.cpu.percent", quantity: metric.cpuUsedPct, unit: "percent" },
-            { meter: "e2b.sandbox.memory.used", quantity: metric.memoryUsedBytes, unit: "byte" },
-            { meter: "e2b.sandbox.memory.total", quantity: metric.memoryTotalBytes, unit: "byte" },
-            { meter: "e2b.sandbox.disk.used", quantity: metric.diskUsedBytes, unit: "byte" },
-            { meter: "e2b.sandbox.disk.total", quantity: metric.diskTotalBytes, unit: "byte" },
+            {
+              meter: "e2b.observability.cpu.percent",
+              quantity: metric.cpuUsedPct,
+              unit: "percent",
+            },
+            {
+              meter: "e2b.observability.memory.used",
+              quantity: metric.memoryUsedBytes,
+              unit: "byte",
+            },
+            {
+              meter: "e2b.observability.memory.total",
+              quantity: metric.memoryTotalBytes,
+              unit: "byte",
+            },
+            { meter: "e2b.observability.disk.used", quantity: metric.diskUsedBytes, unit: "byte" },
+            {
+              meter: "e2b.observability.disk.total",
+              quantity: metric.diskTotalBytes,
+              unit: "byte",
+            },
           ].map((measurement) => ({
             ...measurement,
             intervalStart: iso(intervalStart),
@@ -959,11 +992,7 @@ export const makeE2bSandboxProvider = (
           );
           if (!destroyed) {
             return yield* Effect.fail(
-              error(
-                "E2B_DESTROY_NOT_CONFIRMED",
-                "E2B did not confirm that the sandbox was destroyed",
-                true,
-              ),
+              error("E2B_DESTROY_NOT_CONFIRMED", "E2B sandbox absence was not confirmed", true),
             );
           }
           yield* attempt("identity destroy", () =>

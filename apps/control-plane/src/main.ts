@@ -16,9 +16,14 @@ import { ArtifactStorage, productionArtifactStorageLayer } from "./artifactStora
 import { makeCloudRpc, type ThreadEventSignalHub } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import {
+  makeCloudThreadLifecycle,
+  type CloudThreadLifecycleDependencies,
+} from "./cloudThreadLifecycle.ts";
+import {
   makePostgresCloudThreadLifecycleStore,
   type CloudThreadLifecycleStore,
 } from "./cloudThreadLifecycleStore.ts";
+import { inspectE2bReservation } from "./sandboxIdentityStore.ts";
 import { ControlPlaneConfig, layer as controlPlaneConfigLayer } from "./config.ts";
 import { Database, layer as databaseLayer } from "./database.ts";
 import {
@@ -28,6 +33,7 @@ import {
 import { E2bSandboxConfig, e2bSandboxConfigLayer } from "./e2bSandboxConfig.ts";
 import {
   makeHostedE2bProviderService,
+  makeMaterializingWorkerGateway,
   type HostedE2bProviderDependencies,
 } from "./e2bSandboxProduction.ts";
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
@@ -420,6 +426,7 @@ export interface ControlPlaneApplicationDependencies {
     readonly inputAuthorizer?: InspectorInputAuthorizer;
     readonly desktopControl?: DesktopLeaseService;
   };
+  readonly threadLifecycle?: ReturnType<typeof makeCloudThreadLifecycle>;
 }
 
 /**
@@ -438,6 +445,7 @@ export const makeApplication = ({
   githubWorkflow,
   providerCredentialRuntime,
   inspector,
+  threadLifecycle,
 }: ControlPlaneApplicationDependencies): {
   readonly auth: AuthInstance;
   readonly handle: (request: Request) => Promise<Response>;
@@ -462,6 +470,7 @@ export const makeApplication = ({
     workspaces,
     eventStore: threadEvents,
     coordination,
+    ...(threadLifecycle === undefined ? {} : { lifecycle: threadLifecycle }),
     ...(threadEventSignals === undefined ? {} : { signals: threadEventSignals }),
   });
   const providerCredentials =
@@ -522,6 +531,10 @@ export interface HostedProductionDependencies extends WorkerProductionDependenci
   readonly providerCredentialKeyEncryption: ProviderCredentialKeyEncryption;
   readonly providerCredentialLoginRunner: ProviderCredentialLoginRunner;
   readonly e2b: Omit<HostedE2bProviderDependencies, "config" | "database" | "ptyOwnerId" | "sdk">;
+  readonly cloudThreadLifecycle: Omit<
+    CloudThreadLifecycleDependencies,
+    "workspaces" | "threadEvents" | "lifecycle" | "sandbox" | "reservations" | "clock"
+  >;
 }
 
 export const makeProgram = (production: HostedProductionDependencies) =>
@@ -600,6 +613,20 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       ),
     );
     const lifecycle = makePostgresCloudThreadLifecycleStore(database.pool);
+    const upstreamWorkerGateway = production.cloudThreadLifecycle.workerGateway;
+    const threadLifecycle = makeCloudThreadLifecycle({
+      ...production.cloudThreadLifecycle,
+      workspaces,
+      threadEvents,
+      lifecycle,
+      sandbox: e2b.provider,
+      reservations: {
+        inspect: (workspaceId, reservationId) =>
+          inspectE2bReservation(database.pool, workspaceId, reservationId),
+      },
+      workerGateway: makeMaterializingWorkerGateway(e2b, upstreamWorkerGateway),
+      clock: { now: () => DateTime.toDate(DateTime.nowUnsafe()) },
+    });
     const desktopControl = makeDesktopLeaseService({
       repository: makePostgresDesktopLeaseRepository(database.pool),
       routes: worker.relay.routes,
@@ -766,6 +793,7 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       coordination,
       githubWorkflow,
       providerCredentialRuntime: { service: providerCredentials, logins: credentialLogins },
+      threadLifecycle,
       inspector: {
         lifecycle,
         artifacts: artifactStorage,

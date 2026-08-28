@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import {
+  AuthenticationError,
   CommandExitError,
   type CommandHandle,
   FileType,
@@ -13,6 +14,8 @@ import {
   type SandboxMetrics,
   type SandboxMetricsOpts,
   SandboxNotFoundError,
+  Template,
+  type TemplateBuildStatusResponse,
   type SandboxOpts,
   type SandboxPauseOpts,
   TimeoutError,
@@ -36,7 +39,12 @@ import {
 } from "./types.ts";
 
 export interface E2bSdkRuntime {
-  readonly create: (template: string, options?: SandboxOpts) => Promise<Sandbox>;
+  /** True only when create binds both provider-native identities to the launched machine. */
+  readonly immutableBuildLaunch: boolean;
+  readonly create: (
+    build: { readonly templateId: string; readonly buildId: string },
+    options?: SandboxOpts,
+  ) => Promise<Sandbox>;
   readonly connect: (sandboxId: string, options?: SandboxConnectOpts) => Promise<Sandbox>;
   readonly getInfo: (sandboxId: string, options?: SandboxApiOpts) => Promise<SandboxInfo>;
   readonly pause: (sandboxId: string, options?: SandboxPauseOpts) => Promise<boolean>;
@@ -45,15 +53,31 @@ export interface E2bSdkRuntime {
     sandboxId: string,
     options?: SandboxMetricsOpts,
   ) => Promise<Array<SandboxMetrics>>;
+  readonly getBuildStatus: (
+    input: { readonly templateId: string; readonly buildId: string },
+    options?: SandboxApiOpts,
+  ) => Promise<TemplateBuildStatusResponse>;
 }
 
 const DEFAULT_SDK: E2bSdkRuntime = {
-  create: (template, options) => Sandbox.create(template, options),
+  // E2B 2.46 accepts only a template/tag in Sandbox.create(). Build status is queryable, but the
+  // build ID cannot be bound to that launch. Fail before any remote create instead of silently
+  // launching whichever build is currently attached to a mutable template identity.
+  immutableBuildLaunch: false,
+  create: async () => {
+    throw new E2bClientFailure({
+      code: "invalidRequest",
+      message: "The installed E2B SDK cannot launch a provider-native immutable build ID",
+      retryable: false,
+      createDisposition: { status: "no-compute-confirmed" },
+    });
+  },
   connect: (sandboxId, options) => Sandbox.connect(sandboxId, options),
   getInfo: (sandboxId, options) => Sandbox.getInfo(sandboxId, options),
   pause: (sandboxId, options) => Sandbox.pause(sandboxId, options),
   kill: (sandboxId, options) => Sandbox.kill(sandboxId, options),
   getMetrics: (sandboxId, options) => Sandbox.getMetrics(sandboxId, options),
+  getBuildStatus: (input, options) => Template.getBuildStatus(input, options),
 };
 
 export interface E2bSdkClientOptions {
@@ -74,6 +98,13 @@ const commandLine = (command: string, arguments_: ReadonlyArray<string>) =>
   [command, ...arguments_].map(shellQuote).join(" ");
 
 const toClientFailure = (operation: string, error: unknown) => {
+  if (error instanceof AuthenticationError) {
+    return new E2bClientFailure({
+      code: "authentication",
+      message: `E2B authentication failed during ${operation}`,
+      retryable: false,
+    });
+  }
   if (error instanceof SandboxNotFoundError) {
     return new E2bClientFailure({
       code: "notFound",
@@ -579,7 +610,7 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
     } catch {
       let cleanupFailed = false;
       try {
-        cleanupFailed = !(await sdk.kill(sandbox.sandboxId, connection()));
+        await sdk.kill(sandbox.sandboxId, connection());
       } catch {
         cleanupFailed = true;
       }
@@ -606,10 +637,10 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
     } catch {
       let cleanupFailed = false;
       try {
-        cleanupFailed = !(await sdk.pause(sandbox.sandboxId, {
+        await sdk.pause(sandbox.sandboxId, {
           ...connection(),
           keepMemory: true,
-        }));
+        });
       } catch {
         cleanupFailed = true;
       }
@@ -700,22 +731,53 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
       safe("create", async () => {
         let sandbox: Sandbox;
         try {
-          sandbox = await sdk.create(input.templateId, {
-            ...connection(),
-            timeoutMs: input.timeoutMs,
-            metadata: { ...input.metadata },
-            secure: true,
-            network: { allowPublicTraffic: false },
-            lifecycle: {
-              onTimeout: { action: "pause", keepMemory: true },
-              autoResume: false,
+          if (!sdk.immutableBuildLaunch) {
+            throw new E2bClientFailure({
+              code: "invalidRequest",
+              message: "The installed E2B SDK cannot launch a provider-native immutable build ID",
+              retryable: false,
+              createDisposition: { status: "no-compute-confirmed" },
+            });
+          }
+          const build = await sdk.getBuildStatus(
+            { templateId: input.templateId, buildId: input.buildId },
+            connection(),
+          );
+          if (
+            build.templateID !== input.templateId ||
+            build.buildID.toLowerCase() !== input.buildId.toLowerCase() ||
+            build.status !== "ready"
+          ) {
+            throw new E2bClientFailure({
+              code: "invalidRequest",
+              message: "E2B immutable template build verification failed",
+              retryable: false,
+            });
+          }
+          sandbox = await sdk.create(
+            { templateId: input.templateId, buildId: input.buildId },
+            {
+              ...connection(),
+              timeoutMs: input.timeoutMs,
+              metadata: { ...input.metadata },
+              secure: true,
+              allowInternetAccess: false,
+              // Untrusted repository/package code starts without Internet egress. A later plugin
+              // grant must use a separately reviewed broker/allowlist path; credentials alone do
+              // not authorize arbitrary outbound traffic.
+              network: { allowOut: [], allowPublicTraffic: false },
+              lifecycle: {
+                onTimeout: { action: "pause", keepMemory: true },
+                autoResume: false,
+              },
             },
-          });
+          );
         } catch (cause) {
           const failure =
             cause instanceof E2bClientFailure ? cause : toClientFailure("create", cause);
           if (failure.createDisposition !== undefined) throw failure;
           const noComputeConfirmed =
+            failure.code === "authentication" ||
             failure.code === "invalidRequest" ||
             failure.code === "rateLimited" ||
             failure.code === "notFound";
@@ -1000,14 +1062,8 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
       }),
     pause: (sandboxId) =>
       safe("pause", async () => {
-        const paused = await sdk.pause(sandboxId, { ...connection(), keepMemory: true });
-        if (!paused) {
-          throw new E2bClientFailure({
-            code: "unavailable",
-            message: "E2B did not confirm the sandbox pause",
-            retryable: true,
-          });
-        }
+        // E2B returns false when the sandbox is already paused. Both outcomes converge on paused.
+        await sdk.pause(sandboxId, { ...connection(), keepMemory: true });
       }),
     snapshot: (sandboxId, label, activeTimeoutMs) =>
       safe("snapshot", async () => {
@@ -1041,8 +1097,8 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
           endpoint: `https://${sandbox.getHost(internalPort)}`,
         }));
       }),
-    usage: (sandboxId, since, until) =>
-      safe("usage", async () =>
+    observability: (sandboxId, since, until) =>
+      safe("observability", async () =>
         (
           await sdk.getMetrics(sandboxId, {
             ...connection(),
@@ -1075,7 +1131,8 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
     destroy: (sandboxId) =>
       safe("destroy", async () => {
         try {
-          const destroyed = await sdk.kill(sandboxId, connection());
+          // E2B returns false when the sandbox is already absent. Both outcomes converge on absent.
+          await sdk.kill(sandboxId, connection());
           const records = await options.ptySessions.listReclaimable(sandboxId);
           for (const record of records) {
             const claimed = await options.ptySessions.claim(
@@ -1091,7 +1148,7 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
               "destroy",
             );
           }
-          return destroyed;
+          return true;
         } finally {
           await options.trafficCredentials.revoke(sandboxId);
         }

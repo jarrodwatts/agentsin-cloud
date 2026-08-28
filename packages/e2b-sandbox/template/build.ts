@@ -32,14 +32,16 @@ assertE2bWorkerArtifactHashes({
   ),
 });
 
-const stagingTag = `staging-${NodeCrypto.randomUUID()}`;
+const uniqueTemplateName = `${E2B_BASE_TEMPLATE_NAME}-${NodeCrypto.randomUUID()}`;
+const stagingTag = "verified";
 const build = await Template.build(
   agentsInCloudBaseTemplate,
-  `${E2B_BASE_TEMPLATE_NAME}:${stagingTag}`,
+  `${uniqueTemplateName}:${stagingTag}`,
   { cpuCount: 8, memoryMB: 8_192 },
 );
 const templateReference = await verifyAndAssignImmutableE2bBuildTag({
-  templateName: E2B_BASE_TEMPLATE_NAME,
+  templateName: uniqueTemplateName,
+  templateId: build.templateId,
   stagingTag,
   buildId: build.buildId,
   verificationCommand: E2B_BASE_TEMPLATE_MANIFEST.verificationCommand,
@@ -47,7 +49,8 @@ const templateReference = await verifyAndAssignImmutableE2bBuildTag({
     const sandbox = await Sandbox.create(template, {
       timeoutMs: E2B_ACTIVE_TIMEOUT_MS,
       secure: true,
-      network: { allowPublicTraffic: false },
+      allowInternetAccess: false,
+      network: { allowOut: [], allowPublicTraffic: false },
     });
     return {
       sandboxId: sandbox.sandboxId,

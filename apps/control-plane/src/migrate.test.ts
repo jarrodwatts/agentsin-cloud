@@ -4,7 +4,7 @@ import * as NodeFSP from "node:fs/promises";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
-it.effect("runs application migrations in strict 0001 through 0014 order", () =>
+it.effect("runs application migrations in strict 0001 through 0015 order", () =>
   Effect.gen(function* () {
     const source = yield* Effect.promise(() =>
       NodeFSP.readFile(new URL("./migrate.ts", import.meta.url), "utf8"),
@@ -24,6 +24,7 @@ it.effect("runs application migrations in strict 0001 through 0014 order", () =>
       "0012-",
       "0013-",
       "0014-",
+      "0015-",
     ].map((marker) => source.indexOf(marker));
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));

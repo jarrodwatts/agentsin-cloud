@@ -24,6 +24,10 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import type { DatabaseService } from "./database.ts";
+import {
+  CloudThreadLifecycleDependencyError,
+  type WorkerConnectionGateway,
+} from "./cloudThreadLifecycle.ts";
 import type { E2bSandboxConfigShape } from "./e2bSandboxConfig.ts";
 import { makePostgresSandboxIdentityStore } from "./sandboxIdentityStore.ts";
 
@@ -90,6 +94,34 @@ export interface E2bProviderServiceShape {
   readonly shutdown: Effect.Effect<void, E2bProviderServiceError>;
 }
 
+/** Worker startup cannot run until the exact active sandbox passes template and bootstrap checks. */
+export const makeMaterializingWorkerGateway = (
+  e2b: Pick<E2bProviderServiceShape, "materializeSealedBootstrap">,
+  upstream: WorkerConnectionGateway,
+): WorkerConnectionGateway => ({
+  ...upstream,
+  start: (input) =>
+    e2b
+      .materializeSealedBootstrap({
+        workspaceId: input.workspaceId,
+        environmentId: input.environmentId,
+        threadId: input.threadId,
+        sandboxId: input.sandboxId,
+        sealedBootstrapRef: input.sealedBootstrapRef,
+      })
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new CloudThreadLifecycleDependencyError({
+              code: `e2b-bootstrap-${cause.code}`,
+              retryable: cause.retryable,
+              outcome: cause.retryable ? "uncertain" : "confirmed",
+            }),
+        ),
+        Effect.andThen(upstream.start(input)),
+      ),
+});
+
 const failure = (code: E2bProviderServiceError["code"], operation: string, retryable: boolean) =>
   new E2bProviderServiceError({ code, operation, retryable });
 const isProviderServiceError = Schema.is(E2bProviderServiceError);
@@ -127,13 +159,14 @@ export const makeE2bProviderService = (input: {
       if (!validReference(request.sealedBootstrapRef)) {
         return yield* failure("invalidReference", "validate-bootstrap-reference", false);
       }
-      const identity = yield* Effect.tryPromise({
+      const lookup = yield* Effect.tryPromise({
         try: () => input.identities.get(request.workspaceId, request.sandboxId),
         catch: () => failure("unavailable", "load-sandbox-identity", true),
       });
-      if (identity === undefined || identity.destroyedAt !== undefined) {
+      if (lookup === undefined || lookup.state !== "active") {
         return yield* failure("notFound", "load-sandbox-identity", false);
       }
+      const identity = lookup.identity;
       if (
         identity.workspaceId !== request.workspaceId ||
         identity.environmentId !== request.environmentId ||

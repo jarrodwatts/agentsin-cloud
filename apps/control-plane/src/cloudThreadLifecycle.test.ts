@@ -414,6 +414,8 @@ const makeHarness = () => {
               projectId,
               threadId,
               revisionId,
+              providerTemplateId: "template-lifecycle-1",
+              providerBuildId: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
               repositoryIdentity: revision.blueprint.repositoryIdentity!,
               workspaceDirectory: revision.blueprint.workspaceDirectory,
               providerHandle: sandbox.providerHandle,

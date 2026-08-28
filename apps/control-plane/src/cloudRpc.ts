@@ -5,6 +5,7 @@ import * as NodeCrypto from "node:crypto";
 import type { ThreadId } from "@t3tools/contracts";
 import {
   CLOUD_DESKTOP_RPC_VERSION,
+  CreateCloudThreadRequest,
   CloudThreadCommandSubmissionRequest,
   CloudThreadStreamClientFrame,
   type CloudThreadStreamErrorCode,
@@ -307,6 +308,12 @@ export interface MakeCloudRpcOptions {
   readonly eventStore: ThreadEventStoreService;
   readonly signals?: ThreadEventSignalHub;
   readonly coordination?: EphemeralCoordinationService;
+  readonly lifecycle?: {
+    readonly createThread: (
+      userId: string,
+      input: CreateCloudThreadRequest,
+    ) => Effect.Effect<unknown, { readonly code: string; readonly retryable: boolean }>;
+  };
   readonly limits?: Partial<CloudRpcLimits>;
 }
 
@@ -360,6 +367,110 @@ export const makeCloudRpc = (options: MakeCloudRpcOptions) => {
 
   const handleHttp = (request: Request): Effect.Effect<Response | undefined, never> => {
     const url = new URL(request.url);
+    if (url.pathname === "/api/v1/threads" && request.method === "OPTIONS") {
+      const requestOrigin = request.headers.get("origin") ?? undefined;
+      if (
+        requestOrigin === undefined ||
+        !isTrustedCloudRpcOrigin(request.headers, options.hostedOrigin)
+      ) {
+        return Effect.succeed(jsonResponse({ error: "forbidden" }, 403));
+      }
+      return Effect.succeed(
+        new Response(null, {
+          status: 204,
+          headers: {
+            "access-control-allow-origin": requestOrigin,
+            "access-control-allow-headers": "authorization, content-type",
+            "access-control-allow-methods": "POST, OPTIONS",
+            "access-control-max-age": "600",
+            vary: "Origin",
+          },
+        }),
+      );
+    }
+    if (url.pathname === "/api/v1/threads" && request.method === "POST") {
+      const requestOrigin = request.headers.get("origin") ?? undefined;
+      return Effect.gen(function* () {
+        const principal = yield* authorize(request.headers, request.signal);
+        if (options.lifecycle === undefined) {
+          return yield* new CloudRpcError({
+            code: "internalError",
+            status: 503,
+            retryable: true,
+          });
+        }
+        if (options.coordination !== undefined) {
+          const decision = yield* options.coordination
+            .consumeRateLimit({
+              workspaceId: principal.workspaceId,
+              subjectKind: "user",
+              subjectId: principal.userId,
+              policy: CONTROL_MUTATION_RATE_POLICY,
+            })
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new CloudRpcError({
+                    code: "internalError",
+                    status: 503,
+                    retryable: true,
+                  }),
+              ),
+            );
+          if (!decision.allowed) {
+            return jsonResponse(
+              { error: "rateLimited", retryable: true, retryAfterMs: decision.retryAfterMs },
+              429,
+              requestOrigin,
+              { "retry-after": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1_000))) },
+            );
+          }
+        }
+        const input = yield* readBoundedJson(request, limits.maxCommandBodyBytes).pipe(
+          Effect.flatMap(decoder(CreateCloudThreadRequest)),
+          Effect.mapError((error) =>
+            isCloudRpcError(error)
+              ? error
+              : new CloudRpcError({ code: "invalidRequest", status: 400, retryable: false }),
+          ),
+        );
+        const view = yield* options.lifecycle.createThread(principal.userId, input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new CloudRpcError({
+                code:
+                  cause.code === "unauthorized"
+                    ? "forbidden"
+                    : cause.code === "notFound"
+                      ? "notFound"
+                      : cause.code === "conflict" || cause.code === "invalidEnvironment"
+                        ? "invalidRequest"
+                        : "internalError",
+                status:
+                  cause.code === "unauthorized"
+                    ? 403
+                    : cause.code === "notFound"
+                      ? 404
+                      : cause.code === "conflict" || cause.code === "invalidEnvironment"
+                        ? 409
+                        : 503,
+                retryable: cause.retryable,
+              }),
+          ),
+        );
+        return jsonResponse(view, 201, requestOrigin);
+      }).pipe(
+        Effect.catch((error) => Effect.succeed(publicError(error, requestOrigin))),
+        Effect.catchCause(() =>
+          Effect.succeed(
+            publicError(
+              new CloudRpcError({ code: "internalError", status: 500, retryable: true }),
+              requestOrigin,
+            ),
+          ),
+        ),
+      );
+    }
     const match = /^\/api\/v1\/threads\/([^/]+)\/commands$/u.exec(url.pathname);
     if (match === null) return Effect.sync(() => undefined);
     const requestOrigin = request.headers.get("origin") ?? undefined;

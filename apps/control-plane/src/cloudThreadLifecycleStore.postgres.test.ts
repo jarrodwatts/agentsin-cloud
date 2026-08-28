@@ -82,6 +82,7 @@ const postgresFixture = (url: string) =>
           "0002-cloud-thread-store.sql",
           "0003-thread-integrity-locks.sql",
           "0004-cloud-thread-lifecycle.sql",
+          "0015-e2b-template-identity.sql",
         ].map((filename) =>
           NodeFSP.readFile(new URL(`./migrations/${filename}`, import.meta.url), "utf8"),
         ),
@@ -129,6 +130,8 @@ const reservation = (
   projectId,
   threadId,
   revisionId,
+  providerTemplateId: "template-postgres-1",
+  providerBuildId: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
   repositoryIdentity,
   workspaceDirectory: "/workspace/agentsin-cloud",
   requestedAt: instant,
@@ -212,7 +215,10 @@ it.effect("tenant-scopes reservation identity and preserves the cleanup fence in
         await inspectE2bReservation(fixture.pool, workspaceB, sharedReservationId),
       ).toMatchObject({ state: "failed" });
       expect(await store.get(workspaceB, sandboxA)).toBeUndefined();
-      expect(await store.get(workspaceA, sandboxA)).toMatchObject({ workspaceId: workspaceA });
+      expect(await store.get(workspaceA, sandboxA)).toMatchObject({
+        state: "active",
+        identity: { workspaceId: workspaceA },
+      });
       expect(await rejection(store.markDestroyed(workspaceB, sandboxA, later))).toBeInstanceOf(
         Error,
       );
@@ -226,8 +232,13 @@ it.effect("tenant-scopes reservation identity and preserves the cleanup fence in
         workspaceId: workspaceA,
         reservationId: cleanupId,
         reason: "remote-create-cleanup-uncertain",
+        providerHandle: "postgres-sandbox-cleanup",
         reclaimMetadata: { agentsin_cloud_reservation_id: cleanupId },
         recordedAt: later,
+      });
+      expect(await store.get(workspaceA, "postgres-sandbox-cleanup" as SandboxId)).toMatchObject({
+        state: "cleanup_required",
+        identity: { sandboxId: "postgres-sandbox-cleanup" },
       });
       const fenced = await rejection(
         store.reserve(

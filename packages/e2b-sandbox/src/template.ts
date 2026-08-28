@@ -125,7 +125,7 @@ export const assertE2bWorkerArtifactHashes = (input: {
 
 const E2B_BUILD_ID = /^(?<buildId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const E2B_TEMPLATE_BUILD_REFERENCE =
-  /^(?<name>[a-z0-9][a-z0-9_/-]*):build-(?<buildId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+  /^(?<templateId>[a-z0-9][a-z0-9_-]{2,127})@build-(?<buildId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
 export const makeE2bImmutableBuildTag = (buildId: string) => {
   const normalized = buildId.trim();
@@ -133,9 +133,9 @@ export const makeE2bImmutableBuildTag = (buildId: string) => {
   return `build-${normalized.toLowerCase()}`;
 };
 
-/** Environment revisions store a unique `template:build-<build id>` tag assigned to that build. */
-export const makeE2bTemplateReference = (templateName: string, buildId: string) => {
-  const value = `${templateName.trim()}:${makeE2bImmutableBuildTag(buildId)}`;
+/** Environment revisions pin E2B's provider-native template ID and build ID, never a mutable tag. */
+export const makeE2bTemplateReference = (templateId: string, buildId: string) => {
+  const value = `${templateId.trim()}@${makeE2bImmutableBuildTag(buildId)}`;
   if (!E2B_TEMPLATE_BUILD_REFERENCE.test(value)) {
     throw new Error("An E2B template name and immutable UUID build ID are required");
   }
@@ -144,6 +144,7 @@ export const makeE2bTemplateReference = (templateName: string, buildId: string) 
 
 export const assignImmutableE2bBuildTag = async (input: {
   readonly templateName: string;
+  readonly templateId: string;
   readonly stagingTag: string;
   readonly buildId: string;
   readonly assignTags: (
@@ -159,12 +160,13 @@ export const assignImmutableE2bBuildTag = async (input: {
   if (assigned.buildId !== input.buildId || !assigned.tags.includes(immutableTag)) {
     throw new Error("E2B did not assign the immutable tag to the requested build");
   }
-  return makeE2bTemplateReference(input.templateName, input.buildId);
+  return makeE2bTemplateReference(input.templateId, input.buildId);
 };
 
 /** A template tag is publishable only after E2B can launch it and pass its verification command. */
 export const verifyAndAssignImmutableE2bBuildTag = async (input: {
   readonly templateName: string;
+  readonly templateId: string;
   readonly stagingTag: string;
   readonly buildId: string;
   readonly verificationCommand: string;
@@ -190,7 +192,8 @@ export const verifyAndAssignImmutableE2bBuildTag = async (input: {
 
   let cleanupFailed = false;
   try {
-    cleanupFailed = !(await input.destroyProbe(probe.sandboxId));
+    // E2B returns false when the sandbox is already absent; both results confirm convergence.
+    await input.destroyProbe(probe.sandboxId);
   } catch {
     cleanupFailed = true;
   }
@@ -203,5 +206,11 @@ export const verifyAndAssignImmutableE2bBuildTag = async (input: {
 export const parseE2bTemplateReference = (reference: string) => {
   if (!reference.startsWith(E2B_TEMPLATE_REF_PREFIX)) return undefined;
   const value = reference.slice(E2B_TEMPLATE_REF_PREFIX.length).trim();
-  return E2B_TEMPLATE_BUILD_REFERENCE.test(value) ? value : undefined;
+  const match = E2B_TEMPLATE_BUILD_REFERENCE.exec(value);
+  return match?.groups?.templateId === undefined || match.groups.buildId === undefined
+    ? undefined
+    : {
+        templateId: match.groups.templateId,
+        buildId: match.groups.buildId.toLowerCase(),
+      };
 };

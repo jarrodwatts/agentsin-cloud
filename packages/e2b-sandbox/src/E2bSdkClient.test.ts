@@ -1,6 +1,13 @@
 import * as NodeCrypto from "node:crypto";
 
-import type { CommandHandle, Sandbox, SandboxConnectOpts, SandboxInfo, SandboxOpts } from "e2b";
+import {
+  AuthenticationError,
+  type CommandHandle,
+  type Sandbox,
+  type SandboxConnectOpts,
+  type SandboxInfo,
+  type SandboxOpts,
+} from "e2b";
 import { SandboxPtyId } from "@t3tools/contracts/cloud";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
@@ -16,6 +23,7 @@ import type {
 
 const NOW = DateTime.toDate(DateTime.makeUnsafe("2026-08-27T12:00:00.000Z"));
 const END = DateTime.toDate(DateTime.makeUnsafe("2026-08-27T12:15:00.000Z"));
+const BUILD_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
 
 const info: SandboxInfo = {
   sandboxId: "sandbox-1",
@@ -40,12 +48,20 @@ const makeSandbox = (overrides?: Partial<Sandbox>) =>
   }) as Sandbox;
 
 const makeSdk = (sandbox: Sandbox, overrides?: Partial<E2bSdkRuntime>): E2bSdkRuntime => ({
+  immutableBuildLaunch: true,
   create: async () => sandbox,
   connect: async () => sandbox,
   getInfo: async () => info,
   pause: async () => true,
   kill: async () => true,
   getMetrics: async () => [],
+  getBuildStatus: async ({ templateId, buildId }) => ({
+    templateID: templateId,
+    buildID: buildId,
+    status: "ready",
+    logEntries: [],
+    logs: [],
+  }),
   ...overrides,
 });
 
@@ -195,7 +211,8 @@ const makePtyInfrastructure = () => {
 };
 
 const makeTestClient = (
-  options: Pick<E2bSdkClientOptions, "apiKey" | "trafficCredentials" | "sdk"> & {
+  options: Pick<E2bSdkClientOptions, "apiKey" | "trafficCredentials"> & {
+    readonly sdk?: E2bSdkRuntime;
     readonly ptyOwnerId?: string;
     readonly ptyInfrastructure?: ReturnType<typeof makePtyInfrastructure>;
   },
@@ -230,40 +247,84 @@ const chunkStream = (chunkCount: number, chunkBytes: number, onCancel?: () => vo
 
 describe("E2B SDK client", () => {
   it("launches the exact build-specific tag assigned after a template build", async () => {
-    const buildId = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    const buildId = BUILD_ID;
     const reference = await assignImmutableE2bBuildTag({
       templateName: "agentsin-cloud-base",
+      templateId: "template-1",
       stagingTag: "staging-sdk-test",
       buildId,
       assignTags: async (_target, tag) => ({ buildId, tags: [tag] }),
     });
     const launchTag = parseE2bTemplateReference(reference);
-    expect(launchTag).toBe(`agentsin-cloud-base:build-${buildId}`);
+    expect(launchTag).toEqual({ templateId: "template-1", buildId });
     if (launchTag === undefined) throw new Error("Expected an immutable E2B launch tag");
-    let createdTemplate = "";
+    let createdBuild: { readonly templateId: string; readonly buildId: string } | undefined;
     let createdOptions: SandboxOpts | undefined;
     const sandbox = makeSandbox();
     const client = makeTestClient({
       apiKey: "test-api-key",
       trafficCredentials: acceptingBroker,
       sdk: makeSdk(sandbox, {
-        create: async (template, options) => {
-          createdTemplate = template;
+        create: async (build, options) => {
+          createdBuild = build;
           createdOptions = options;
           return sandbox;
         },
       }),
     });
 
-    await client.create({ templateId: launchTag, metadata: {}, timeoutMs: 60_000 });
-    expect(createdTemplate).toBe(`agentsin-cloud-base:build-${buildId}`);
+    await client.create({ ...launchTag, metadata: {}, timeoutMs: 60_000 });
+    expect(createdBuild).toEqual({ templateId: "template-1", buildId: BUILD_ID });
     expect(createdOptions).toMatchObject({
       secure: true,
-      network: { allowPublicTraffic: false },
+      allowInternetAccess: false,
+      network: { allowOut: [], allowPublicTraffic: false },
       lifecycle: {
         onTimeout: { action: "pause", keepMemory: true },
         autoResume: false,
       },
+    });
+  });
+
+  it("fails before provider I/O when the SDK cannot bind a build ID to launch", async () => {
+    const client = makeTestClient({
+      apiKey: "test-api-key",
+      trafficCredentials: acceptingBroker,
+      sdk: makeSdk(makeSandbox(), { immutableBuildLaunch: false }),
+    });
+
+    await expect(
+      client.create({
+        templateId: "template-1",
+        buildId: BUILD_ID,
+        metadata: {},
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toMatchObject({
+      code: "invalidRequest",
+      retryable: false,
+      createDisposition: { status: "no-compute-confirmed" },
+    });
+  });
+
+  it("marks the installed SDK immutable-launch capability unavailable", async () => {
+    const client = makeTestClient({
+      apiKey: "test-api-key",
+      trafficCredentials: acceptingBroker,
+    });
+
+    await expect(
+      client.create({
+        templateId: "template-1",
+        buildId: BUILD_ID,
+        metadata: {},
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toMatchObject({
+      code: "invalidRequest",
+      message: "The installed E2B SDK cannot launch a provider-native immutable build ID",
+      retryable: false,
+      createDisposition: { status: "no-compute-confirmed" },
     });
   });
 
@@ -282,7 +343,12 @@ describe("E2B SDK client", () => {
     });
 
     await expect(
-      client.create({ templateId: "base:build-1", metadata: {}, timeoutMs: 60_000 }),
+      client.create({
+        templateId: "template-1",
+        buildId: BUILD_ID,
+        metadata: {},
+        timeoutMs: 60_000,
+      }),
     ).rejects.toMatchObject({
       code: "unavailable",
       message: "E2B credential sealing failed after create; the sandbox was destroyed",
@@ -292,6 +358,73 @@ describe("E2B SDK client", () => {
       },
     });
     expect(killCalls).toBe(1);
+  });
+
+  it("classifies authentication failure as non-retryable before compute exists", async () => {
+    let killCalls = 0;
+    const client = makeTestClient({
+      apiKey: "invalid-api-key",
+      trafficCredentials: acceptingBroker,
+      sdk: makeSdk(makeSandbox(), {
+        create: async () => {
+          throw new AuthenticationError("raw upstream authentication detail");
+        },
+        kill: async () => {
+          killCalls += 1;
+          return true;
+        },
+      }),
+    });
+
+    await expect(
+      client.create({
+        templateId: "template-1",
+        buildId: BUILD_ID,
+        metadata: {},
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toMatchObject({
+      code: "authentication",
+      retryable: false,
+      message: "E2B authentication failed during create",
+      createDisposition: { status: "no-compute-confirmed" },
+    });
+    expect(killCalls).toBe(0);
+  });
+
+  it("rejects a mismatched immutable build before creating compute", async () => {
+    let createCalls = 0;
+    const client = makeTestClient({
+      apiKey: "test-api-key",
+      trafficCredentials: acceptingBroker,
+      sdk: makeSdk(makeSandbox(), {
+        getBuildStatus: async ({ templateId }) => ({
+          templateID: templateId,
+          buildID: "11111111-1111-4111-8111-111111111111",
+          status: "ready",
+          logEntries: [],
+          logs: [],
+        }),
+        create: async () => {
+          createCalls += 1;
+          return makeSandbox();
+        },
+      }),
+    });
+
+    await expect(
+      client.create({
+        templateId: "template-1",
+        buildId: BUILD_ID,
+        metadata: {},
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toMatchObject({
+      code: "invalidRequest",
+      retryable: false,
+      createDisposition: { status: "no-compute-confirmed" },
+    });
+    expect(createCalls).toBe(0);
   });
 
   it("pauses a resumed sandbox when traffic-token sealing fails", async () => {
@@ -321,18 +454,24 @@ describe("E2B SDK client", () => {
     expect(connectOptions?.timeoutMs).toBe(900_000);
   });
 
-  it("rejects a pause that the E2B API does not confirm", async () => {
+  it("treats an already-paused false response as convergent success", async () => {
     const client = makeTestClient({
       apiKey: "test-api-key",
       trafficCredentials: acceptingBroker,
       sdk: makeSdk(makeSandbox(), { pause: async () => false }),
     });
 
-    await expect(client.pause("sandbox-1")).rejects.toMatchObject({
-      code: "unavailable",
-      message: "E2B did not confirm the sandbox pause",
-      retryable: true,
+    await expect(client.pause("sandbox-1")).resolves.toBeUndefined();
+  });
+
+  it("treats an already-absent false kill response as convergent success", async () => {
+    const client = makeTestClient({
+      apiKey: "test-api-key",
+      trafficCredentials: acceptingBroker,
+      sdk: makeSdk(makeSandbox(), { kill: async () => false }),
     });
+
+    await expect(client.destroy("sandbox-1")).resolves.toBe(true);
   });
 
   it("sanitizes broker and cleanup failures without exposing token material", async () => {
@@ -349,7 +488,8 @@ describe("E2B SDK client", () => {
 
     const failure = await client
       .create({
-        templateId: "base:build-1",
+        templateId: "template-1",
+        buildId: BUILD_ID,
         metadata: { agentsin_cloud_reservation_id: "command-create" },
         timeoutMs: 60_000,
       })
@@ -378,8 +518,8 @@ describe("E2B SDK client", () => {
       .catch((cause: unknown) => cause);
     expect(resumeFailure).toMatchObject({
       code: "unavailable",
-      retryable: true,
-      message: "E2B credential sealing failed after resume and pause could not be confirmed",
+      retryable: false,
+      message: "E2B credential sealing failed after resume; the sandbox was paused",
     });
     expect(String(resumeFailure)).not.toContain("raw-traffic-token");
   });

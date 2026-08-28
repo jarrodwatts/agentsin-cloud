@@ -353,6 +353,7 @@ export const makeCloudThreadRuntime = (dependencies: CloudThreadRuntimeDependenc
       const started = yield* Effect.result(
         dependencies.workerGateway.start({
           workspaceId: runtime.workspaceId,
+          environmentId: runtime.environmentId,
           threadId: runtime.threadId,
           sandboxId: runtime.sandboxId,
           workerId: runtime.workerId,

@@ -157,6 +157,7 @@ export interface WorkerConnectionGateway {
   /** Idempotent for one workerId; the sandbox receives only the sealed reference. */
   readonly start: (input: {
     readonly workspaceId: WorkspaceId;
+    readonly environmentId: EnvironmentId;
     readonly threadId: ThreadId;
     readonly sandboxId: SandboxProviderSandbox["sandboxId"];
     readonly workerId: WorkerInstanceId;
@@ -602,6 +603,7 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
         const started = yield* Effect.result(
           dependencies.workerGateway.start({
             workspaceId: attempt.workspaceId,
+            environmentId: attempt.environmentId,
             threadId: attempt.threadId,
             sandboxId: attempt.sandboxId!,
             workerId: attempt.workerId!,

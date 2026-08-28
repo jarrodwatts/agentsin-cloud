@@ -243,6 +243,7 @@ describe("verified E2B template publishing", () => {
     const operations: Array<string> = [];
     const reference = await verifyAndAssignImmutableE2bBuildTag({
       templateName: "agentsin-cloud-base",
+      templateId: "template-1",
       stagingTag: "staging-verified",
       buildId: BUILD_ID,
       verificationCommand: "test -d /workspace",
@@ -266,7 +267,7 @@ describe("verified E2B template publishing", () => {
       },
     });
 
-    expect(reference).toBe(`e2b://template/agentsin-cloud-base:build-${BUILD_ID}`);
+    expect(reference).toBe(`e2b://template/template-1@build-${BUILD_ID}`);
     expect(operations).toEqual([
       "launch:agentsin-cloud-base:staging-verified",
       "verify:test -d /workspace",
@@ -281,6 +282,7 @@ describe("verified E2B template publishing", () => {
     await expect(
       verifyAndAssignImmutableE2bBuildTag({
         templateName: "agentsin-cloud-base",
+        templateId: "template-1",
         stagingTag: "staging-failed",
         buildId: BUILD_ID,
         verificationCommand: "verify-template",
@@ -303,26 +305,26 @@ describe("verified E2B template publishing", () => {
     expect(assignCalls).toBe(0);
   });
 
-  it("refuses to publish when probe cleanup cannot be confirmed", async () => {
+  it("accepts an already-absent probe as converged cleanup", async () => {
     let assignCalls = 0;
-    await expect(
-      verifyAndAssignImmutableE2bBuildTag({
-        templateName: "agentsin-cloud-base",
-        stagingTag: "staging-cleanup-failed",
-        buildId: BUILD_ID,
-        verificationCommand: "verify-template",
-        launchProbe: async () => ({
-          sandboxId: "probe-3",
-          execute: async () => ({ exitCode: 0 }),
-        }),
-        destroyProbe: async () => false,
-        assignTags: async (_target, tag) => {
-          assignCalls += 1;
-          return { buildId: BUILD_ID, tags: [tag] };
-        },
+    const reference = await verifyAndAssignImmutableE2bBuildTag({
+      templateName: "agentsin-cloud-base",
+      templateId: "template-1",
+      stagingTag: "staging-cleanup-failed",
+      buildId: BUILD_ID,
+      verificationCommand: "verify-template",
+      launchProbe: async () => ({
+        sandboxId: "probe-3",
+        execute: async () => ({ exitCode: 0 }),
       }),
-    ).rejects.toThrow("E2B template probe cleanup could not be confirmed");
+      destroyProbe: async () => false,
+      assignTags: async (_target, tag) => {
+        assignCalls += 1;
+        return { buildId: BUILD_ID, tags: [tag] };
+      },
+    });
 
-    expect(assignCalls).toBe(0);
+    expect(reference).toBe(`e2b://template/template-1@build-${BUILD_ID}`);
+    expect(assignCalls).toBe(1);
   });
 });

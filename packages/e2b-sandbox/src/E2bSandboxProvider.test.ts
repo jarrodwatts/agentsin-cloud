@@ -93,7 +93,7 @@ const createRequest = Schema.decodeUnknownSync(SandboxProviderCreateRequest)({
         },
       },
       checkoutRef: "main",
-      image: `e2b://template/agentsin-cloud-base:build-${BUILD_ID}`,
+      image: `e2b://template/template-1@build-${BUILD_ID}`,
       workspaceDirectory: "/workspace",
       resources: { cpuCores: 4, memoryMiB: 8_192, storageMiB: 32_768 },
       setupCommands: [],
@@ -139,10 +139,11 @@ const makeHarness = (options?: {
   readonly identityActivationFailure?: boolean;
   readonly reservationFailureUpdateFailure?: boolean;
   readonly cleanupOrphanRecordFailure?: boolean;
+  readonly identityDestroyFailureOnce?: boolean;
   readonly createFailure?: boolean;
+  readonly createClientFailure?: E2bClientFailure;
   readonly clientOverride?: E2bClient;
   readonly destroyFailure?: boolean;
-  readonly destroyUnconfirmed?: boolean;
   readonly ptyOutput?: string;
   readonly activeTimeoutMs?: number;
 }) => {
@@ -170,6 +171,7 @@ const makeHarness = (options?: {
   const connectTimeouts: Array<number> = [];
   let executeCalls = 0;
   let createCalls = 0;
+  let identityDestroyCalls = 0;
   let ptyOutputWriter: Parameters<E2bClient["pty"]>[3];
   const ptyInputs: Array<string> = [];
   let pauseHold: { readonly wait: Promise<void>; readonly signal: () => void } | undefined;
@@ -190,6 +192,7 @@ const makeHarness = (options?: {
   const defaultClient: E2bClient = {
     create: async (input) => {
       createCalls += 1;
+      if (options?.createClientFailure !== undefined) throw options.createClientFailure;
       if (options?.createFailure === true) {
         throw new E2bClientFailure({
           code: "unavailable",
@@ -278,7 +281,7 @@ const makeHarness = (options?: {
             credentialRef: "e2b-traffic/sandbox-1",
           },
     ports: async () => [{ internalPort: 3_000, endpoint: "https://3000-sandbox-1.e2b.app" }],
-    usage: async () => [
+    observability: async () => [
       {
         timestamp: date("2026-08-27T12:01:00.000Z"),
         cpuUsedPct: 25,
@@ -301,7 +304,6 @@ const makeHarness = (options?: {
           retryable: true,
         });
       }
-      if (options?.destroyUnconfirmed === true) return false;
       destroyed = true;
       return true;
     },
@@ -381,8 +383,25 @@ const makeHarness = (options?: {
           reclaimMetadata: reconciliation.reclaimMetadata,
         });
       },
-      get: async (_workspaceId, sandboxId) => records.get(sandboxId),
+      get: async (_workspaceId, sandboxId) => {
+        const identity = records.get(sandboxId);
+        if (identity === undefined) return undefined;
+        const reservationState = reservations.get(identity.reservationId)?.state;
+        return {
+          state:
+            reservationState === "cleanup-required"
+              ? "cleanup_required"
+              : identity.destroyedAt === undefined
+                ? "active"
+                : "destroyed",
+          identity,
+        };
+      },
       markDestroyed: async (_workspaceId, sandboxId, destroyedAt) => {
+        identityDestroyCalls += 1;
+        if (options?.identityDestroyFailureOnce === true && identityDestroyCalls === 1) {
+          throw new Error("identity tombstone failed");
+        }
         const record = records.get(sandboxId);
         if (record !== undefined) records.set(sandboxId, { ...record, destroyedAt });
       },
@@ -535,6 +554,7 @@ describe("E2B SandboxProvider", () => {
       const reference = yield* Effect.promise(() =>
         assignImmutableE2bBuildTag({
           templateName: "agentsin-cloud-base",
+          templateId: "template-1",
           stagingTag: "staging-request-1",
           buildId: BUILD_ID,
           assignTags: async (target, tag) => {
@@ -558,8 +578,8 @@ describe("E2B SandboxProvider", () => {
           tag: `build-${BUILD_ID}`,
         },
       ]);
-      expect(reference).toBe(`e2b://template/agentsin-cloud-base:build-${BUILD_ID}`);
-      expect(harness.createInput()?.templateId).toBe(`agentsin-cloud-base:build-${BUILD_ID}`);
+      expect(reference).toBe(`e2b://template/template-1@build-${BUILD_ID}`);
+      expect(harness.createInput()).toMatchObject({ templateId: "template-1", buildId: BUILD_ID });
       expect(harness.createInput()?.timeoutMs).toBe(900_000);
       expect(harness.createInput()?.metadata.agentsin_cloud_thread_id).toBe("thread-1");
       expect(result.sandbox.infrastructureProvider).toBe("e2b");
@@ -570,6 +590,7 @@ describe("E2B SandboxProvider", () => {
         expect(
           assignImmutableE2bBuildTag({
             templateName: "agentsin-cloud-base",
+            templateId: "template-1",
             stagingTag: "staging-request-2",
             buildId: BUILD_ID,
             assignTags: async (_target, tag) => ({ buildId: "different-build", tags: [tag] }),
@@ -641,6 +662,25 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
+  it.effect("marks authentication failures failed without quarantining nonexistent compute", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness({
+        createClientFailure: new E2bClientFailure({
+          code: "authentication",
+          message: "E2B authentication failed during create",
+          retryable: false,
+          createDisposition: { status: "no-compute-confirmed" },
+        }),
+      });
+      const failure = yield* Effect.flip(harness.provider.create(createRequest));
+
+      expect(failure).toMatchObject({ code: "E2B_AUTHENTICATION_FAILED", retryable: false });
+      expect(harness.reservations.get(createRequest.requestId)?.state).toBe("failed");
+      expect(harness.cleanupOrphans.size).toBe(0);
+      expect(harness.destroyCalls()).toBe(0);
+    }),
+  );
+
   it.effect("preserves a reclaimable fence when create cleanup is uncertain", () =>
     Effect.gen(function* () {
       let sdkCreateCalls = 0;
@@ -664,6 +704,7 @@ describe("E2B SandboxProvider", () => {
         getInfo: async () => ({ ...sandboxInfo, metadata: createdMetadata }),
       } as Sandbox;
       const sdk: E2bSdkRuntime = {
+        immutableBuildLaunch: true,
         create: async (_template, options) => {
           sdkCreateCalls += 1;
           createdMetadata = options?.metadata ?? {};
@@ -676,6 +717,13 @@ describe("E2B SandboxProvider", () => {
           throw new Error("simulated cleanup failure");
         },
         getMetrics: async () => [],
+        getBuildStatus: async ({ templateId, buildId }) => ({
+          templateID: templateId,
+          buildID: buildId,
+          status: "ready",
+          logEntries: [],
+          logs: [],
+        }),
       };
       const client = makeE2bSdkClient({
         apiKey: "test-api-key",
@@ -876,9 +924,9 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
-  it.effect("keeps the durable identity active when E2B does not confirm destroy", () =>
+  it.effect("retries the durable tombstone after remote destroy already converged", () =>
     Effect.gen(function* () {
-      const harness = makeHarness({ destroyUnconfirmed: true });
+      const harness = makeHarness({ identityDestroyFailureOnce: true });
       const created = yield* harness.provider.create(createRequest);
       const failure = yield* Effect.flip(
         harness.provider.destroy(
@@ -888,8 +936,16 @@ describe("E2B SandboxProvider", () => {
         ),
       );
 
-      expect(failure.code).toBe("E2B_DESTROY_NOT_CONFIRMED");
+      expect(failure.code).toBe("E2B_INTERNAL_ERROR");
       expect(harness.records.get(created.sandbox.sandboxId)?.destroyedAt).toBeUndefined();
+
+      yield* harness.provider.destroy(
+        harness.request(SandboxProviderDestroyRequest, "destroy", {
+          sandboxId: created.sandbox.sandboxId,
+        }),
+      );
+      expect(harness.destroyCalls()).toBe(2);
+      expect(harness.records.get(created.sandbox.sandboxId)?.destroyedAt).toBe(NOW);
     }),
   );
 
@@ -944,6 +1000,29 @@ describe("E2B SandboxProvider", () => {
         ),
       );
       expect(drift.code).toBe("E2B_IDENTITY_MISMATCH");
+    }),
+  );
+
+  it.effect("rejects every ordinary operation for a cleanup-required identity", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const created = yield* harness.provider.create(createRequest);
+      const reservation = harness.reservations.get(createRequest.requestId)!;
+      harness.reservations.set(createRequest.requestId, {
+        ...reservation,
+        state: "cleanup-required",
+        reclaimMetadata: created.sandbox.binding,
+      });
+
+      const failure = yield* Effect.flip(
+        harness.provider.connect(
+          harness.request(SandboxProviderConnectRequest, "connect", {
+            sandboxId: created.sandbox.sandboxId,
+          }),
+        ),
+      );
+      expect(failure).toMatchObject({ code: "E2B_RECONCILIATION_REQUIRED", retryable: false });
+      expect(harness.connectCalls()).toBe(0);
     }),
   );
 

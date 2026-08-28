@@ -24,6 +24,7 @@ import {
   CloudThreadEvent,
   CloudThreadStreamClientFrame,
   CloudThreadStreamServerFrame,
+  CreateCloudThreadRequest,
   DesktopAuthExchangeRequest,
   DesktopAuthInitiateRequest,
   DesktopLease,
@@ -403,6 +404,7 @@ const decodeCloudThreadCommandSubmission = Schema.decodeUnknownSync(
 );
 const decodeCloudThreadStreamClientFrame = Schema.decodeUnknownSync(CloudThreadStreamClientFrame);
 const decodeCloudThreadStreamServerFrame = Schema.decodeUnknownSync(CloudThreadStreamServerFrame);
+const decodeCreateCloudThreadRequest = Schema.decodeUnknownSync(CreateCloudThreadRequest);
 const decodePluginManifest = Schema.decodeUnknownSync(PluginManifest);
 const decodeUsageSample = Schema.decodeUnknownSync(UsageSample);
 const decodeSandboxProviderCapabilities = Schema.decodeUnknownSync(SandboxProviderCapabilities);
@@ -460,6 +462,24 @@ const billingRecordsJsonCodec = Schema.toCodecJson(
 const decodeBillingRecordsJson = Schema.decodeUnknownSync(billingRecordsJsonCodec);
 
 describe("cloud provider contracts", () => {
+  it("decodes the strict authenticated thread-create input", () => {
+    const input = {
+      requestId: "create-thread-1",
+      idempotencyKey: "create-thread-once",
+      threadId: "thread-1",
+      environmentId: "environment-1",
+      environmentRevisionId: "revision-1",
+      projectId: "project-1",
+      providerInstanceId: "codex_default",
+    };
+    expect(decodeCreateCloudThreadRequest(input)).toEqual(input);
+    expect(() => decodeCreateCloudThreadRequest({ ...input, workspaceId: WORKSPACE_ID })).toThrow();
+    expect(() => decodeCreateCloudThreadRequest({ ...input, idempotencyKey: "" })).toThrow();
+    expect(() =>
+      decodeCreateCloudThreadRequest({ ...input, idempotencyKey: "x".repeat(257) }),
+    ).toThrow();
+  });
+
   it("covers the complete sandbox provider capability surface", () => {
     const capabilities = decodeSandboxProviderCapabilities([
       "create",
