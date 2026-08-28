@@ -15,9 +15,15 @@ The activity API accepts an authenticated worker generation and a bounded lease 
 control plane assigns the occurrence and expiry times. Starts, heartbeats, and ends have durable
 event identities, so duplicate delivery replays the original stored timing even after a delayed
 retry, while changed stable content or an old worker generation fails closed. When an activity
-lease or desktop lease expires, its expiry time begins
-the 15-minute idle window. The boundary is inclusive: a runtime last active at 12:00 is eligible at
-12:15:00, never before.
+lease or desktop lease expires, its expiry time begins the 15-minute idle window. The boundary is
+inclusive: a runtime last active at 12:00 is eligible at 12:15:00, never before.
+
+A heartbeat arriving at or after its prior expiry is rejected; an expired claim cannot be
+resurrected. If an end event is delivered after expiry, the prior expiry remains the effective idle
+boundary instead of the later delivery time. Worker activity is currently accepted through this
+generation-fenced service port. The B4 gateway integration must derive its activity identity from
+`VerifiedWorkerPrincipal` before exposing the port to worker traffic; caller-supplied worker
+identity is not a production authentication boundary.
 
 ## Pause
 
@@ -27,21 +33,28 @@ blocks the pause or loses to the durable fence and is rejected.
 
 Before calling E2B, the controller:
 
-1. revokes worker bootstrap tokens and certificates, fences the worker route, and records that
-   receipt;
-2. scrubs temporary provider, GitHub, and plugin credentials through a trusted E2B control path
-   that does not depend on the now-fenced worker socket; and
-3. calls the E2B-only `SandboxProvider.pause` operation.
+1. revokes central broker grants and credential material without depending on the worker or
+   sandbox;
+2. independently fences the worker route;
+3. scrubs temporary provider, GitHub, and plugin credentials through a trusted E2B control path;
+4. calls the E2B-only `SandboxProvider.pause` operation, or destroys the sandbox when local scrub
+   or a confirmed pause operation fails.
 
-Each receipt is durable. A lost or retryable response leaves the runtime fenced in
-`pause_dispatched`; recovery repeats only the missing idempotent step with the same transition
-identity. A confirmed non-retryable failure or identity mismatch moves the runtime to
-`reconciliation_required`. It never reports `paused` from an uncertain result.
+Every attempt and outcome is durable. The transition identity binds workspace, thread, lifecycle
+attempt, sandbox, and worker generation, and every external retry reuses it. Failures in one step do
+not prevent central revocation or forced provider containment from being attempted. A lost or
+retryable response stays recoverable; a confirmed failure may be shown as
+`reconciliation_required`, but the recovery scheduler continues quarantine work until durable
+receipts prove route fencing, central credential revocation, and either a sanitized pause or
+sandbox destruction. A destroyed sandbox remains visibly unrecoverable and cannot consume a
+pending resume. The runtime never reports `paused` from an uncertain result.
 
 ## Resume
 
 A user message, opening the inspector, or an approved continuation records an idempotent resume
-request. If a pause is already in flight, the request remains pending and is claimed immediately
+request. The caller supplies only stable identity and reason; the control-plane clock assigns the
+persisted request time, and delayed retries replay that original time. If a pause is already in
+flight, the request remains pending and is claimed immediately
 after the pause receipt; the triggering message is not lost. A running thread simply gets a fresh
 idle window.
 
@@ -63,7 +76,8 @@ Railway runs two bounded jobs against the same PostgreSQL source of truth:
 - the idle sweep claims eligible `running` rows and advances their pause saga;
 - the recovery sweep advances durable pause/resume states left by process or provider failure.
 
-The jobs may use multiple replicas because idle claims use `FOR UPDATE SKIP LOCKED` and provider
-operations use stable request identities. Production composition must supply the E2B provider,
-the B4 worker route/recovery adapters, the credential scrubber, and the sealed bootstrap issuer.
-There is no alternative sandbox implementation or development fallback.
+The jobs may use multiple replicas because idle claims share a durable per-thread fence and
+provider operations use stable request identities. Production composition must supply the E2B
+provider, the B4 worker route/recovery adapters, the central credential revoker, the sandbox-local
+credential scrubber, and the sealed bootstrap issuer. There is no alternative sandbox
+implementation or development fallback.

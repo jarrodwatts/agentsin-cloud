@@ -19,6 +19,9 @@ import {
 import {
   CloudThreadRuntimeStoreError,
   type CloudThreadActivityEvent,
+  type CloudThreadContainmentOutcome,
+  type CloudThreadContainmentStep,
+  type CloudThreadResumeEvent,
   type CloudThreadResumeRequest,
   type CloudThreadRuntimeRecord,
   type CloudThreadRuntimeStore,
@@ -45,6 +48,20 @@ export interface WorkerCredentialLifecycle {
    * control path. This must not depend on the worker route, which has already been fenced.
    */
   readonly scrubForPause: (input: {
+    readonly workspaceId: CloudThreadRuntimeRecord["workspaceId"];
+    readonly threadId: CloudThreadRuntimeRecord["threadId"];
+    readonly sandboxId: CloudThreadRuntimeRecord["sandboxId"];
+    readonly workerId: WorkerInstanceId;
+    readonly transitionId: string;
+  }) => Effect.Effect<void, CloudThreadLifecycleDependencyError>;
+}
+
+export interface CentralCredentialRevoker {
+  /**
+   * Revokes broker grants and credential material outside the sandbox. This operation is
+   * idempotent for transitionId and must not depend on the worker route or sandbox process.
+   */
+  readonly revokeForContainment: (input: {
     readonly workspaceId: CloudThreadRuntimeRecord["workspaceId"];
     readonly threadId: CloudThreadRuntimeRecord["threadId"];
     readonly sandboxId: CloudThreadRuntimeRecord["sandboxId"];
@@ -107,6 +124,7 @@ export interface CloudThreadRuntimeDependencies {
   readonly workerGateway: WorkerConnectionGateway;
   readonly workerRecovery: RuntimeWorkerRecovery;
   readonly workerRoutes: WorkerRouteLifecycle;
+  readonly centralCredentialRevoker: CentralCredentialRevoker;
   readonly workerCredentials: WorkerCredentialLifecycle;
   readonly clock: CloudThreadRuntimeClock;
 }
@@ -367,7 +385,61 @@ export const makeCloudThreadRuntime = (dependencies: CloudThreadRuntimeDependenc
     initial: CloudThreadRuntimeRecord,
   ) {
     let runtime = initial;
-    if (runtime.state !== "pause_dispatched") return runtime;
+    if (
+      runtime.transitionKind !== "pause" ||
+      (runtime.state !== "pause_dispatched" && runtime.state !== "reconciliation_required")
+    ) {
+      return runtime;
+    }
+    const failures: Array<{
+      readonly step: CloudThreadContainmentStep;
+      readonly code: string;
+      readonly retryable: boolean;
+      readonly cause: unknown;
+    }> = [];
+    const recordOutcome = (
+      step: CloudThreadContainmentStep,
+      outcome: CloudThreadContainmentOutcome,
+      errorCode: string | undefined,
+      occurredAt = iso(dependencies.clock.now()),
+    ) =>
+      storeEffect(() =>
+        dependencies.store.recordContainmentOutcome(runtime, step, outcome, errorCode, occurredAt),
+      );
+    const dependencyOutcome = (failure: CloudThreadLifecycleDependencyError) =>
+      failure.outcome === "uncertain"
+        ? ("uncertain_failure" as const)
+        : failure.retryable
+          ? ("retryable_failure" as const)
+          : ("confirmed_failure" as const);
+
+    if (runtime.credentialsRevokedAt === undefined) {
+      const revoked = yield* Effect.result(
+        dependencies.centralCredentialRevoker.revokeForContainment({
+          workspaceId: runtime.workspaceId,
+          threadId: runtime.threadId,
+          sandboxId: runtime.sandboxId,
+          workerId: runtime.workerId,
+          transitionId: runtime.transitionId!,
+        }),
+      );
+      if (Result.isFailure(revoked)) {
+        runtime = yield* recordOutcome(
+          "credential_revoke",
+          dependencyOutcome(revoked.failure),
+          revoked.failure.code,
+        );
+        failures.push({
+          step: "credential_revoke",
+          code: revoked.failure.code,
+          retryable: revoked.failure.retryable || revoked.failure.outcome === "uncertain",
+          cause: revoked.failure,
+        });
+      } else {
+        runtime = yield* recordOutcome("credential_revoke", "succeeded", undefined);
+      }
+    }
+
     if (runtime.routeFencedAt === undefined) {
       const fenced = yield* Effect.result(
         dependencies.workerRoutes.fenceSandboxForReplacement({
@@ -378,13 +450,23 @@ export const makeCloudThreadRuntime = (dependencies: CloudThreadRuntimeDependenc
         }),
       );
       if (Result.isFailure(fenced)) {
-        return yield* handleDependencyFailure(dependencies, runtime, fenced.failure);
+        runtime = yield* recordOutcome(
+          "route_fence",
+          dependencyOutcome(fenced.failure),
+          fenced.failure.code,
+        );
+        failures.push({
+          step: "route_fence",
+          code: fenced.failure.code,
+          retryable: fenced.failure.retryable || fenced.failure.outcome === "uncertain",
+          cause: fenced.failure,
+        });
+      } else {
+        runtime = yield* recordOutcome("route_fence", "succeeded", undefined);
       }
-      runtime = yield* storeEffect(() =>
-        dependencies.store.recordPauseStep(runtime, "route_fenced", iso(dependencies.clock.now())),
-      );
     }
-    if (runtime.credentialsScrubbedAt === undefined) {
+
+    if (runtime.credentialsScrubbedAt === undefined && runtime.sandboxDestroyedAt === undefined) {
       const scrubbed = yield* Effect.result(
         dependencies.workerCredentials.scrubForPause({
           workspaceId: runtime.workspaceId,
@@ -395,40 +477,163 @@ export const makeCloudThreadRuntime = (dependencies: CloudThreadRuntimeDependenc
         }),
       );
       if (Result.isFailure(scrubbed)) {
-        return yield* handleDependencyFailure(dependencies, runtime, scrubbed.failure);
+        runtime = yield* recordOutcome(
+          "credential_scrub",
+          dependencyOutcome(scrubbed.failure),
+          scrubbed.failure.code,
+        );
+        failures.push({
+          step: "credential_scrub",
+          code: scrubbed.failure.code,
+          retryable: scrubbed.failure.retryable || scrubbed.failure.outcome === "uncertain",
+          cause: scrubbed.failure,
+        });
+      } else {
+        runtime = yield* recordOutcome("credential_scrub", "succeeded", undefined);
       }
+    }
+
+    let forceDestroy =
+      runtime.credentialsScrubbedAt === undefined && runtime.sandboxDestroyedAt === undefined;
+    if (
+      runtime.providerCompletedAt === undefined &&
+      runtime.sandboxDestroyedAt === undefined &&
+      !forceDestroy
+    ) {
+      const paused = yield* Effect.result(
+        dependencies.sandbox.pause({
+          type: "pause",
+          requestId: `${runtime.transitionId}:provider-pause` as CommandId,
+          workspaceId: runtime.workspaceId,
+          environmentId: runtime.environmentId,
+          sandboxId: runtime.sandboxId,
+          requestedAt: runtime.transitionStartedAt!,
+        }),
+      );
+      if (Result.isFailure(paused)) {
+        const outcome = paused.failure.retryable ? "retryable_failure" : "confirmed_failure";
+        runtime = yield* recordOutcome("provider_pause", outcome, paused.failure.code);
+        failures.push({
+          step: "provider_pause",
+          code: paused.failure.code,
+          retryable: paused.failure.retryable,
+          cause: paused.failure,
+        });
+        forceDestroy = !paused.failure.retryable;
+      } else if (!validateSandbox(runtime, paused.success.sandbox, "suspended")) {
+        runtime = yield* recordOutcome(
+          "provider_pause",
+          "confirmed_failure",
+          "pause-identity-mismatch",
+        );
+        failures.push({
+          step: "provider_pause",
+          code: "pause-identity-mismatch",
+          retryable: false,
+          cause: "pause-identity-mismatch",
+        });
+        forceDestroy = true;
+      } else {
+        runtime = yield* recordOutcome(
+          "provider_pause",
+          "succeeded",
+          undefined,
+          paused.success.completedAt,
+        );
+      }
+    }
+
+    if (forceDestroy && runtime.sandboxDestroyedAt === undefined) {
+      const destroyed = yield* Effect.result(
+        dependencies.sandbox.destroy({
+          type: "destroy",
+          requestId: `${runtime.transitionId}:provider-destroy` as CommandId,
+          workspaceId: runtime.workspaceId,
+          environmentId: runtime.environmentId,
+          sandboxId: runtime.sandboxId,
+          requestedAt: runtime.transitionStartedAt!,
+        }),
+      );
+      if (Result.isFailure(destroyed)) {
+        runtime = yield* recordOutcome(
+          "provider_destroy",
+          destroyed.failure.retryable ? "retryable_failure" : "confirmed_failure",
+          destroyed.failure.code,
+        );
+        failures.push({
+          step: "provider_destroy",
+          code: destroyed.failure.code,
+          retryable: destroyed.failure.retryable,
+          cause: destroyed.failure,
+        });
+      } else if (
+        destroyed.success.workspaceId !== runtime.workspaceId ||
+        destroyed.success.environmentId !== runtime.environmentId ||
+        destroyed.success.sandboxId !== runtime.sandboxId
+      ) {
+        runtime = yield* recordOutcome(
+          "provider_destroy",
+          "confirmed_failure",
+          "destroy-identity-mismatch",
+        );
+        failures.push({
+          step: "provider_destroy",
+          code: "destroy-identity-mismatch",
+          retryable: false,
+          cause: "destroy-identity-mismatch",
+        });
+      } else {
+        runtime = yield* recordOutcome(
+          "provider_destroy",
+          "succeeded",
+          undefined,
+          destroyed.success.completedAt,
+        );
+      }
+    }
+
+    if (
+      runtime.routeFencedAt !== undefined &&
+      runtime.credentialsRevokedAt !== undefined &&
+      runtime.credentialsScrubbedAt !== undefined &&
+      runtime.providerCompletedAt !== undefined &&
+      runtime.sandboxDestroyedAt === undefined
+    ) {
       runtime = yield* storeEffect(() =>
-        dependencies.store.recordPauseStep(
+        dependencies.store.markPaused(runtime, iso(dependencies.clock.now())),
+      );
+      const pending = yield* storeEffect(() =>
+        dependencies.store.claimPendingResume(runtime, iso(dependencies.clock.now())),
+      );
+      return pending === undefined ? runtime : yield* processResume(pending, false);
+    }
+
+    if (
+      runtime.routeFencedAt !== undefined &&
+      runtime.credentialsRevokedAt !== undefined &&
+      runtime.sandboxDestroyedAt !== undefined
+    ) {
+      return yield* storeEffect(() =>
+        dependencies.store.markReconciliationRequired(
           runtime,
-          "credentials_scrubbed",
+          "sandbox-destroyed-for-containment",
           iso(dependencies.clock.now()),
         ),
       );
     }
 
-    const paused = yield* Effect.result(
-      dependencies.sandbox.pause({
-        type: "pause",
-        requestId: `${runtime.transitionId}:provider` as CommandId,
-        workspaceId: runtime.workspaceId,
-        environmentId: runtime.environmentId,
-        sandboxId: runtime.sandboxId,
-        requestedAt: runtime.transitionStartedAt!,
-      }),
-    );
-    if (Result.isFailure(paused)) {
-      return yield* handleProviderFailure(dependencies, runtime, paused.failure);
+    const confirmed = failures.find((failure) => !failure.retryable);
+    if (confirmed !== undefined) {
+      return yield* storeEffect(() =>
+        dependencies.store.markReconciliationRequired(
+          runtime,
+          `${confirmed.step}:${confirmed.code}`,
+          iso(dependencies.clock.now()),
+        ),
+      );
     }
-    if (!validateSandbox(runtime, paused.success.sandbox, "suspended")) {
-      return yield* reconcile(dependencies, runtime, "pause-identity-mismatch");
-    }
-    runtime = yield* storeEffect(() =>
-      dependencies.store.markPaused(runtime, paused.success.completedAt),
-    );
-    const pending = yield* storeEffect(() =>
-      dependencies.store.claimPendingResume(runtime, iso(dependencies.clock.now())),
-    );
-    return pending === undefined ? runtime : yield* processResume(pending, false);
+    const retryable = failures[0];
+    return retryable === undefined ? runtime : yield* dependencyFailure(retryable.cause, true);
   });
 
   const summarize = (results: ReadonlyArray<Result.Result<CloudThreadRuntimeRecord, unknown>>) => ({
@@ -488,11 +693,16 @@ export const makeCloudThreadRuntime = (dependencies: CloudThreadRuntimeDependenc
 
   const requestResume = (request: CloudThreadResumeRequest) =>
     Effect.gen(function* () {
-      const claim = yield* storeEffect(() => dependencies.store.requestResume(request));
+      const event: CloudThreadResumeEvent = {
+        ...request,
+        requestedAt: iso(dependencies.clock.now()),
+      };
+      const claim = yield* storeEffect(() => dependencies.store.requestResume(event));
       if (claim.disposition === "claimed" || claim.disposition === "joined") {
-        return yield* processResume(claim.runtime, claim.disposition === "joined");
+        const runtime = yield* processResume(claim.runtime, claim.disposition === "joined");
+        return { ...claim, runtime };
       }
-      return claim.runtime;
+      return claim;
     });
 
   const pauseIdle = (limit = 25) =>
@@ -520,7 +730,7 @@ export const makeCloudThreadRuntime = (dependencies: CloudThreadRuntimeDependenc
         recoverable,
         (runtime) =>
           Effect.result(
-            runtime.state === "pause_dispatched"
+            runtime.transitionKind === "pause"
               ? processPause(runtime)
               : processResume(runtime, true),
           ),

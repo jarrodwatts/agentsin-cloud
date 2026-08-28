@@ -131,7 +131,8 @@ it.effect("claims idle pause at exactly fifteen minutes and never before", () =>
       expect(claimed).toHaveLength(1);
       expect(claimed[0]).toMatchObject({
         state: "pause_dispatched",
-        transitionId: "pause:runtime-attempt:1",
+        transitionId:
+          "pause:77777777-7777-4777-8777-777777777777:72756e74696d652d746872656164:72756e74696d652d617474656d7074:72756e74696d652d73616e64626f78:1",
         generation: 1,
       });
       expect(await store.claimIdlePauses("2026-08-28T12:30:00.000Z")).toHaveLength(0);
@@ -223,6 +224,120 @@ it.effect("replays delayed activity delivery with its original server timing", (
       expect(persisted.rows[0]).toEqual({
         occurred_at: "2026-08-28T12:01:00.000Z",
         expires_at: "2026-08-28T12:02:00.000Z",
+      });
+    }),
+  ),
+);
+
+it.effect("rejects expired heartbeats and uses prior expiry for a delayed end", () =>
+  withPostgres(({ pool }) =>
+    Effect.promise(async () => {
+      const store = makePostgresCloudThreadRuntimeStore(pool);
+      await store.recordActivity({
+        type: "started",
+        workspaceId,
+        threadId,
+        attemptId,
+        eventId: "expiry-boundary-start",
+        activityId: "expiry-boundary-agent",
+        source: "agent",
+        generation: 1,
+        leaseMs: 60_000,
+        occurredAt: "2026-08-28T12:01:00.000Z",
+        expiresAt: "2026-08-28T12:02:00.000Z",
+      });
+      const heartbeat = await rejected(
+        store.recordActivity({
+          type: "heartbeat",
+          workspaceId,
+          threadId,
+          attemptId,
+          eventId: "expiry-boundary-heartbeat",
+          activityId: "expiry-boundary-agent",
+          generation: 1,
+          leaseMs: 60_000,
+          occurredAt: "2026-08-28T12:02:00.000Z",
+          expiresAt: "2026-08-28T12:03:00.000Z",
+        }),
+      );
+      expect(heartbeat).toMatchObject({ code: "conflict" });
+
+      await store.recordActivity({
+        type: "ended",
+        workspaceId,
+        threadId,
+        attemptId,
+        eventId: "expiry-boundary-end",
+        activityId: "expiry-boundary-agent",
+        generation: 1,
+        occurredAt: "2026-08-28T12:10:00.000Z",
+      });
+      const timing = await pool.query<{
+        readonly ended_at: string;
+        readonly last_activity_at: string;
+      }>(
+        `SELECT
+           to_char(activity.ended_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS ended_at,
+           to_char(runtime.last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+             AS last_activity_at
+           FROM cloud_thread_runtime_activity AS activity
+           JOIN cloud_thread_runtime AS runtime
+             ON runtime.workspace_id = activity.workspace_id
+            AND runtime.thread_id = activity.thread_id
+          WHERE activity.workspace_id = $1 AND activity.activity_id = $2`,
+        [workspaceId, "expiry-boundary-agent"],
+      );
+      expect(timing.rows[0]).toEqual({
+        ended_at: "2026-08-28T12:02:00.000Z",
+        last_activity_at: "2026-08-28T12:02:00.000Z",
+      });
+      expect(await store.claimIdlePauses("2026-08-28T12:16:59.999Z")).toHaveLength(0);
+      expect(await store.claimIdlePauses("2026-08-28T12:17:00.000Z")).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect("replays the original server time for a delayed resume request", () =>
+  withPostgres(({ pool }) =>
+    Effect.promise(async () => {
+      const store = makePostgresCloudThreadRuntimeStore(pool);
+      const first = await store.requestResume({
+        workspaceId,
+        threadId,
+        attemptId,
+        requestId: "delayed-resume",
+        reason: "message",
+        requestedAt: "2026-08-28T12:01:00.000Z",
+      });
+      const replay = await store.requestResume({
+        workspaceId,
+        threadId,
+        attemptId,
+        requestId: "delayed-resume",
+        reason: "message",
+        requestedAt: "2026-08-28T12:10:00.000Z",
+      });
+
+      expect(first.request.requestedAt).toBe("2026-08-28T12:01:00.000Z");
+      expect(replay.request.requestedAt).toBe("2026-08-28T12:01:00.000Z");
+      const persisted = await pool.query<{
+        readonly requested_at: string;
+        readonly last_activity_at: string;
+      }>(
+        `SELECT
+           to_char(request.requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+             AS requested_at,
+           to_char(runtime.last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+             AS last_activity_at
+           FROM cloud_thread_runtime_resume_request AS request
+           JOIN cloud_thread_runtime AS runtime
+             ON runtime.workspace_id = request.workspace_id AND runtime.thread_id = request.thread_id
+          WHERE request.workspace_id = $1 AND request.request_id = $2`,
+        [workspaceId, "delayed-resume"],
+      );
+      expect(persisted.rows[0]).toEqual({
+        requested_at: "2026-08-28T12:01:00.000Z",
+        last_activity_at: "2026-08-28T12:01:00.000Z",
       });
     }),
   ),
@@ -420,16 +535,134 @@ it.effect("rechecks desktop control after waiting on the shared pause fence", ()
   ),
 );
 
+it.effect("keeps reconciliation recoverable until durable containment receipts are complete", () =>
+  withPostgres(({ pool }) =>
+    Effect.promise(async () => {
+      const store = makePostgresCloudThreadRuntimeStore(pool);
+      let runtime = (await store.claimIdlePauses("2026-08-28T12:15:00.000Z"))[0]!;
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "route_fence",
+        "confirmed_failure",
+        "route-fence-denied",
+        "2026-08-28T12:15:00.100Z",
+      );
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "credential_revoke",
+        "succeeded",
+        undefined,
+        "2026-08-28T12:15:00.200Z",
+      );
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "credential_scrub",
+        "confirmed_failure",
+        "sandbox-scrub-denied",
+        "2026-08-28T12:15:00.300Z",
+      );
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "provider_destroy",
+        "succeeded",
+        undefined,
+        "2026-08-28T12:15:00.400Z",
+      );
+      runtime = await store.markReconciliationRequired(
+        runtime,
+        "route_fence:route-fence-denied",
+        "2026-08-28T12:15:00.500Z",
+      );
+      expect(await store.listRecoverable()).toEqual([runtime]);
+
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "route_fence",
+        "succeeded",
+        undefined,
+        "2026-08-28T12:15:00.600Z",
+      );
+      expect(await store.listRecoverable()).toHaveLength(0);
+      const attempts = await pool.query<{
+        readonly step: string;
+        readonly attempt_no: number;
+        readonly outcome: string;
+        readonly error_code: string | null;
+      }>(
+        `SELECT step, attempt_no, outcome, error_code
+           FROM cloud_thread_runtime_containment_attempt
+          WHERE workspace_id = $1 AND thread_id = $2
+          ORDER BY occurred_at, attempt_no`,
+        [workspaceId, threadId],
+      );
+      expect(attempts.rows).toEqual([
+        {
+          step: "route_fence",
+          attempt_no: 1,
+          outcome: "confirmed_failure",
+          error_code: "route-fence-denied",
+        },
+        {
+          step: "credential_revoke",
+          attempt_no: 1,
+          outcome: "succeeded",
+          error_code: null,
+        },
+        {
+          step: "credential_scrub",
+          attempt_no: 1,
+          outcome: "confirmed_failure",
+          error_code: "sandbox-scrub-denied",
+        },
+        {
+          step: "provider_destroy",
+          attempt_no: 1,
+          outcome: "succeeded",
+          error_code: null,
+        },
+        {
+          step: "route_fence",
+          attempt_no: 2,
+          outcome: "succeeded",
+          error_code: null,
+        },
+      ]);
+    }),
+  ),
+);
+
 it.effect("coalesces a resume race and fences the replaced worker generation", () =>
   withPostgres(({ pool }) =>
     Effect.promise(async () => {
       const store = makePostgresCloudThreadRuntimeStore(pool);
       let runtime = (await store.claimIdlePauses("2026-08-28T12:15:00.000Z"))[0]!;
-      runtime = await store.recordPauseStep(runtime, "route_fenced", "2026-08-28T12:15:00.100Z");
-      runtime = await store.recordPauseStep(
+      runtime = await store.recordContainmentOutcome(
         runtime,
-        "credentials_scrubbed",
+        "route_fence",
+        "succeeded",
+        undefined,
+        "2026-08-28T12:15:00.100Z",
+      );
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "credential_revoke",
+        "succeeded",
+        undefined,
+        "2026-08-28T12:15:00.150Z",
+      );
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "credential_scrub",
+        "succeeded",
+        undefined,
         "2026-08-28T12:15:00.200Z",
+      );
+      runtime = await store.recordContainmentOutcome(
+        runtime,
+        "provider_pause",
+        "succeeded",
+        undefined,
+        "2026-08-28T12:15:00.250Z",
       );
 
       const queued = await store.requestResume({

@@ -30,8 +30,10 @@ CREATE TABLE IF NOT EXISTS cloud_thread_runtime (
   transition_kind text CHECK (transition_kind IN ('pause', 'resume')),
   transition_started_at timestamptz,
   route_fenced_at timestamptz,
+  credentials_revoked_at timestamptz,
   credentials_scrubbed_at timestamptz,
   provider_completed_at timestamptz,
+  sandbox_destroyed_at timestamptz,
   failure_code text,
   updated_at timestamptz NOT NULL,
   PRIMARY KEY (workspace_id, thread_id),
@@ -48,7 +50,13 @@ CREATE TABLE IF NOT EXISTS cloud_thread_runtime (
     (transition_id IS NOT NULL AND transition_kind IS NOT NULL AND transition_started_at IS NOT NULL)
   ),
   CHECK (state = 'running' OR transition_id IS NOT NULL),
-  CHECK (state <> 'paused' OR provider_completed_at IS NOT NULL)
+  CHECK (
+    state <> 'paused' OR (
+      route_fenced_at IS NOT NULL AND credentials_revoked_at IS NOT NULL AND
+      credentials_scrubbed_at IS NOT NULL AND provider_completed_at IS NOT NULL AND
+      sandbox_destroyed_at IS NULL
+    )
+  )
 );
 
 CREATE INDEX IF NOT EXISTS cloud_thread_runtime_idle_idx
@@ -58,6 +66,7 @@ CREATE INDEX IF NOT EXISTS cloud_thread_runtime_recovery_idx
   ON cloud_thread_runtime (updated_at, workspace_id, thread_id)
   WHERE state IN (
     'pause_dispatched',
+    'reconciliation_required',
     'resume_dispatched',
     'resume_bootstrap_dispatched',
     'resume_worker_start_dispatched'
@@ -127,6 +136,33 @@ CREATE TABLE IF NOT EXISTS cloud_thread_runtime_resume_request (
 CREATE INDEX IF NOT EXISTS cloud_thread_runtime_resume_pending_idx
   ON cloud_thread_runtime_resume_request (workspace_id, thread_id, requested_at, request_id)
   WHERE state = 'pending';
+
+CREATE TABLE IF NOT EXISTS cloud_thread_runtime_containment_attempt (
+  workspace_id uuid NOT NULL,
+  thread_id text NOT NULL,
+  transition_id text NOT NULL,
+  step text NOT NULL CHECK (step IN (
+    'route_fence',
+    'credential_revoke',
+    'credential_scrub',
+    'provider_pause',
+    'provider_destroy'
+  )),
+  attempt_no integer NOT NULL CHECK (attempt_no > 0),
+  outcome text NOT NULL CHECK (outcome IN (
+    'succeeded',
+    'retryable_failure',
+    'confirmed_failure',
+    'uncertain_failure'
+  )),
+  error_code text,
+  occurred_at timestamptz NOT NULL,
+  PRIMARY KEY (workspace_id, thread_id, transition_id, step, attempt_no),
+  FOREIGN KEY (workspace_id, thread_id)
+    REFERENCES cloud_thread_runtime (workspace_id, thread_id)
+    ON DELETE CASCADE,
+  CHECK ((outcome = 'succeeded') = (error_code IS NULL))
+);
 
 CREATE OR REPLACE FUNCTION agentsin_cloud_seed_thread_runtime()
 RETURNS trigger

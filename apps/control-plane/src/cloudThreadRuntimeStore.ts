@@ -47,8 +47,10 @@ export interface CloudThreadRuntimeRecord {
   readonly transitionKind?: "pause" | "resume";
   readonly transitionStartedAt?: string;
   readonly routeFencedAt?: string;
+  readonly credentialsRevokedAt?: string;
   readonly credentialsScrubbedAt?: string;
   readonly providerCompletedAt?: string;
+  readonly sandboxDestroyedAt?: string;
   readonly failureCode?: string;
   readonly updatedAt: string;
 }
@@ -102,13 +104,30 @@ export interface CloudThreadResumeRequest {
   readonly attemptId: string;
   readonly requestId: string;
   readonly reason: CloudThreadResumeReason;
+}
+
+export interface CloudThreadResumeEvent extends CloudThreadResumeRequest {
   readonly requestedAt: string;
 }
 
-export type CloudThreadResumeClaim =
-  | { readonly disposition: "running"; readonly runtime: CloudThreadRuntimeRecord }
-  | { readonly disposition: "pending"; readonly runtime: CloudThreadRuntimeRecord }
-  | { readonly disposition: "claimed" | "joined"; readonly runtime: CloudThreadRuntimeRecord };
+export type CloudThreadResumeClaim = {
+  readonly disposition: "running" | "pending" | "claimed" | "joined";
+  readonly runtime: CloudThreadRuntimeRecord;
+  readonly request: CloudThreadResumeEvent;
+};
+
+export type CloudThreadContainmentStep =
+  | "route_fence"
+  | "credential_revoke"
+  | "credential_scrub"
+  | "provider_pause"
+  | "provider_destroy";
+
+export type CloudThreadContainmentOutcome =
+  | "succeeded"
+  | "retryable_failure"
+  | "confirmed_failure"
+  | "uncertain_failure";
 
 export class CloudThreadRuntimeStoreError extends Error {
   readonly code: "conflict" | "notFound" | "staleGeneration" | "databaseFailure";
@@ -139,8 +158,10 @@ interface RuntimeRow extends QueryResultRow {
   readonly transition_kind: "pause" | "resume" | null;
   readonly transition_started_at: string | null;
   readonly route_fenced_at: string | null;
+  readonly credentials_revoked_at: string | null;
   readonly credentials_scrubbed_at: string | null;
   readonly provider_completed_at: string | null;
+  readonly sandbox_destroyed_at: string | null;
   readonly failure_code: string | null;
   readonly updated_at: string;
 }
@@ -184,8 +205,9 @@ const runtimeColumns = `runtime.workspace_id::text AS workspace_id, runtime.thre
   runtime.generation::text, runtime.state,
   runtime.last_activity_at::text, runtime.idle_since::text,
   runtime.transition_id, runtime.transition_kind, runtime.transition_started_at::text,
-  runtime.route_fenced_at::text, runtime.credentials_scrubbed_at::text,
-  runtime.provider_completed_at::text, runtime.failure_code, runtime.updated_at::text`;
+  runtime.route_fenced_at::text, runtime.credentials_revoked_at::text,
+  runtime.credentials_scrubbed_at::text, runtime.provider_completed_at::text,
+  runtime.sandbox_destroyed_at::text, runtime.failure_code, runtime.updated_at::text`;
 
 const toRuntime = (row: RuntimeRow): CloudThreadRuntimeRecord => ({
   workspaceId: row.workspace_id as WorkspaceId,
@@ -206,10 +228,14 @@ const toRuntime = (row: RuntimeRow): CloudThreadRuntimeRecord => ({
   ...(row.transition_kind === null ? {} : { transitionKind: row.transition_kind }),
   ...(row.transition_started_at === null ? {} : { transitionStartedAt: row.transition_started_at }),
   ...(row.route_fenced_at === null ? {} : { routeFencedAt: row.route_fenced_at }),
+  ...(row.credentials_revoked_at === null
+    ? {}
+    : { credentialsRevokedAt: row.credentials_revoked_at }),
   ...(row.credentials_scrubbed_at === null
     ? {}
     : { credentialsScrubbedAt: row.credentials_scrubbed_at }),
   ...(row.provider_completed_at === null ? {} : { providerCompletedAt: row.provider_completed_at }),
+  ...(row.sandbox_destroyed_at === null ? {} : { sandboxDestroyedAt: row.sandbox_destroyed_at }),
   ...(row.failure_code === null ? {} : { failureCode: row.failure_code }),
   updatedAt: row.updated_at,
 });
@@ -321,7 +347,14 @@ const eventFingerprint = (event: CloudThreadActivityEvent) =>
             generation: event.generation,
           },
   );
-const resumeFingerprint = (request: CloudThreadResumeRequest) => fingerprint(request);
+const resumeFingerprint = (request: CloudThreadResumeRequest) =>
+  fingerprint({
+    workspaceId: request.workspaceId,
+    threadId: request.threadId,
+    attemptId: request.attemptId,
+    requestId: request.requestId,
+    reason: request.reason,
+  });
 
 export interface CloudThreadRuntimeStore {
   readonly getCurrent: (
@@ -334,16 +367,18 @@ export interface CloudThreadRuntimeStore {
     idleForMs?: number,
     limit?: number,
   ) => Promise<ReadonlyArray<CloudThreadRuntimeRecord>>;
-  readonly recordPauseStep: (
+  readonly recordContainmentOutcome: (
     runtime: CloudThreadRuntimeRecord,
-    step: "route_fenced" | "credentials_scrubbed",
+    step: CloudThreadContainmentStep,
+    outcome: CloudThreadContainmentOutcome,
+    errorCode: string | undefined,
     occurredAt: string,
   ) => Promise<CloudThreadRuntimeRecord>;
   readonly markPaused: (
     runtime: CloudThreadRuntimeRecord,
     occurredAt: string,
   ) => Promise<CloudThreadRuntimeRecord>;
-  readonly requestResume: (request: CloudThreadResumeRequest) => Promise<CloudThreadResumeClaim>;
+  readonly requestResume: (request: CloudThreadResumeEvent) => Promise<CloudThreadResumeClaim>;
   readonly claimPendingResume: (
     runtime: CloudThreadRuntimeRecord,
     now: string,
@@ -449,6 +484,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
         [event.workspaceId, event.activityId],
       );
       const activity = activityResult.rows[0];
+      let activityBoundaryAt = event.occurredAt;
       if (event.type === "started") {
         if (Date.parse(event.occurredAt) >= Date.parse(event.expiresAt)) {
           throw new CloudThreadRuntimeStoreError(
@@ -495,6 +531,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
           if (
             activity.state !== "active" ||
             Date.parse(event.occurredAt) < Date.parse(activity.heartbeat_at) ||
+            Date.parse(event.occurredAt) >= Date.parse(activity.expires_at) ||
             Date.parse(event.occurredAt) >= Date.parse(event.expiresAt)
           ) {
             throw new CloudThreadRuntimeStoreError("conflict", "Activity heartbeat was stale");
@@ -513,11 +550,15 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
             );
           }
           if (activity.state === "active") {
+            activityBoundaryAt =
+              Date.parse(event.occurredAt) < Date.parse(activity.expires_at)
+                ? event.occurredAt
+                : activity.expires_at;
             await client.query(
               `UPDATE cloud_thread_runtime_activity
                   SET state = 'ended', ended_at = $3::timestamptz
                 WHERE workspace_id = $1 AND activity_id = $2 AND state = 'active'`,
-              [event.workspaceId, event.activityId, event.occurredAt],
+              [event.workspaceId, event.activityId, activityBoundaryAt],
             );
           } else {
             throw new CloudThreadRuntimeStoreError("conflict", "Activity ended more than once");
@@ -562,10 +603,10 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
       await client.query(
         `UPDATE cloud_thread_runtime
             SET last_activity_at = GREATEST(last_activity_at, $3::timestamptz),
-                idle_since = ${remainsActive ? "NULL" : "$3::timestamptz"},
-                updated_at = GREATEST(updated_at, $3::timestamptz)
+                idle_since = ${remainsActive ? "NULL" : "GREATEST(last_activity_at, $3::timestamptz)"},
+                updated_at = GREATEST(updated_at, $4::timestamptz)
           WHERE workspace_id = $1 AND thread_id = $2`,
-        [event.workspaceId, event.threadId, event.occurredAt],
+        [event.workspaceId, event.threadId, activityBoundaryAt, event.occurredAt],
       );
       return {
         disposition: "applied",
@@ -720,10 +761,14 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
         const updated = await client.query(
           `UPDATE cloud_thread_runtime
               SET state = 'pause_dispatched', idle_since = NULL,
-                  transition_id = 'pause:' || attempt_id || ':' || generation::text,
+                  transition_id = 'pause:' || workspace_id::text || ':' ||
+                    encode(convert_to(thread_id, 'UTF8'), 'hex') || ':' ||
+                    encode(convert_to(attempt_id, 'UTF8'), 'hex') || ':' ||
+                    encode(convert_to(sandbox_id, 'UTF8'), 'hex') || ':' || generation::text,
                   transition_kind = 'pause', transition_started_at = $5::timestamptz,
-                  route_fenced_at = NULL, credentials_scrubbed_at = NULL,
-                  provider_completed_at = NULL, failure_code = NULL,
+                  route_fenced_at = NULL, credentials_revoked_at = NULL,
+                  credentials_scrubbed_at = NULL, provider_completed_at = NULL,
+                  sandbox_destroyed_at = NULL, failure_code = NULL,
                   updated_at = $5::timestamptz
             WHERE workspace_id = $1 AND thread_id = $2 AND attempt_id = $3
               AND generation = $4 AND state = 'running'
@@ -737,27 +782,75 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
       return claimed;
     }),
 
-  recordPauseStep: (runtime, step, occurredAt) =>
+  recordContainmentOutcome: (runtime, step, outcome, errorCode, occurredAt) =>
     transaction(pool, async (client) => {
-      const column = step === "route_fenced" ? "route_fenced_at" : "credentials_scrubbed_at";
+      if ((outcome === "succeeded") !== (errorCode === undefined)) {
+        throw new CloudThreadRuntimeStoreError(
+          "conflict",
+          "Containment outcome and error code did not agree",
+        );
+      }
+      const current = await loadRuntime(client, runtime.workspaceId, runtime.threadId, true);
+      exactAttempt(current, runtime.attemptId);
+      exactGeneration(current, runtime.generation);
+      if (
+        current.transitionId !== runtime.transitionId ||
+        current.transitionKind !== "pause" ||
+        (current.state !== "pause_dispatched" && current.state !== "reconciliation_required")
+      ) {
+        throw new CloudThreadRuntimeStoreError("conflict", "Containment outcome arrived stale");
+      }
+      await client.query(
+        `INSERT INTO cloud_thread_runtime_containment_attempt
+          (workspace_id, thread_id, transition_id, step, attempt_no, outcome, error_code,
+           occurred_at)
+         SELECT $1,$2,$3,$4,COALESCE(MAX(attempt_no), 0) + 1,$5,$6,$7::timestamptz
+           FROM cloud_thread_runtime_containment_attempt
+          WHERE workspace_id = $1 AND thread_id = $2 AND transition_id = $3 AND step = $4`,
+        [
+          runtime.workspaceId,
+          runtime.threadId,
+          runtime.transitionId,
+          step,
+          outcome,
+          errorCode ?? null,
+          occurredAt,
+        ],
+      );
+      const column =
+        step === "route_fence"
+          ? "route_fenced_at"
+          : step === "credential_revoke"
+            ? "credentials_revoked_at"
+            : step === "credential_scrub"
+              ? "credentials_scrubbed_at"
+              : step === "provider_pause"
+                ? "provider_completed_at"
+                : "sandbox_destroyed_at";
       const updated = await client.query(
         `UPDATE cloud_thread_runtime
-            SET ${column} = COALESCE(${column}, $5::timestamptz), updated_at = $5::timestamptz
+            SET ${column} = CASE WHEN $5 = 'succeeded'
+                  THEN COALESCE(${column}, $7::timestamptz) ELSE ${column} END,
+                failure_code = CASE WHEN $5 = 'succeeded' THEN failure_code ELSE $6 END,
+                updated_at = GREATEST(updated_at, $7::timestamptz)
           WHERE workspace_id = $1 AND thread_id = $2 AND attempt_id = $3
-            AND generation = $4 AND state = 'pause_dispatched'
-            AND transition_id = $6
+            AND generation = $4
+            AND state IN ('pause_dispatched', 'reconciliation_required')
+            AND transition_id = $8
           RETURNING thread_id`,
         [
           runtime.workspaceId,
           runtime.threadId,
           runtime.attemptId,
           runtime.generation,
+          outcome,
+          errorCode ?? null,
           occurredAt,
           runtime.transitionId,
         ],
       );
       if (updated.rowCount !== 1) {
-        throw new CloudThreadRuntimeStoreError("conflict", "Pause fence receipt arrived stale");
+        throw new CloudThreadRuntimeStoreError("conflict", "Containment receipt arrived stale");
       }
       return loadRuntime(client, runtime.workspaceId, runtime.threadId);
     }),
@@ -766,12 +859,12 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
     transaction(pool, async (client) => {
       const updated = await client.query(
         `UPDATE cloud_thread_runtime
-            SET state = 'paused', provider_completed_at = $5::timestamptz,
-                updated_at = $5::timestamptz
+            SET state = 'paused', failure_code = NULL, updated_at = $5::timestamptz
           WHERE workspace_id = $1 AND thread_id = $2 AND attempt_id = $3
-            AND generation = $4 AND state = 'pause_dispatched'
+            AND generation = $4 AND state IN ('pause_dispatched', 'reconciliation_required')
             AND transition_id = $6 AND route_fenced_at IS NOT NULL
-            AND credentials_scrubbed_at IS NOT NULL
+            AND credentials_revoked_at IS NOT NULL AND credentials_scrubbed_at IS NOT NULL
+            AND provider_completed_at IS NOT NULL AND sandbox_destroyed_at IS NULL
           RETURNING thread_id`,
         [
           runtime.workspaceId,
@@ -795,7 +888,9 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
       const digest = resumeFingerprint(request);
       const existing = await client.query<ResumeRequestRow>(
         `SELECT thread_id, attempt_id, reason, request_fingerprint, state,
-                transition_id, requested_at::text
+                transition_id,
+                to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                  AS requested_at
            FROM cloud_thread_runtime_resume_request
           WHERE workspace_id = $1 AND request_id = $2`,
         [request.workspaceId, request.requestId],
@@ -819,7 +914,11 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
             : runtime.state === "running"
               ? "running"
               : "joined";
-        return { disposition, runtime } as CloudThreadResumeClaim;
+        return {
+          disposition,
+          runtime,
+          request: { ...request, requestedAt: prior.requested_at },
+        } as CloudThreadResumeClaim;
       }
       if (runtime.state === "reconciliation_required") {
         throw new CloudThreadRuntimeStoreError(
@@ -853,7 +952,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
           [request.workspaceId, request.threadId, request.requestedAt],
         );
         runtime = await loadRuntime(client, request.workspaceId, request.threadId);
-        return { disposition: "running", runtime };
+        return { disposition: "running", runtime, request };
       }
 
       if (runtime.state === "pause_dispatched") {
@@ -872,7 +971,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
             request.requestedAt,
           ],
         );
-        return { disposition: "pending", runtime };
+        return { disposition: "pending", runtime, request };
       }
 
       if (runtime.state === "paused") {
@@ -883,7 +982,8 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
               SET state = 'resume_dispatched', generation = $3,
                   transition_id = $4, transition_kind = 'resume',
                   transition_started_at = $5::timestamptz, route_fenced_at = NULL,
-                  credentials_scrubbed_at = NULL, provider_completed_at = NULL,
+                  credentials_revoked_at = NULL, credentials_scrubbed_at = NULL,
+                  provider_completed_at = NULL, sandbox_destroyed_at = NULL,
                   failure_code = NULL, updated_at = $5::timestamptz
             WHERE workspace_id = $1 AND thread_id = $2 AND state = 'paused'`,
           [request.workspaceId, request.threadId, generation, transitionId, request.requestedAt],
@@ -905,7 +1005,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
           ],
         );
         runtime = await loadRuntime(client, request.workspaceId, request.threadId);
-        return { disposition: "claimed", runtime };
+        return { disposition: "claimed", runtime, request };
       }
 
       await client.query(
@@ -924,7 +1024,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
           request.requestedAt,
         ],
       );
-      return { disposition: "joined", runtime };
+      return { disposition: "joined", runtime, request };
     }),
 
   claimPendingResume: (runtime, now) =>
@@ -946,7 +1046,8 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
             SET state = 'resume_dispatched', generation = $3,
                 transition_id = $4, transition_kind = 'resume',
                 transition_started_at = $5::timestamptz, route_fenced_at = NULL,
-                credentials_scrubbed_at = NULL, provider_completed_at = NULL,
+                credentials_revoked_at = NULL, credentials_scrubbed_at = NULL,
+                provider_completed_at = NULL, sandbox_destroyed_at = NULL,
                 failure_code = NULL, updated_at = $5::timestamptz
           WHERE workspace_id = $1 AND thread_id = $2 AND state = 'paused'`,
         [runtime.workspaceId, runtime.threadId, generation, transitionId, now],
@@ -1043,8 +1144,9 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
             SET state = 'running', last_activity_at = $5::timestamptz,
                 idle_since = $5::timestamptz, transition_id = NULL,
                 transition_kind = NULL, transition_started_at = NULL,
-                route_fenced_at = NULL, credentials_scrubbed_at = NULL,
-                provider_completed_at = NULL, failure_code = NULL,
+                route_fenced_at = NULL, credentials_revoked_at = NULL,
+                credentials_scrubbed_at = NULL, provider_completed_at = NULL,
+                sandbox_destroyed_at = NULL, failure_code = NULL,
                 updated_at = $5::timestamptz
           WHERE workspace_id = $1 AND thread_id = $2 AND attempt_id = $3
             AND generation = $4 AND state = 'resume_worker_start_dispatched'
@@ -1104,9 +1206,21 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
          JOIN cloud_thread_lifecycle_attempt AS attempt
            ON attempt.workspace_id = runtime.workspace_id AND attempt.attempt_id = runtime.attempt_id
         WHERE attempt.is_current AND attempt.state = 'ready'
-          AND runtime.state IN (
-            'pause_dispatched', 'resume_dispatched',
-            'resume_bootstrap_dispatched', 'resume_worker_start_dispatched'
+          AND (
+            runtime.state IN (
+              'pause_dispatched', 'resume_dispatched',
+              'resume_bootstrap_dispatched', 'resume_worker_start_dispatched'
+            ) OR (
+              runtime.state = 'reconciliation_required'
+              AND runtime.transition_kind = 'pause'
+              AND (
+                runtime.route_fenced_at IS NULL OR runtime.credentials_revoked_at IS NULL OR
+                (
+                  runtime.sandbox_destroyed_at IS NULL AND
+                  (runtime.provider_completed_at IS NULL OR runtime.credentials_scrubbed_at IS NULL)
+                )
+              )
+            )
           )
         ORDER BY runtime.updated_at, runtime.workspace_id, runtime.thread_id
         LIMIT $1`,

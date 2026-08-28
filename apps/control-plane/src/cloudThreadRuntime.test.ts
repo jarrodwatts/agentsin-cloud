@@ -25,6 +25,7 @@ import {
 } from "./cloudThreadLifecycle.ts";
 import {
   makeCloudThreadRuntime,
+  type CentralCredentialRevoker,
   type RuntimeWorkerRecovery,
   type RuntimeWorkerBootstrapIssuer,
   type WorkerCredentialLifecycle,
@@ -32,7 +33,6 @@ import {
 import type {
   CloudThreadActivityEvent,
   CloudThreadResumeClaim,
-  CloudThreadResumeRequest,
   CloudThreadRuntimeRecord,
   CloudThreadRuntimeStore,
 } from "./cloudThreadRuntimeStore.ts";
@@ -148,12 +148,23 @@ const makeStore = (initial: CloudThreadRuntimeRecord) => {
       };
       return Promise.resolve([current]);
     },
-    recordPauseStep: (value, step, occurredAt) => {
+    recordContainmentOutcome: (value, step, outcome, errorCode, occurredAt) => {
+      const receipt =
+        outcome !== "succeeded"
+          ? {}
+          : step === "route_fence"
+            ? { routeFencedAt: occurredAt }
+            : step === "credential_revoke"
+              ? { credentialsRevokedAt: occurredAt }
+              : step === "credential_scrub"
+                ? { credentialsScrubbedAt: occurredAt }
+                : step === "provider_pause"
+                  ? { providerCompletedAt: occurredAt }
+                  : { sandboxDestroyedAt: occurredAt };
       current = {
         ...value,
-        ...(step === "route_fenced"
-          ? { routeFencedAt: occurredAt }
-          : { credentialsScrubbedAt: occurredAt }),
+        ...receipt,
+        ...(errorCode === undefined ? {} : { failureCode: errorCode }),
         updatedAt: occurredAt,
       };
       return Promise.resolve(current);
@@ -162,16 +173,15 @@ const makeStore = (initial: CloudThreadRuntimeRecord) => {
       current = {
         ...value,
         state: "paused",
-        providerCompletedAt: occurredAt,
         updatedAt: occurredAt,
       };
       return Promise.resolve(current);
     },
-    requestResume: (_request: CloudThreadResumeRequest): Promise<CloudThreadResumeClaim> => {
+    requestResume: (request): Promise<CloudThreadResumeClaim> => {
       if (current.state === "running")
-        return Promise.resolve({ disposition: "running", runtime: current });
+        return Promise.resolve({ disposition: "running", runtime: current, request });
       if (current.state === "pause_dispatched") {
-        return Promise.resolve({ disposition: "pending", runtime: current });
+        return Promise.resolve({ disposition: "pending", runtime: current, request });
       }
       if (current.state === "paused") {
         const { providerCompletedAt: _providerCompletedAt, ...paused } = current;
@@ -183,9 +193,9 @@ const makeStore = (initial: CloudThreadRuntimeRecord) => {
           transitionKind: "resume",
           transitionStartedAt: instant,
         };
-        return Promise.resolve({ disposition: "claimed", runtime: current });
+        return Promise.resolve({ disposition: "claimed", runtime: current, request });
       }
-      return Promise.resolve({ disposition: "joined", runtime: current });
+      return Promise.resolve({ disposition: "joined", runtime: current, request });
     },
     claimPendingResume: () => Promise.resolve(undefined),
     markProviderResumed: (value, occurredAt) => {
@@ -212,8 +222,10 @@ const makeStore = (initial: CloudThreadRuntimeRecord) => {
         transitionKind: _transitionKind,
         transitionStartedAt: _transitionStartedAt,
         routeFencedAt: _routeFencedAt,
+        credentialsRevokedAt: _credentialsRevokedAt,
         credentialsScrubbedAt: _credentialsScrubbedAt,
         providerCompletedAt: _providerCompletedAt,
+        sandboxDestroyedAt: _sandboxDestroyedAt,
         ...resumed
       } = value;
       current = {
@@ -236,6 +248,13 @@ const makeStore = (initial: CloudThreadRuntimeRecord) => {
     listRecoverable: () =>
       Promise.resolve(
         current.state === "pause_dispatched" ||
+          (current.state === "reconciliation_required" &&
+            current.transitionKind === "pause" &&
+            (current.routeFencedAt === undefined ||
+              current.credentialsRevokedAt === undefined ||
+              (current.sandboxDestroyedAt === undefined &&
+                (current.providerCompletedAt === undefined ||
+                  current.credentialsScrubbedAt === undefined)))) ||
           current.state === "resume_dispatched" ||
           current.state === "resume_bootstrap_dispatched" ||
           current.state === "resume_worker_start_dispatched"
@@ -284,6 +303,12 @@ it.effect("fences routes and credentials before an idempotent pause retry", () =
           return Effect.void;
         },
       } as WorkerRouteLifecycle,
+      centralCredentialRevoker: {
+        revokeForContainment: () => {
+          calls.push("credential-revoke");
+          return Effect.void;
+        },
+      },
       workerCredentials: {
         scrubForPause: () => {
           calls.push("credential-scrub");
@@ -298,10 +323,102 @@ it.effect("fences routes and credentials before an idempotent pause retry", () =
     expect(yield* service.recoverPending()).toMatchObject({ claimed: 1, completed: 1 });
     expect(state.current().state).toBe("paused");
     expect(calls).toEqual([
+      "credential-revoke",
       "route-fence",
       "credential-scrub",
-      "pause:pause:runtime-unit-attempt:1:provider",
-      "pause:pause:runtime-unit-attempt:1:provider",
+      "pause:pause:runtime-unit-attempt:1:provider-pause",
+      "pause:pause:runtime-unit-attempt:1:provider-pause",
+    ]);
+  }),
+);
+
+it.effect("quarantines and destroys after confirmed fence and scrub failures", () =>
+  Effect.gen(function* () {
+    const state = makeStore(runtime("running"));
+    const calls: string[] = [];
+    let routeAttempts = 0;
+    const service = makeCloudThreadRuntime({
+      store: state.store,
+      sandbox: {
+        pause: () => {
+          calls.push("provider-pause");
+          return Effect.die("pause must not run with an unsanitized sandbox");
+        },
+        destroy: (request: Parameters<SandboxProvider["destroy"]>[0]) => {
+          calls.push(`provider-destroy:${request.requestId}`);
+          return Effect.succeed({
+            type: "destroyed" as const,
+            requestId: request.requestId,
+            workspaceId,
+            environmentId,
+            sandboxId,
+            completedAt: instant,
+          });
+        },
+      } as unknown as SandboxProvider,
+      bootstrapIssuer: {} as RuntimeWorkerBootstrapIssuer,
+      workerGateway: {} as WorkerConnectionGateway,
+      workerRecovery: {} as RuntimeWorkerRecovery,
+      workerRoutes: {
+        fenceSandboxForReplacement: () => {
+          routeAttempts += 1;
+          calls.push("route-fence");
+          return routeAttempts === 1
+            ? Effect.fail(
+                dependencyError({
+                  code: "route-fence-denied",
+                  retryable: false,
+                  outcome: "confirmed",
+                }),
+              )
+            : Effect.void;
+        },
+      } as WorkerRouteLifecycle,
+      centralCredentialRevoker: {
+        revokeForContainment: () => {
+          calls.push("central-revoke");
+          return Effect.void;
+        },
+      },
+      workerCredentials: {
+        scrubForPause: () => {
+          calls.push("credential-scrub");
+          return Effect.fail(
+            dependencyError({
+              code: "sandbox-scrub-denied",
+              retryable: false,
+              outcome: "confirmed",
+            }),
+          );
+        },
+      },
+      clock: { now: () => new Date(instant) },
+    });
+
+    expect(yield* service.pauseIdle()).toMatchObject({ claimed: 1, reconciliationRequired: 1 });
+    expect(state.current()).toMatchObject({
+      state: "reconciliation_required",
+      credentialsRevokedAt: instant,
+      sandboxDestroyedAt: instant,
+    });
+    expect(state.current().routeFencedAt).toBeUndefined();
+    expect(yield* service.recoverPending()).toMatchObject({
+      claimed: 1,
+      reconciliationRequired: 1,
+    });
+    expect(state.current()).toMatchObject({
+      state: "reconciliation_required",
+      routeFencedAt: instant,
+      credentialsRevokedAt: instant,
+      sandboxDestroyedAt: instant,
+    });
+    expect(yield* service.recoverPending()).toMatchObject({ claimed: 0 });
+    expect(calls).toEqual([
+      "central-revoke",
+      "route-fence",
+      "credential-scrub",
+      "provider-destroy:pause:runtime-unit-attempt:1:provider-destroy",
+      "route-fence",
     ]);
   }),
 );
@@ -310,11 +427,16 @@ it.effect("assigns activity time in the control plane and bounds worker leases",
   Effect.gen(function* () {
     const state = makeStore(runtime("running"));
     let recorded: CloudThreadActivityEvent | undefined;
+    let resumeRequestedAt: string | undefined;
     const store: CloudThreadRuntimeStore = {
       ...state.store,
       recordActivity: (event) => {
         recorded = event;
         return Promise.resolve({ disposition: "applied", runtime: state.current(), event });
+      },
+      requestResume: (event) => {
+        resumeRequestedAt = event.requestedAt;
+        return state.store.requestResume(event);
       },
     };
     const service = makeCloudThreadRuntime({
@@ -324,6 +446,7 @@ it.effect("assigns activity time in the control plane and bounds worker leases",
       workerGateway: {} as WorkerConnectionGateway,
       workerRecovery: {} as RuntimeWorkerRecovery,
       workerRoutes: {} as WorkerRouteLifecycle,
+      centralCredentialRevoker: {} as CentralCredentialRevoker,
       workerCredentials: {} as WorkerCredentialLifecycle,
       clock: { now: () => new Date(instant) },
     });
@@ -355,6 +478,15 @@ it.effect("assigns activity time in the control plane and bounds worker leases",
       }),
     );
     expect(Exit.isFailure(invalid)).toBe(true);
+    const resume = yield* service.requestResume({
+      workspaceId,
+      threadId,
+      attemptId,
+      requestId: "server-timed-resume",
+      reason: "message",
+    });
+    expect(resumeRequestedAt).toBe(instant);
+    expect(resume.request.requestedAt).toBe(instant);
   }),
 );
 
@@ -404,6 +536,7 @@ it.effect("reconciles a lost worker-start response without starting a second wor
       workerGateway: gateway,
       workerRecovery: { confirmRecovered: () => Effect.void },
       workerRoutes: {} as WorkerRouteLifecycle,
+      centralCredentialRevoker: {} as CentralCredentialRevoker,
       workerCredentials: {} as WorkerCredentialLifecycle,
       clock: { now: () => new Date(instant) },
     });
@@ -415,7 +548,6 @@ it.effect("reconciles a lost worker-start response without starting a second wor
         attemptId,
         requestId: "resume-inspector",
         reason: "inspector",
-        requestedAt: instant,
       }),
     );
     expect(Exit.isFailure(first)).toBe(true);
