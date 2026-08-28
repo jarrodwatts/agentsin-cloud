@@ -29,6 +29,7 @@ import {
   DesktopAuthInitiateRequest,
   DesktopLease,
   EnvironmentRevision,
+  EvmTransactionHash,
   GitHubThreadWorkflowCommand,
   GitHubThreadWorkflowView,
   LedgerEntry,
@@ -49,6 +50,7 @@ import {
   UsageReceipt,
   UsageReceiptAccepted,
   UsageSample,
+  UsageSettlementReceipt,
 } from "./cloud.ts";
 
 const NOW = "2026-08-27T12:00:00.000Z";
@@ -101,6 +103,133 @@ describe("desktop auth handoff contracts", () => {
       decodeDesktopAuthExchangeRequest({
         handoff: "",
         codeVerifier: "short",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("usage settlement receipt contracts", () => {
+  it("canonicalizes Monad transaction hashes to lowercase at decode", () => {
+    const decode = Schema.decodeUnknownSync(EvmTransactionHash);
+    expect(decode(`0x${"Aa".repeat(32)}`)).toBe(`0x${"aa".repeat(32)}`);
+  });
+
+  const decodeReceipt = Schema.decodeUnknownSync(UsageSettlementReceipt);
+  const posting = {
+    accrualId: "accrual-1",
+    sampleId: "sample-1",
+    environmentId: "environment-1",
+    sandboxId: "sandbox-1",
+    evidenceId: "evidence-1",
+    evidenceRevision: 1,
+    evidencePayloadSha256: "a".repeat(64),
+    receiptInputSha256: "b".repeat(64),
+    pricingSequence: 1,
+    intervalStart: "2026-08-27T11:00:00.000Z",
+    intervalEnd: "2026-08-27T11:05:00.000Z",
+    upstreamDeltaMicroUsdc: 1_000,
+    markupDeltaMicroUsdc: 50,
+    totalDeltaMicroUsdc: 1_050,
+  } as const;
+  const correction = {
+    ...posting,
+    accrualId: "accrual-2",
+    sampleId: "sample-2",
+    evidenceRevision: 2,
+    evidencePayloadSha256: "c".repeat(64),
+    receiptInputSha256: "d".repeat(64),
+    pricingSequence: 2,
+    upstreamDeltaMicroUsdc: -100,
+    markupDeltaMicroUsdc: -5,
+    totalDeltaMicroUsdc: -105,
+  } as const;
+  const fixture = {
+    payload: {
+      schemaVersion: 1,
+      settlementId: "settlement-1",
+      workspaceId: WORKSPACE_ID,
+      threadId: "thread-1",
+      infrastructureProvider: "e2b",
+      evidenceRange: {
+        firstSampleId: posting.sampleId,
+        lastSampleId: correction.sampleId,
+        firstEvidenceId: posting.evidenceId,
+        firstEvidenceRevision: posting.evidenceRevision,
+        lastEvidenceId: correction.evidenceId,
+        lastEvidenceRevision: correction.evidenceRevision,
+        firstPricingSequence: 1,
+        lastPricingSequence: 2,
+        accrualCount: 2,
+        intervalStart: posting.intervalStart,
+        intervalEnd: posting.intervalEnd,
+      },
+      postings: [posting, correction],
+      upstreamMicroUsdc: 900,
+      markupMicroUsdc: 45,
+      totalMicroUsdc: 945,
+      txHash: SETTLEMENT_TX_HASH,
+      createdAt: NOW,
+      submittedAt: NOW,
+    },
+    payloadSha256: "e".repeat(64),
+    signature: {
+      algorithm: "ed25519",
+      keyId: "kms://settlement-receipts/v1",
+      payloadHash: "e".repeat(64),
+      signature: "signed-receipt",
+      signedAt: NOW,
+    },
+  } as const;
+
+  it("preserves signed debit and correction deltas without repricing", () => {
+    const receipt = decodeReceipt(fixture);
+    expect(receipt.payload.totalMicroUsdc).toBe(945);
+    expect(receipt.payload.postings.map((entry) => entry.totalDeltaMicroUsdc)).toEqual([
+      1_050, -105,
+    ]);
+  });
+
+  it("rejects altered totals, evidence range, and signature hashes", () => {
+    expect(() =>
+      decodeReceipt({ ...fixture, payload: { ...fixture.payload, totalMicroUsdc: 946 } }),
+    ).toThrow();
+    expect(() =>
+      decodeReceipt({
+        ...fixture,
+        payload: {
+          ...fixture.payload,
+          evidenceRange: { ...fixture.payload.evidenceRange, lastPricingSequence: 3 },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeReceipt({
+        ...fixture,
+        signature: { ...fixture.signature, payloadHash: "f".repeat(64) },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeReceipt({
+        ...fixture,
+        payload: {
+          ...fixture.payload,
+          evidenceRange: {
+            ...fixture.payload.evidenceRange,
+            intervalStart: "2026-08-27T10:59:59.999Z",
+          },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeReceipt({
+        ...fixture,
+        payload: { ...fixture.payload, postings: [correction, posting] },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeReceipt({
+        ...fixture,
+        signature: { ...fixture.signature, signedAt: "2026-08-27T11:59:59.999Z" },
       }),
     ).toThrow();
   });

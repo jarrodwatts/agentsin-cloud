@@ -56,6 +56,17 @@ Recovery completion uses the same wallet-scoped intent. Do not manually clear it
 - A released reservation no longer counts toward the daily total; release only after definitive `notApplied` evidence.
 - A wallet balance is not authoritative spend state. Reconcile the on-chain balance, submitted reservations, withdrawals, direct deposits, and any pending transaction together.
 - Amounts are micro-USDC integers. Reject fractional or floating-point operator input.
+- A low-balance settlement must be `low-balance-paused` before support asks the user to fund it.
+  Confirm the thread workspace still exists. After funding is confirmed, invoke the exact
+  settlement's explicit funding retry; do not create a replacement settlement or release its H4
+  accruals.
+- A `submission-pending` or `reconciliation-required` settlement is not evidence that no transfer
+  occurred. Inspect the original Turnkey activity and Monad transaction identity before any retry.
+- An active billing fence must remain in place while inspection, funding recovery, or authorization
+  rebinding runs. Never clear it manually; successful receipt finalization clears only the exact
+  settlement episode.
+- A `transfer-applied` settlement needs receipt signing/finalization only. Never submit its USDC
+  transfer again.
 
 ## Suspected credential or policy compromise
 

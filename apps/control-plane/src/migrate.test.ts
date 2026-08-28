@@ -1,32 +1,15 @@
-// @effect-diagnostics nodeBuiltinImport:off -- Migration-order test reads the checked-in entrypoint as source.
-import * as NodeFSP from "node:fs/promises";
-
 import { expect, it } from "@effect/vitest";
-import * as Effect from "effect/Effect";
 
-it.effect("runs application migrations in strict 0001 through 0015 order", () =>
-  Effect.gen(function* () {
-    const source = yield* Effect.promise(() =>
-      NodeFSP.readFile(new URL("./migrate.ts", import.meta.url), "utf8"),
-    );
-    const positions = [
-      "0001-",
-      "0002-",
-      "0003-",
-      "0004-",
-      "0005-",
-      "0006-",
-      "0007-",
-      "0008-",
-      "0009-",
-      "0010-",
-      "0011-",
-      "0012-",
-      "0013-",
-      "0014-",
-      "0015-",
-    ].map((marker) => source.indexOf(marker));
-    expect(positions.every((position) => position >= 0)).toBe(true);
-    expect(positions).toEqual([...positions].sort((left, right) => left - right));
-  }),
-);
+import { applicationMigrationFilenames } from "./applicationMigrations.ts";
+
+it("uses a parsed, contiguous, strictly ordered application migration manifest", () => {
+  const versions = applicationMigrationFilenames.map((filename) => Number(filename.slice(0, 4)));
+  expect(versions).toEqual([...versions].sort((left, right) => left - right));
+  expect(new Set(versions).size).toBe(versions.length);
+  expect(versions).toEqual(Array.from({ length: versions.length }, (_, index) => index + 1));
+  expect(applicationMigrationFilenames.slice(-3)).toEqual([
+    "0015-e2b-template-identity.sql",
+    "0016-usage-settlements.sql",
+    "0017-usage-settlement-hardening.sql",
+  ]);
+});
