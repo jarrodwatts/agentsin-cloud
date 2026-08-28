@@ -120,8 +120,8 @@ const statusNumber = (value: unknown, operation: string) =>
       ? Effect.succeed(Number(value))
       : Effect.fail(failure("corruptState", operation, "Valkey returned an invalid status"));
 
-const tuple = (value: unknown, operation: string) =>
-  Array.isArray(value) && value.length === 2
+const tuple = (value: unknown, length: number, operation: string) =>
+  Array.isArray(value) && value.length === length
     ? Effect.succeed(value as ReadonlyArray<unknown>)
     : Effect.fail(failure("corruptState", operation, "Valkey returned an invalid tuple"));
 
@@ -498,7 +498,7 @@ export const makeValkeyEphemeralCoordinationFromClient = (
             String(EPHEMERAL_FENCE_RETENTION_MS),
           ),
         );
-        const response = yield* tuple(raw, "acquire-lease");
+        const response = yield* tuple(raw, 2, "acquire-lease");
         const status = yield* statusNumber(response[0], "acquire-lease");
         if (status === 0) return { acquired: false };
         const stored = yield* decode(StoredLeaseJson, response[1], "acquire-lease");
@@ -547,7 +547,7 @@ export const makeValkeyEphemeralCoordinationFromClient = (
             String(EPHEMERAL_FENCE_RETENTION_MS),
           ),
         );
-        const response = yield* tuple(raw, "heartbeat-lease");
+        const response = yield* tuple(raw, 2, "heartbeat-lease");
         const status = yield* statusNumber(response[0], "heartbeat-lease");
         if (status === 0) return { status: "missing" };
         if (status === -1) return { status: "fenced" };
@@ -602,7 +602,7 @@ export const makeValkeyEphemeralCoordinationFromClient = (
               String(input.policy.windowMs),
             ),
           );
-          const response = yield* tuple(raw, operation);
+          const response = yield* tuple(raw, 3, operation);
           const allowed = (yield* statusNumber(response[0], operation)) === 1;
           const count = yield* statusNumber(response[1], operation);
           const retryAfterMs = Math.max(1, yield* statusNumber(response[2], operation));

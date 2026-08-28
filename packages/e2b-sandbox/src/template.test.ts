@@ -211,6 +211,18 @@ describe("immutable E2B worker image manifest", () => {
     });
   });
 
+  it("keeps the standalone architecture exception explicit and narrow", async () => {
+    const verifier = await NodeFSP.readFile(
+      new URL("../template/verify-provenance.cjs", import.meta.url),
+      "utf8",
+    );
+    expect(verifier).toContain(
+      "oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone image verifier has no Effect runtime.",
+    );
+    expect(verifier.match(/process\.arch/gu)).toHaveLength(1);
+    expect(verifier).not.toContain('require("node:os")');
+  });
+
   it("checks provenance before any remote template build", async () => {
     const buildSource = await NodeFSP.readFile(
       new URL("../template/build.ts", import.meta.url),
