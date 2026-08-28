@@ -45,6 +45,9 @@ jobs:
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
 
+      - name: Check protected worker workflow invariants
+        run: node --test .github/scripts/protected-worker-isolation.test.cjs
+
       - name: Check
         run: vp check
 
@@ -89,7 +92,9 @@ jobs:
         run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' test
 
   test_worker_credential_isolation:
-    name: Test Worker Credential Isolation
+    # Compatibility only. The default-branch-owned pull_request_target workflow
+    # is the authoritative kernel boundary because this job executes PR code.
+    name: Test Worker Isolation Compatibility
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -106,6 +111,38 @@ jobs:
         with:
           node-version-file: package.json
           cache: true
+          run-install: true
+
+      - name: Test unprivileged worker isolation behavior
+        working-directory: apps/worker
+        run: >-
+          vp test run
+          src/ProviderCredentialExecutor.test.ts
+          src/ProviderRuntimeSupervisor.test.ts
+          src/ContainedWorkspace.test.ts
+          src/InspectorPtySandbox.test.ts
+          src/main.test.ts
+
+  test_worker_root_isolation_trusted_main:
+    name: Test Worker Root Isolation (Trusted Main)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup trusted-main Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: false
           run-install: true
 
       - name: Install Bubblewrap security boundary
@@ -127,11 +164,13 @@ jobs:
           AGENTSIN_ROOT_SECURITY_TEST: "1"
           AGENTSIN_ROOT_SECURITY_NODE: /usr/local/lib/agentsin-ci/node
         run: |
-          # setup-vp guarantees this executable, while pnpm is an implementation
-          # detail that is not placed on PATH by every supported runner.
           vp_bin="$(command -v vp)"
           test -n "$vp_bin"
-          sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST="$AGENTSIN_ROOT_SECURITY_TEST" \
+          sudo /usr/bin/env -i \
+            PATH=/usr/local/lib/agentsin-ci:/usr/bin:/bin \
+            HOME=/root \
+            CI=true \
+            AGENTSIN_ROOT_SECURITY_TEST="$AGENTSIN_ROOT_SECURITY_TEST" \
             AGENTSIN_ROOT_SECURITY_NODE="$AGENTSIN_ROOT_SECURITY_NODE" \
             "$vp_bin" test run \
             src/ProviderCredentialExecutor.root.test.ts \
