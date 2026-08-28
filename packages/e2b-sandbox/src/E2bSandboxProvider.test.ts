@@ -135,7 +135,7 @@ const makeHarness = (options?: {
   readonly stderr?: string;
   readonly desktop?: boolean;
   readonly executeFailure?: E2bClientFailure;
-  readonly connectFailure?: E2bClientFailure;
+  readonly resumeFailure?: E2bClientFailure;
   readonly identityReservationFailure?: boolean;
   readonly identityActivationFailure?: boolean;
   readonly reservationFailureUpdateFailure?: boolean;
@@ -168,8 +168,8 @@ const makeHarness = (options?: {
   const lockTails = new Map<string, Promise<void>>();
   let destroyed = false;
   let destroyCalls = 0;
-  let connectCalls = 0;
-  const connectTimeouts: Array<number> = [];
+  let resumeCalls = 0;
+  const resumeTimeouts: Array<number> = [];
   let executeCalls = 0;
   let fileCalls = 0;
   let ptyCalls = 0;
@@ -211,10 +211,10 @@ const makeHarness = (options?: {
       return description;
     },
     inspect: async () => (destroyed ? undefined : description),
-    connect: async (_sandboxId, timeoutMs) => {
-      connectCalls += 1;
-      connectTimeouts.push(timeoutMs);
-      if (options?.connectFailure !== undefined) throw options.connectFailure;
+    resume: async (_sandboxId, timeoutMs) => {
+      resumeCalls += 1;
+      resumeTimeouts.push(timeoutMs);
+      if (options?.resumeFailure !== undefined) throw options.resumeFailure;
       description = { ...description, state: "running" };
       return description;
     },
@@ -521,8 +521,8 @@ const makeHarness = (options?: {
     createInput: () => createInput,
     createCalls: () => createCalls,
     destroyCalls: () => destroyCalls,
-    connectCalls: () => connectCalls,
-    connectTimeouts,
+    resumeCalls: () => resumeCalls,
+    resumeTimeouts,
     executeCalls: () => executeCalls,
     fileCalls: () => fileCalls,
     ptyCalls: () => ptyCalls,
@@ -578,7 +578,7 @@ describe("E2B SandboxProvider", () => {
 
       const threadFailure = yield* Effect.flip(harness.provider.connect(wrongThread));
       expect(threadFailure.code).toBe("E2B_IDENTITY_MISMATCH");
-      expect(harness.connectCalls()).toBe(0);
+      expect(harness.resumeCalls()).toBe(0);
 
       const executeFailure = yield* Effect.flip(
         harness.provider.execute(
@@ -856,7 +856,7 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
-  it.effect("uses the configured active timeout for create, connect, and resume", () =>
+  it.effect("uses the configured active timeout for create and explicit resume", () =>
     Effect.gen(function* () {
       const harness = makeHarness({ activeTimeoutMs: 720_000 });
       const created = yield* harness.provider.create(createRequest);
@@ -873,7 +873,7 @@ describe("E2B SandboxProvider", () => {
         harness.request(SandboxProviderResumeRequest, "resume", { sandboxId }),
       );
 
-      expect(harness.connectTimeouts).toEqual([720_000, 720_000]);
+      expect(harness.resumeTimeouts).toEqual([720_000]);
     }),
   );
 
@@ -891,7 +891,7 @@ describe("E2B SandboxProvider", () => {
         harness.request(SandboxProviderResumeRequest, "resume", { sandboxId }),
       );
       expect(resumed.sandbox.state).toBe("ready");
-      expect(harness.connectTimeouts).toEqual([900_000]);
+      expect(harness.resumeTimeouts).toEqual([900_000]);
       const ports = yield* harness.provider.ports(
         harness.request(SandboxProviderPortsRequest, "ports", { sandboxId }),
       );
@@ -927,7 +927,23 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
-  it.effect("does not implicitly resume a paused sandbox for running-only operations", () =>
+  it.effect("connects to a ready sandbox without using the resume primitive", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const created = yield* harness.provider.create(createRequest);
+      const connected = yield* harness.provider.connect(
+        harness.request(SandboxProviderConnectRequest, "connect", {
+          sandboxId: created.sandbox.sandboxId,
+        }),
+      );
+
+      expect(connected.connection.endpoint).toBe("https://sandbox-1.e2b.app");
+      expect(connected.connection.credentialRef).toBe("secret-broker/e2b/sandbox-1");
+      expect(harness.resumeCalls()).toBe(0);
+    }),
+  );
+
+  it.effect("rejects a paused sandbox connection without using the resume primitive", () =>
     Effect.gen(function* () {
       const harness = makeHarness();
       const created = yield* harness.provider.create(createRequest);
@@ -937,19 +953,13 @@ describe("E2B SandboxProvider", () => {
         harness.request(SandboxProviderPauseRequest, "pause", { sandboxId }),
       );
       const failure = yield* Effect.flip(
-        harness.provider.ports(
-          harness.request(SandboxProviderPortsRequest, "ports", { sandboxId }),
+        harness.provider.connect(
+          harness.request(SandboxProviderConnectRequest, "connect", { sandboxId }),
         ),
       );
 
       expect(failure.code).toBe("E2B_SANDBOX_PAUSED");
-      expect(harness.connectCalls()).toBe(0);
-      const connected = yield* harness.provider.connect(
-        harness.request(SandboxProviderConnectRequest, "connect", { sandboxId }),
-      );
-      expect(harness.connectCalls()).toBe(1);
-      expect(harness.connectTimeouts).toEqual([900_000]);
-      expect(connected.connection.credentialRef).toBe("secret-broker/e2b/sandbox-1");
+      expect(harness.resumeCalls()).toBe(0);
     }),
   );
 
@@ -1047,14 +1057,14 @@ describe("E2B SandboxProvider", () => {
         ),
       );
       expect(failure).toMatchObject({ code: "E2B_RECONCILIATION_REQUIRED", retryable: false });
-      expect(harness.connectCalls()).toBe(0);
+      expect(harness.resumeCalls()).toBe(0);
     }),
   );
 
   it.effect("returns typed sanitized upstream failures", () =>
     Effect.gen(function* () {
       const harness = makeHarness({
-        connectFailure: new E2bClientFailure({
+        resumeFailure: new E2bClientFailure({
           code: "unavailable",
           message: "E2B connect failed",
           retryable: true,
@@ -1062,8 +1072,8 @@ describe("E2B SandboxProvider", () => {
       });
       const created = yield* harness.provider.create(createRequest);
       const failure = yield* Effect.flip(
-        harness.provider.connect(
-          harness.request(SandboxProviderConnectRequest, "connect", {
+        harness.provider.resume(
+          harness.request(SandboxProviderResumeRequest, "resume", {
             sandboxId: created.sandbox.sandboxId,
           }),
         ),
@@ -1072,7 +1082,7 @@ describe("E2B SandboxProvider", () => {
         code: "E2B_UNAVAILABLE",
         message: "E2B connect failed",
         retryable: true,
-        details: { operation: "connect" },
+        details: { operation: "resume" },
       });
     }),
   );

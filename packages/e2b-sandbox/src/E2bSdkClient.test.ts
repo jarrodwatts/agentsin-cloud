@@ -448,7 +448,7 @@ describe("E2B SDK client", () => {
       }),
     });
 
-    await expect(client.connect("sandbox-1", 900_000)).rejects.toMatchObject({
+    await expect(client.resume("sandbox-1", 900_000)).rejects.toMatchObject({
       code: "unavailable",
       message: "E2B credential sealing failed after resume; the sandbox was paused",
     });
@@ -516,7 +516,7 @@ describe("E2B SDK client", () => {
       }),
     });
     const resumeFailure = await resumeClient
-      .connect("sandbox-1", 900_000)
+      .resume("sandbox-1", 900_000)
       .catch((cause: unknown) => cause);
     expect(resumeFailure).toMatchObject({
       code: "unavailable",

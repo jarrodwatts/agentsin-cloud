@@ -184,7 +184,8 @@ export class E2bClientFailure extends Error {
 export interface E2bClient {
   readonly create: (input: E2bCreateInput) => Promise<E2bSandboxDescription>;
   readonly inspect: (sandboxId: string) => Promise<E2bSandboxDescription | undefined>;
-  readonly connect: (sandboxId: string, timeoutMs: number) => Promise<E2bSandboxDescription>;
+  /** Explicitly resumes a paused sandbox. Never use this for passive client attachment. */
+  readonly resume: (sandboxId: string, timeoutMs: number) => Promise<E2bSandboxDescription>;
   readonly execute: (
     sandboxId: string,
     input: E2bExecuteInput,

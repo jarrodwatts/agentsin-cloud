@@ -14,6 +14,7 @@ import { WebSocket } from "ws";
 
 import { makeCloudRpc } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
+import { CloudThreadLifecycleError } from "./cloudThreadLifecycle.ts";
 import { DEFAULT_INSPECTOR_BRIDGE_LIMITS, type InspectorBridge } from "./inspectorBridge.ts";
 import type { ControlPlaneAuth } from "./http.ts";
 import type { ThreadEventStoreService } from "./threadEventStore.ts";
@@ -205,6 +206,72 @@ it.effect("authenticates upgrades and enforces the native max-payload boundary",
       });
       oversized.send("x".repeat(257));
       expect(yield* Effect.promise(() => closed)).toBe(1009);
+    }),
+  ),
+);
+
+it.effect("closes a subscription when a remotely paused thread rejects passive reconnect", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const server = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeHttp.createServer((_request, response) => response.end())),
+        closeServer,
+      );
+      let connectCalls = 0;
+      const rpc = makeCloudRpc({
+        auth,
+        hostedOrigin: "https://control.example.com",
+        workspaces,
+        eventStore,
+        lifecycle: {
+          createThread: () => Effect.die("not used"),
+          connectThread: () => {
+            connectCalls += 1;
+            return Effect.fail(
+              new CloudThreadLifecycleError({
+                code: "dependencyFailure",
+                retryable: false,
+                cause: {
+                  code: "E2B_SANDBOX_PAUSED",
+                  message: "Resume the E2B sandbox before connecting",
+                  retryable: false,
+                },
+              }),
+            );
+          },
+        },
+      });
+      const attachment = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          attachCloudRpcWebSocket({
+            server,
+            rpc,
+            baseUrl: new URL("https://control.example.com"),
+            authenticationTimeoutMs: 1_000,
+          }),
+        ),
+        (attachment) => Effect.sync(attachment.detach),
+      );
+      void attachment;
+      yield* listen(server);
+      const address = server.address();
+      if (address === null || typeof address === "string") return yield* Effect.die("no address");
+      const socket = yield* open(`ws://127.0.0.1:${address.port}/api/v1/thread-events`);
+      const closed = new Promise<{ readonly code: number; readonly reason: string }>((resolve) => {
+        socket.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+      });
+
+      socket.send(
+        encodeSubscribe({
+          protocolVersion: 1,
+          type: "subscribe",
+          threadId,
+          afterSequence: -1,
+        }),
+      );
+
+      expect(yield* Effect.promise(() => closed)).toEqual({ code: 4500, reason: "internalError" });
+      expect(connectCalls).toBe(1);
     }),
   ),
 );

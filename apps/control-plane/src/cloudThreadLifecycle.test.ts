@@ -10,6 +10,7 @@ import {
   EnvironmentRevision,
   type EnvironmentRevisionId,
   type SandboxProvider,
+  type SandboxProviderError,
   type SandboxProviderSandbox,
   type WorkspaceId,
 } from "@t3tools/contracts/cloud";
@@ -347,12 +348,15 @@ const makeHarness = () => {
   const lifecycle = new InMemoryLifecycleStore();
   const clock = new MutableClock();
   let createCalls = 0;
+  let connectCalls = 0;
+  let resumeCalls = 0;
   let destroyCalls = 0;
   let bootstrapCalls = 0;
   let startCalls = 0;
   let routeFenceCalls = 0;
   let inspectStatus: "running" | "absent" | "unknown" = "absent";
   let createFailure: { code: string; retryable: boolean } | undefined;
+  let connectFailure: SandboxProviderError | undefined;
   let bootstrapFailure: CloudThreadLifecycleDependencyError | undefined;
   let startFailure: CloudThreadLifecycleDependencyError | undefined;
   let routeFenceFailure: CloudThreadLifecycleDependencyError | undefined;
@@ -442,15 +446,19 @@ const makeHarness = () => {
               : true,
         }),
       }),
-    connect: (request) =>
-      Effect.succeed({
-        type: "connected" as const,
-        requestId: request.requestId,
-        workspaceId,
-        sandboxId: request.sandboxId,
-        connection: { transport: "http" as const, endpoint: "https://sandbox.example" },
-        completedAt: NOW,
-      }),
+    connect: (request) => {
+      connectCalls += 1;
+      return connectFailure === undefined
+        ? Effect.succeed({
+            type: "connected" as const,
+            requestId: request.requestId,
+            workspaceId,
+            sandboxId: request.sandboxId,
+            connection: { transport: "http" as const, endpoint: "https://sandbox.example" },
+            completedAt: NOW,
+          })
+        : Effect.fail(connectFailure);
+    },
     destroy: (request) => {
       compensationOrder.push("destroy");
       destroyCalls += 1;
@@ -467,7 +475,10 @@ const makeHarness = () => {
     files: () => Effect.die("unused"),
     pty: () => Effect.die("unused"),
     pause: () => Effect.die("unused"),
-    resume: () => Effect.die("unused"),
+    resume: () => {
+      resumeCalls += 1;
+      return Effect.die("unused");
+    },
     snapshot: () => Effect.die("unused"),
     desktop: () => Effect.die("unused"),
     ports: () => Effect.die("unused"),
@@ -638,10 +649,21 @@ const makeHarness = () => {
     lifecycle,
     clock,
     reservations,
-    counts: () => ({ createCalls, destroyCalls, bootstrapCalls, startCalls, routeFenceCalls }),
+    counts: () => ({
+      createCalls,
+      connectCalls,
+      resumeCalls,
+      destroyCalls,
+      bootstrapCalls,
+      startCalls,
+      routeFenceCalls,
+    }),
     compensationOrder: () => compensationOrder,
     setCreateFailure: (failure: { code: string; retryable: boolean }) => {
       createFailure = failure;
+    },
+    setConnectFailure: (failure: SandboxProviderError) => {
+      connectFailure = failure;
     },
     setBootstrapFailure: (failure: CloudThreadLifecycleDependencyError) => {
       bootstrapFailure = failure;
@@ -940,6 +962,30 @@ it.effect("replays durable events to an authenticated desktop connection", () =>
     expect(connected.replay.events).toHaveLength(1);
     expect(connected.replayCursor).toBe(0);
     expect(connected.connection.endpoint).toBe("https://sandbox.example");
+  }),
+);
+
+it.effect("does not resume a remotely paused sandbox during desktop reconnect", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    yield* harness.service.createThread("user-1", createInput());
+    harness.setConnectFailure({
+      code: "E2B_SANDBOX_PAUSED",
+      message: "Resume the E2B sandbox before connecting",
+      retryable: false,
+    });
+
+    const result = yield* Effect.result(harness.service.connectThread("user-1", threadId, -1));
+
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(result.failure).toMatchObject({
+        code: "dependencyFailure",
+        retryable: false,
+        cause: { code: "E2B_SANDBOX_PAUSED" },
+      });
+    }
+    expect(harness.counts()).toMatchObject({ connectCalls: 1, resumeCalls: 0 });
   }),
 );
 

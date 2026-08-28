@@ -175,7 +175,7 @@ const makeClient = (options?: {
     };
   },
   inspect: async () => options?.remote?.(),
-  connect: async () => {
+  resume: async () => {
     const remote = options?.remote?.();
     if (remote === undefined) throw new Error("sandbox missing");
     return remote;

@@ -812,8 +812,8 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
           throw error;
         }
       }),
-    connect: (sandboxId, timeoutMs) =>
-      safe("connect", () => connectAndDescribe(sandboxId, timeoutMs)),
+    resume: (sandboxId, timeoutMs) =>
+      safe("resume", () => connectAndDescribe(sandboxId, timeoutMs)),
     execute: (sandboxId, input, output, activeTimeoutMs) =>
       safe("execute", async (): Promise<E2bExecutionResult> => {
         const user = options.operationUser;

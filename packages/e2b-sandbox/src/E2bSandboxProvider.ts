@@ -586,15 +586,7 @@ export const makeE2bSandboxProvider = (
       }),
     connect: (request) =>
       Effect.gen(function* () {
-        const { identity } = yield* getActive(request);
-        const remote = yield* attempt("connect", () =>
-          dependencies.client.connect(identity.providerHandle, activeTimeoutMs),
-        );
-        if (!e2bDescriptionMatchesIdentity(remote, identity)) {
-          return yield* Effect.fail(
-            error("E2B_IDENTITY_MISMATCH", "Connected E2B sandbox metadata changed", false),
-          );
-        }
+        const { remote } = yield* getRunning(request);
         if (remote.sandboxDomain === undefined) {
           return yield* Effect.fail(
             error("E2B_UNAVAILABLE", "E2B did not return a sandbox connection endpoint", true),
@@ -642,7 +634,7 @@ export const makeE2bSandboxProvider = (
       Effect.gen(function* () {
         const { identity } = yield* getActive(request);
         const remote = yield* attempt("resume", () =>
-          dependencies.client.connect(identity.providerHandle, activeTimeoutMs),
+          dependencies.client.resume(identity.providerHandle, activeTimeoutMs),
         );
         if (!e2bDescriptionMatchesIdentity(remote, identity)) {
           return yield* Effect.fail(
