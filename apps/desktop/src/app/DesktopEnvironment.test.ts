@@ -68,6 +68,9 @@ describe("DesktopEnvironment", () => {
       assert.equal(environment.serverRoot, "/repo");
       assert.equal(environment.backendEntryPath, "/repo/apps/server/dist/bin.mjs");
       assert.equal(environment.backendCwd, "/repo");
+      assert.equal(environment.branding.baseName, "Agents in Cloud");
+      assert.equal(environment.branding.stageLabel, "Dev");
+      assert.equal(environment.displayName, "Agents in Cloud (Dev)");
       assert.equal(environment.appUserModelId, "com.t3tools.t3code.dev");
       assert.equal(environment.linuxWmClass, "t3code-dev");
       assert.deepEqual(
