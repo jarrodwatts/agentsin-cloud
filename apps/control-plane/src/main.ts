@@ -533,9 +533,35 @@ export interface HostedProductionDependencies extends WorkerProductionDependenci
   readonly e2b: Omit<HostedE2bProviderDependencies, "config" | "database" | "ptyOwnerId" | "sdk">;
   readonly cloudThreadLifecycle: Omit<
     CloudThreadLifecycleDependencies,
-    "workspaces" | "threadEvents" | "lifecycle" | "sandbox" | "reservations" | "clock"
+    | "workspaces"
+    | "threadEvents"
+    | "lifecycle"
+    | "sandbox"
+    | "reservations"
+    | "workerRoutes"
+    | "clock"
   >;
 }
+
+export const makeCloudThreadRecoveryLoop = (
+  recoverPending: () => Effect.Effect<number, unknown>,
+  minimumDelayMs = 5_000,
+  failureDelayMs = 30_000,
+): Effect.Effect<never, never> => {
+  const loop = (): Effect.Effect<never, never> =>
+    Effect.suspend(() =>
+      recoverPending().pipe(
+        Effect.flatMap((recovered) => Effect.sleep(recovered >= 25 ? 100 : minimumDelayMs)),
+        Effect.catch((cause) =>
+          Effect.logError("Cloud thread lifecycle recovery failed", cause).pipe(
+            Effect.andThen(Effect.sleep(failureDelayMs)),
+          ),
+        ),
+        Effect.andThen(loop()),
+      ),
+    );
+  return loop();
+};
 
 export const makeProgram = (production: HostedProductionDependencies) =>
   Effect.gen(function* () {
@@ -625,8 +651,38 @@ export const makeProgram = (production: HostedProductionDependencies) =>
           inspectE2bReservation(database.pool, workspaceId, reservationId),
       },
       workerGateway: makeMaterializingWorkerGateway(e2b, upstreamWorkerGateway),
+      workerRoutes: worker.routeLifecycle,
       clock: { now: () => DateTime.toDate(DateTime.nowUnsafe()) },
     });
+    worker.bindLifecycleRecovery((identity, confirmedEventCursor) =>
+      threadLifecycle
+        .reconnectVerifiedWorker(
+          {
+            generation: identity.reservationId,
+            workspaceId: identity.workspaceId,
+            environmentId: identity.environmentId,
+            environmentRevisionId: identity.environmentRevisionId,
+            threadId: identity.threadId,
+            sandboxId: identity.sandboxId,
+            workerId: identity.workerId,
+            providerInstanceId: identity.providerInstanceId,
+            providerDriver: identity.providerDriver,
+          },
+          confirmedEventCursor,
+        )
+        .pipe(
+          Effect.map(({ commands }) => commands),
+          Effect.mapError(
+            (cause) =>
+              new WorkerRelayServerError({
+                code: cause.code === "staleWorker" ? "leaseFenced" : "internal",
+                operation: "recover-cloud-thread-lifecycle",
+                cause,
+              }),
+          ),
+        ),
+    );
+    yield* Effect.forkScoped(makeCloudThreadRecoveryLoop(() => threadLifecycle.recoverPending()));
     const desktopControl = makeDesktopLeaseService({
       repository: makePostgresDesktopLeaseRepository(database.pool),
       routes: worker.relay.routes,

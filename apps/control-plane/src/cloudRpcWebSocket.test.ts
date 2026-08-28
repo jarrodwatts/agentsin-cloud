@@ -138,11 +138,20 @@ it.effect("authenticates upgrades and enforces the native max-payload boundary",
         Effect.sync(() => NodeHttp.createServer((_request, response) => response.end())),
         closeServer,
       );
+      const lifecycleConnects: Array<{ userId: string; afterSequence: number }> = [];
       const rpc = makeCloudRpc({
         auth,
         hostedOrigin: "https://control.example.com",
         workspaces,
         eventStore,
+        lifecycle: {
+          createThread: () => Effect.die("not used"),
+          connectThread: (userId, routedThread, afterSequence) => {
+            if (routedThread !== threadId) return Effect.die("unexpected thread");
+            lifecycleConnects.push({ userId, afterSequence });
+            return Effect.succeed({});
+          },
+        },
         limits: { maxFrameBytes: 256 },
       });
       const attachment = yield* Effect.acquireRelease(
@@ -187,6 +196,7 @@ it.effect("authenticates upgrades and enforces the native max-payload boundary",
       );
       const caughtUp = yield* receive(caughtUpReceipt);
       expect(caughtUp).toMatchObject({ type: "caughtUp", lastSequence: -1 });
+      expect(lifecycleConnects).toEqual([{ userId: "user-1", afterSequence: -1 }]);
       socket.close(1000, "complete");
 
       const oversized = yield* open(url);

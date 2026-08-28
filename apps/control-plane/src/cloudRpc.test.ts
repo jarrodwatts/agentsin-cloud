@@ -335,6 +335,7 @@ it.effect("routes authenticated hosted thread creation into the production lifec
           replayCursor: -1,
         });
       },
+      connectThread: () => Effect.die("connect is exercised by the WebSocket suite"),
     },
   });
   return Effect.gen(function* () {

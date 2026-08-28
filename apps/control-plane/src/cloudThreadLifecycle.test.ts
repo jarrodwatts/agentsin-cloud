@@ -889,6 +889,32 @@ it.effect("replays authoritative state to an mTLS-authenticated worker reconnect
   }),
 );
 
+it.effect("reuses the same lifecycle replay for the relay-authenticated recovery principal", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    yield* harness.service.createThread("user-1", createInput());
+    const current = (yield* Effect.promise(() =>
+      harness.lifecycle.getCurrent(workspaceId, threadId),
+    ))!;
+    const reconnected = yield* harness.service.reconnectVerifiedWorker(
+      {
+        generation: current.attemptId,
+        workspaceId,
+        environmentId,
+        environmentRevisionId: revisionId,
+        threadId,
+        sandboxId: current.sandboxId!,
+        workerId: current.workerId!,
+        providerInstanceId,
+        providerDriver: revision.blueprint.providerInstances[0]!.driver,
+      },
+      -1,
+    );
+    expect(reconnected.commands).toEqual([]);
+    expect(reconnected.replay.events).toHaveLength(1);
+  }),
+);
+
 it.effect("rejects an unverified worker credential before reading tenant state", () =>
   Effect.gen(function* () {
     const harness = makeHarness();

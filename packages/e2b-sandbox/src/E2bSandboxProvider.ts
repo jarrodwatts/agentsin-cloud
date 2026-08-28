@@ -1,4 +1,5 @@
 import * as NodeCrypto from "node:crypto";
+import * as NodePath from "node:path";
 
 import type {
   SandboxProvider,
@@ -73,6 +74,19 @@ const sha256 = (value: string | Uint8Array) =>
 
 const iso = (date: Date) => date.toISOString();
 const dateFromIso = (value: string) => DateTime.toDate(DateTime.makeUnsafe(value));
+
+const confinedPath = (workspaceDirectory: string, candidate: string | undefined) => {
+  const root = NodePath.posix.resolve(workspaceDirectory);
+  const resolved = NodePath.posix.resolve(root, candidate ?? ".");
+  if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+    throw new E2bClientFailure({
+      code: "invalidRequest",
+      message: "Sandbox operation path must remain inside the thread workspace",
+      retryable: false,
+    });
+  }
+  return resolved;
+};
 
 const inlineFileContent = (bytes: Uint8Array) => {
   try {
@@ -193,6 +207,7 @@ export const makeE2bSandboxProvider = (
     readonly sandboxId: SandboxIdentityRecord["sandboxId"];
     readonly workspaceId: SandboxIdentityRecord["workspaceId"];
     readonly environmentId: SandboxIdentityRecord["environmentId"];
+    readonly threadId: SandboxIdentityRecord["threadId"];
   }) =>
     Effect.gen(function* () {
       const lookup = yield* attempt("identity lookup", () =>
@@ -217,7 +232,8 @@ export const makeE2bSandboxProvider = (
         identity.provider !== "e2b" ||
         identity.sandboxId !== request.sandboxId ||
         identity.workspaceId !== request.workspaceId ||
-        identity.environmentId !== request.environmentId
+        identity.environmentId !== request.environmentId ||
+        identity.threadId !== request.threadId
       ) {
         return yield* Effect.fail(
           error("E2B_IDENTITY_MISMATCH", "E2B sandbox identity does not match the request", false),
@@ -230,6 +246,7 @@ export const makeE2bSandboxProvider = (
     readonly sandboxId: SandboxIdentityRecord["sandboxId"];
     readonly workspaceId: SandboxIdentityRecord["workspaceId"];
     readonly environmentId: SandboxIdentityRecord["environmentId"];
+    readonly threadId: SandboxIdentityRecord["threadId"];
   }) =>
     Effect.gen(function* () {
       const identity = yield* getIdentity(request);
@@ -663,6 +680,10 @@ export const makeE2bSandboxProvider = (
     execute: (request) =>
       Effect.gen(function* () {
         const { identity } = yield* getRunning(request);
+        const cwd = yield* Effect.try({
+          try: () => confinedPath(identity.workspaceDirectory, request.cwd),
+          catch: (cause) => mapFailure("execute path validation", cause),
+        });
         const startedAt = iso(dependencies.clock.now());
         const output = yield* attempt("artifact open", () => openExecutionWriters(request));
         const result = yield* attempt("execute", async () => {
@@ -672,7 +693,7 @@ export const makeE2bSandboxProvider = (
               {
                 command: request.command,
                 arguments: request.arguments,
-                ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+                cwd,
                 ...(request.environment === undefined ? {} : { environment: request.environment }),
                 ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
               },
@@ -702,10 +723,17 @@ export const makeE2bSandboxProvider = (
     files: (request) =>
       Effect.gen(function* () {
         const { identity } = yield* getRunning(request);
+        const operation = yield* Effect.try({
+          try: () => ({
+            ...request.operation,
+            path: confinedPath(identity.workspaceDirectory, request.operation.path),
+          }),
+          catch: (cause) => mapFailure("file path validation", cause),
+        });
         const result = yield* attempt("files", () =>
           dependencies.client.files(
             identity.providerHandle,
-            request.operation,
+            operation,
             {
               maxReadBytes: maxInlineFileBytes,
               maxListEntries,
@@ -763,6 +791,16 @@ export const makeE2bSandboxProvider = (
     pty: (request) =>
       Effect.gen(function* () {
         const { identity } = yield* getRunning(request);
+        const operation = yield* Effect.try({
+          try: () =>
+            request.operation.type === "open"
+              ? {
+                  ...request.operation,
+                  cwd: confinedPath(identity.workspaceDirectory, request.operation.cwd),
+                }
+              : request.operation,
+          catch: (cause) => mapFailure("PTY path validation", cause),
+        });
         const output =
           request.operation.type === "open"
             ? yield* attempt("PTY artifact open", () => openPtyWriter(request))
@@ -771,7 +809,7 @@ export const makeE2bSandboxProvider = (
           try {
             return await dependencies.client.pty(
               identity.providerHandle,
-              request.operation,
+              operation,
               activeTimeoutMs,
               output,
             );

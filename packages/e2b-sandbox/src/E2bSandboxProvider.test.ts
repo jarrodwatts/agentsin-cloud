@@ -495,6 +495,7 @@ const makeHarness = (options?: {
       requestId: `command-${type}`,
       workspaceId: createRequest.workspaceId,
       environmentId: createRequest.environmentId,
+      threadId: createRequest.workspace.threadId,
       requestedAt: NOW,
       ...fields,
     }) as S["Type"];
@@ -548,6 +549,34 @@ const makeHarness = (options?: {
 };
 
 describe("E2B SandboxProvider", () => {
+  it.effect("rejects a different thread and paths outside its workspace before execution", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const created = yield* harness.provider.create(createRequest);
+      const wrongThread = harness.request(SandboxProviderConnectRequest, "connect", {
+        sandboxId: created.sandbox.sandboxId,
+        threadId: "thread-other",
+      });
+
+      const threadFailure = yield* Effect.flip(harness.provider.connect(wrongThread));
+      expect(threadFailure.code).toBe("E2B_IDENTITY_MISMATCH");
+      expect(harness.connectCalls()).toBe(0);
+
+      const traversalFailure = yield* Effect.flip(
+        harness.provider.execute(
+          harness.request(SandboxProviderExecuteRequest, "execute", {
+            sandboxId: created.sandbox.sandboxId,
+            command: "pwd",
+            arguments: [],
+            cwd: "../outside",
+          }),
+        ),
+      );
+      expect(traversalFailure.code).toBe("E2B_INVALID_REQUEST");
+      expect(harness.executeCalls()).toBe(0);
+    }),
+  );
+
   it.effect("creates only from an immutable E2B build and records provider identity", () =>
     Effect.gen(function* () {
       const assignments: Array<{ readonly target: string; readonly tag: string }> = [];
@@ -726,6 +755,8 @@ describe("E2B SandboxProvider", () => {
         }),
       };
       const client = makeE2bSdkClient({
+        operationUser: "agentsin-agent",
+        inspectorUser: "agentsin-inspector",
         apiKey: "test-api-key",
         sdk,
         trafficCredentials: {

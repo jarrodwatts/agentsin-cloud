@@ -15,5 +15,12 @@ describe("0015 immutable E2B template identity migration", () => {
     expect(migration).toContain("provider_template_id SET NOT NULL");
     expect(migration).toContain("provider_build_id SET NOT NULL");
     expect(migration).toContain("cloud_e2b_provider_build_id_format");
+    expect(migration).toContain("format_type(atttypid, atttypmod)");
+    expect(migration).toContain("attnotnull");
+    expect(migration).toContain("contype::text");
+    expect(migration).toContain("convalidated");
+    expect(migration).toContain("regexp_replace(pg_get_constraintdef(oid)");
+    expect(migration).toContain("constraint_definition <> expected_definition");
+    expect(migration).toContain("USING ERRCODE = '23000'");
   });
 });

@@ -3,16 +3,19 @@ import { WorkerCertificateBootstrapRequest } from "@t3tools/contracts/worker";
 import type { ThreadId } from "@t3tools/contracts";
 import type { SandboxId, WorkspaceId } from "@t3tools/contracts/cloud";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import { Pool } from "pg";
 
 import { type ControlPlaneConfigShape } from "./config.ts";
 import { type DatabaseService } from "./database.ts";
 import { makeMemoryEphemeralCoordination } from "./ephemeralCoordination.ts";
-import { makeApplication } from "./main.ts";
+import { makeApplication, makeCloudThreadRecoveryLoop } from "./main.ts";
 import { type ThreadEventStoreService } from "./threadEventStore.ts";
 import {
   makeWorkerControlPlaneRuntime,
+  makeLifecycleWorkerRecoveryBridge,
   type WorkerProductionDependencies,
 } from "./workerProduction.ts";
 import { WorkerRelayServerError } from "./workerRelay.ts";
@@ -84,6 +87,54 @@ const workerProduction: WorkerProductionDependencies = {
     tokenVault: {} as WorkerProductionDependencies["github"]["tokenVault"],
   },
 };
+
+it.effect("binds relay recovery to the authenticated cloud lifecycle identity", () => {
+  const bridge = makeLifecycleWorkerRecoveryBridge({
+    handleOutbound: workerProduction.recovery.handleOutbound,
+    claimCommand: workerProduction.recovery.claimCommand,
+  });
+  const identity = { reservationId: "attempt-1" } as never;
+  let observed: unknown;
+  bridge.bind((received, cursor) => {
+    observed = { received, cursor };
+    return Effect.succeed([]);
+  });
+  return Effect.gen(function* () {
+    expect(
+      (yield* Effect.exit(bridge.source.recover(identity, { confirmedEventCursor: 7 })))._tag,
+    ).toBe("Success");
+    expect(observed).toEqual({ received: identity, cursor: 7 });
+  });
+});
+
+it.effect("backs off a crashed lifecycle recovery drain and resumes it", () =>
+  Effect.gen(function* () {
+    let calls = 0;
+    const running = yield* Effect.forkChild(
+      makeCloudThreadRecoveryLoop(
+        () =>
+          Effect.sync(() => {
+            calls += 1;
+            return calls;
+          }).pipe(
+            Effect.flatMap((attempt) =>
+              attempt === 1 ? Effect.fail("database unavailable") : Effect.succeed(0),
+            ),
+          ),
+        10,
+        30,
+      ),
+      { startImmediately: true },
+    );
+    yield* Effect.yieldNow;
+    expect(calls).toBe(1);
+    yield* TestClock.adjust("29 millis");
+    expect(calls).toBe(1);
+    yield* TestClock.adjust("1 millis");
+    expect(calls).toBe(2);
+    yield* Fiber.interrupt(running);
+  }).pipe(Effect.provide(TestClock.layer())),
+);
 
 it.effect("wires auth, services, and HTTP routes without opening a listener", () =>
   Effect.scoped(

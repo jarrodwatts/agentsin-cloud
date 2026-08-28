@@ -94,7 +94,13 @@ const prepareMigratedDatabase = async (pool: Pool) => {
   if (routeBindingMigration === undefined) {
     throw new Error("0009 GitHub worker route binding migration is missing");
   }
-  return { migrations, routeBindingMigration };
+  const e2bIdentityMigration = migrations.find(
+    ({ filename }) => filename === "0015-e2b-template-identity.sql",
+  );
+  if (e2bIdentityMigration === undefined) {
+    throw new Error("0015 E2B template identity migration is missing");
+  }
+  return { migrations, routeBindingMigration, e2bIdentityMigration };
 };
 
 const readRouteConstraintState = async (pool: Pool) =>
@@ -220,6 +226,77 @@ it.effect("fails closed for a wrong-type same-name route binding constraint", ()
       pool,
       routeBindingMigration,
       "github_worker_token_lease_route_binding_required",
+    );
+  }),
+);
+
+const expectE2bReplayRejected = async (
+  pool: Pool,
+  migration: ApplicationMigration,
+  message: string,
+) => {
+  await expect(pool.query(migration.sql)).rejects.toMatchObject({
+    code: "23000",
+    message: expect.stringContaining(message),
+  });
+  await pool.query("ROLLBACK");
+};
+
+it.effect("fails closed for a weakened same-name E2B build check", () =>
+  withPostgres(async (pool) => {
+    const { e2bIdentityMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE cloud_e2b_sandbox_identity
+      DROP CONSTRAINT cloud_e2b_provider_build_id_format,
+      ADD CONSTRAINT cloud_e2b_provider_build_id_format CHECK (true)`);
+    await expectE2bReplayRejected(
+      pool,
+      e2bIdentityMigration,
+      "cloud_e2b_provider_build_id_format does not match",
+    );
+  }),
+);
+
+it.effect("fails closed for an unvalidated E2B build check", () =>
+  withPostgres(async (pool) => {
+    const { e2bIdentityMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE cloud_e2b_sandbox_identity
+      DROP CONSTRAINT cloud_e2b_provider_build_id_format,
+      ADD CONSTRAINT cloud_e2b_provider_build_id_format CHECK (
+        provider_build_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      ) NOT VALID`);
+    await expectE2bReplayRejected(
+      pool,
+      e2bIdentityMigration,
+      "cloud_e2b_provider_build_id_format does not match",
+    );
+  }),
+);
+
+it.effect("fails closed for a wrong-type same-name E2B build constraint", () =>
+  withPostgres(async (pool) => {
+    const { e2bIdentityMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE cloud_e2b_sandbox_identity
+      DROP CONSTRAINT cloud_e2b_provider_build_id_format,
+      ADD CONSTRAINT cloud_e2b_provider_build_id_format UNIQUE (provider_build_id)`);
+    await expectE2bReplayRejected(
+      pool,
+      e2bIdentityMigration,
+      "cloud_e2b_provider_build_id_format does not match",
+    );
+  }),
+);
+
+it.effect("fails closed when an E2B provider identity column drifts from text", () =>
+  withPostgres(async (pool) => {
+    const { e2bIdentityMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE cloud_e2b_sandbox_identity
+      DROP CONSTRAINT cloud_e2b_provider_build_id_format,
+      ALTER COLUMN provider_build_id DROP NOT NULL,
+      ALTER COLUMN provider_build_id TYPE varchar(64)`);
+    await expectE2bReplayRejected(
+      pool,
+      e2bIdentityMigration,
+      "provider identity columns have unexpected types",
     );
   }),
 );

@@ -415,6 +415,12 @@ const SandboxProviderRequestBaseFields = {
   requestedAt: IsoDateTime,
 } as const;
 
+const SandboxProviderExistingSandboxRequestFields = {
+  ...SandboxProviderRequestBaseFields,
+  threadId: ThreadId,
+  sandboxId: SandboxId,
+} as const;
+
 export const SandboxProviderCreateRequest = Schema.Struct({
   type: Schema.Literal("create"),
   ...SandboxProviderRequestBaseFields,
@@ -439,15 +445,13 @@ export type SandboxProviderCreateRequest = typeof SandboxProviderCreateRequest.T
 
 export const SandboxProviderConnectRequest = Schema.Struct({
   type: Schema.Literal("connect"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
 });
 export type SandboxProviderConnectRequest = typeof SandboxProviderConnectRequest.Type;
 
 export const SandboxProviderExecuteRequest = Schema.Struct({
   type: Schema.Literal("execute"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
   command: TrimmedNonEmptyString,
   arguments: Schema.Array(Schema.String),
   cwd: Schema.optionalKey(TrimmedNonEmptyString),
@@ -475,8 +479,7 @@ export type SandboxProviderFileOperation = typeof SandboxProviderFileOperation.T
 
 export const SandboxProviderFilesRequest = Schema.Struct({
   type: Schema.Literal("files"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
   operation: SandboxProviderFileOperation,
 });
 export type SandboxProviderFilesRequest = typeof SandboxProviderFilesRequest.Type;
@@ -506,58 +509,50 @@ export type SandboxProviderPtyOperation = typeof SandboxProviderPtyOperation.Typ
 
 export const SandboxProviderPtyRequest = Schema.Struct({
   type: Schema.Literal("pty"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
   operation: SandboxProviderPtyOperation,
 });
 export type SandboxProviderPtyRequest = typeof SandboxProviderPtyRequest.Type;
 
 export const SandboxProviderPauseRequest = Schema.Struct({
   type: Schema.Literal("pause"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
 });
 export type SandboxProviderPauseRequest = typeof SandboxProviderPauseRequest.Type;
 export const SandboxProviderResumeRequest = Schema.Struct({
   type: Schema.Literal("resume"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
 });
 export type SandboxProviderResumeRequest = typeof SandboxProviderResumeRequest.Type;
 export const SandboxProviderDestroyRequest = Schema.Struct({
   type: Schema.Literal("destroy"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
 });
 export type SandboxProviderDestroyRequest = typeof SandboxProviderDestroyRequest.Type;
 
 export const SandboxProviderSnapshotRequest = Schema.Struct({
   type: Schema.Literal("snapshot"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
   label: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type SandboxProviderSnapshotRequest = typeof SandboxProviderSnapshotRequest.Type;
 
 export const SandboxProviderDesktopRequest = Schema.Struct({
   type: Schema.Literal("desktop"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
 });
 export type SandboxProviderDesktopRequest = typeof SandboxProviderDesktopRequest.Type;
 
 export const SandboxProviderPortsRequest = Schema.Struct({
   type: Schema.Literal("ports"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
 });
 export type SandboxProviderPortsRequest = typeof SandboxProviderPortsRequest.Type;
 
 /** Requests resource observability gauges. These values are never authoritative billing evidence. */
 export const SandboxProviderUsageRequest = Schema.Struct({
   type: Schema.Literal("usage"),
-  ...SandboxProviderRequestBaseFields,
-  sandboxId: SandboxId,
+  ...SandboxProviderExistingSandboxRequestFields,
   since: IsoDateTime,
   until: IsoDateTime,
 }).check(

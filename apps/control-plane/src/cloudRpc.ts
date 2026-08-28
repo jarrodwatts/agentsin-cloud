@@ -313,6 +313,11 @@ export interface MakeCloudRpcOptions {
       userId: string,
       input: CreateCloudThreadRequest,
     ) => Effect.Effect<unknown, { readonly code: string; readonly retryable: boolean }>;
+    readonly connectThread: (
+      userId: string,
+      threadId: ThreadId,
+      afterSequence: number,
+    ) => Effect.Effect<unknown, { readonly code: string; readonly retryable: boolean }>;
   };
   readonly limits?: Partial<CloudRpcLimits>;
 }
@@ -583,6 +588,7 @@ export const makeCloudRpc = (options: MakeCloudRpcOptions) => {
     const abort = new AbortController();
     let disposed = false;
     let subscribed = false;
+    let subscribing = false;
     let cursor = -1;
     let threadId: ThreadId | undefined;
     let unsubscribeSignal: (() => void) | undefined;
@@ -724,27 +730,59 @@ export const makeCloudRpc = (options: MakeCloudRpcOptions) => {
         (frame) => {
           if (disposed) return;
           if (frame.type === "subscribe") {
-            if (subscribed) {
+            if (subscribed || subscribing) {
               close(4400, "duplicate_subscription");
               return;
             }
-            subscribed = true;
-            threadId = frame.threadId;
-            cursor = frame.afterSequence;
-            writer.enqueue({
-              protocolVersion: CLOUD_DESKTOP_RPC_VERSION,
-              type: "subscribed",
-              threadId,
-              afterSequence: cursor,
-            });
-            unsubscribeSignal = signals.subscribe(principal.workspaceId, threadId, () => {
-              if (eventPoll !== undefined) {
-                clearTimeout(eventPoll);
-                eventPoll = undefined;
-              }
-              pump();
-            });
-            pump();
+            subscribing = true;
+            const connect =
+              options.lifecycle === undefined
+                ? Effect.void
+                : options.lifecycle
+                    .connectThread(principal.userId, frame.threadId, frame.afterSequence)
+                    .pipe(
+                      Effect.asVoid,
+                      Effect.mapError(
+                        (cause) =>
+                          new CloudRpcError({
+                            code: cause.code === "notFound" ? "notFound" : "internalError",
+                            status: cause.code === "notFound" ? 404 : 503,
+                            retryable: cause.retryable,
+                          }),
+                      ),
+                    );
+            void Effect.runPromise(connect, { signal: abort.signal }).then(
+              () => {
+                if (disposed) return;
+                subscribing = false;
+                subscribed = true;
+                threadId = frame.threadId;
+                cursor = frame.afterSequence;
+                writer.enqueue({
+                  protocolVersion: CLOUD_DESKTOP_RPC_VERSION,
+                  type: "subscribed",
+                  threadId,
+                  afterSequence: cursor,
+                });
+                unsubscribeSignal = signals.subscribe(principal.workspaceId, threadId, () => {
+                  if (eventPoll !== undefined) {
+                    clearTimeout(eventPoll);
+                    eventPoll = undefined;
+                  }
+                  pump();
+                });
+                pump();
+              },
+              (cause: unknown) => {
+                subscribing = false;
+                if (disposed || abort.signal.aborted) return;
+                failStream(
+                  isCloudRpcError(cause)
+                    ? cause
+                    : new CloudRpcError({ code: "internalError", status: 500, retryable: true }),
+                );
+              },
+            );
             return;
           }
           if (!subscribed || frame.nonce !== pendingHeartbeat) {

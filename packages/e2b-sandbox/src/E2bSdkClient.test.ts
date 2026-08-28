@@ -219,6 +219,8 @@ const makeTestClient = (
 ) => {
   const ptyInfrastructure = options.ptyInfrastructure ?? makePtyInfrastructure();
   return makeE2bSdkClient({
+    operationUser: "agentsin-agent",
+    inspectorUser: "agentsin-inspector",
     apiKey: options.apiKey,
     trafficCredentials: options.trafficCredentials,
     ...(options.sdk === undefined ? {} : { sdk: options.sdk }),
@@ -530,16 +532,24 @@ describe("E2B SDK client", () => {
     const stdout = makeWriter("stdout");
     const stderr = makeWriter("stderr");
     let readCount = 0;
+    const commandUsers: Array<unknown> = [];
+    const fileUsers: Array<unknown> = [];
     const sandbox = makeSandbox({
       commands: {
-        run: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        run: async (_command: string, options?: { readonly user?: string }) => {
+          commandUsers.push(options?.user);
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
       } as unknown as Sandbox["commands"],
       files: {
-        read: async () => {
+        read: async (_path: string, options?: { readonly user?: string }) => {
+          fileUsers.push(options?.user);
           readCount += 1;
           return readCount === 1 ? chunkStream(stdoutChunks, chunkBytes) : chunkStream(0, 0);
         },
-        remove: async () => undefined,
+        remove: async (_path: string, options?: { readonly user?: string }) => {
+          fileUsers.push(options?.user);
+        },
       } as unknown as Sandbox["files"],
     });
     const client = makeTestClient({
@@ -560,6 +570,13 @@ describe("E2B SDK client", () => {
     expect(result.stdoutSummary.length).toBeLessThanOrEqual(4_096);
     expect(result.stdoutArtifact.sizeBytes).toBe(stdoutChunks * chunkBytes);
     expect(stdout.aborted()).toBe(false);
+    expect(commandUsers).toEqual(["agentsin-agent", "agentsin-agent"]);
+    expect(fileUsers).toEqual([
+      "agentsin-agent",
+      "agentsin-agent",
+      "agentsin-agent",
+      "agentsin-agent",
+    ]);
   });
 
   it("rejects oversized and growing file reads without materializing beyond the cap", async () => {
@@ -614,6 +631,30 @@ describe("E2B SDK client", () => {
     expect(cancelled).toBe(true);
   });
 
+  it("runs generic filesystem writes as the fixed non-root agent user", async () => {
+    let writeUser: unknown;
+    const sandbox = makeSandbox({
+      files: {
+        write: async (_path: string, _content: string, options?: { readonly user?: string }) => {
+          writeUser = options?.user;
+        },
+      } as unknown as Sandbox["files"],
+    });
+    const client = makeTestClient({
+      apiKey: "test-api-key",
+      trafficCredentials: failingBroker("unused"),
+      sdk: makeSdk(sandbox),
+    });
+
+    await client.files(
+      "sandbox-1",
+      { type: "write", path: "/workspace/file.txt", content: "safe", encoding: "utf8" },
+      { maxReadBytes: 8, maxListEntries: 10, maxListBytes: 1_024 },
+      900_000,
+    );
+    expect(writeUser).toBe("agentsin-agent");
+  });
+
   it("passes explicit entry and byte ceilings to bounded directory listing", async () => {
     let listCommand = "";
     const sandbox = makeSandbox({
@@ -643,6 +684,7 @@ describe("E2B SDK client", () => {
 
   it("uses the configured timeout and rechecks running state for every connected operation", async () => {
     const connectTimeouts: Array<number | undefined> = [];
+    const inspectorUsers: Array<unknown> = [];
     const output = makeWriter("timeout-pty");
     const ptyInfrastructure = makePtyInfrastructure();
     ptyInfrastructure.registerWriter(output.writer);
@@ -654,11 +696,14 @@ describe("E2B SDK client", () => {
     } as unknown as CommandHandle;
     const sandbox = makeSandbox({
       commands: {
-        run: async (command: string) => ({
-          exitCode: 0,
-          stdout: command === "ss -H -ltn" ? "LISTEN 0 128 0.0.0.0:6080\n" : "",
-          stderr: "",
-        }),
+        run: async (command: string, options?: { readonly user?: string }) => {
+          if (command === "ss -H -ltn") inspectorUsers.push(options?.user);
+          return {
+            exitCode: 0,
+            stdout: command === "ss -H -ltn" ? "LISTEN 0 128 0.0.0.0:6080\n" : "",
+            stderr: "",
+          };
+        },
       } as unknown as Sandbox["commands"],
       files: {
         getInfo: async () => ({ size: 0 }),
@@ -710,6 +755,7 @@ describe("E2B SDK client", () => {
     await client.ports("sandbox-1", 720_000);
 
     expect(connectTimeouts).toEqual(Array.from({ length: 7 }, () => 720_000));
+    expect(inspectorUsers).toEqual(["agentsin-inspector", "agentsin-inspector"]);
 
     let pausedConnectCalls = 0;
     const pausedClient = makeTestClient({
@@ -977,6 +1023,7 @@ describe("E2B SDK client", () => {
 
   it("marks cleanup required and aborts durable output when PTY streaming fails", async () => {
     let onData: ((data: Uint8Array) => void | Promise<void>) | undefined;
+    let ptyUser: unknown;
     let aborted = false;
     const writer: StreamingArtifactWriter = {
       writerId: "writer-pty-failure",
@@ -999,8 +1046,9 @@ describe("E2B SDK client", () => {
     } as unknown as CommandHandle;
     const sandbox = makeSandbox({
       pty: {
-        create: async (options: { readonly onData: typeof onData }) => {
+        create: async (options: { readonly onData: typeof onData; readonly user?: string }) => {
           onData = options.onData;
+          ptyUser = options.user;
           return handle;
         },
         kill: async () => {
@@ -1016,6 +1064,7 @@ describe("E2B SDK client", () => {
       ptyInfrastructure,
     });
     await client.pty("sandbox-1", { type: "open", columns: 80, rows: 24 }, 900_000, writer);
+    expect(ptyUser).toBe("agentsin-agent");
     if (onData === undefined) throw new Error("Expected PTY output callback");
 
     await expect(onData(new TextEncoder().encode("broken"))).rejects.toThrow("R2 write failed");

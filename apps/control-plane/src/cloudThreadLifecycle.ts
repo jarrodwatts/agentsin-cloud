@@ -411,6 +411,7 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
         requestId: `${attempt.attemptId}:compensate` as CommandId,
         workspaceId: attempt.workspaceId,
         environmentId: attempt.environmentId,
+        threadId: attempt.threadId,
         sandboxId: attempt.sandboxId,
         requestedAt: now,
       }),
@@ -444,6 +445,7 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
             requestId: `${attempt.attemptId}:recover-create` as CommandId,
             workspaceId: attempt.workspaceId,
             environmentId: attempt.environmentId,
+            threadId: attempt.threadId,
             sandboxId: reservation.identity.sandboxId,
             requestedAt: now,
           }),
@@ -729,6 +731,7 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
             requestId: `${attempt.attemptId}:desktop-connect` as CommandId,
             workspaceId,
             environmentId: attempt.environmentId,
+            threadId: attempt.threadId,
             sandboxId: attempt.sandboxId,
             requestedAt: iso(dependencies.clock.now()),
           })
@@ -753,16 +756,8 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
       } satisfies ConnectedCloudThread;
     });
 
-  const reconnectWorker = (claim: WorkerReconnectClaim) =>
+  const reconnectVerifiedWorker = (principal: VerifiedWorkerPrincipal, afterSequence: number) =>
     Effect.gen(function* () {
-      const principal = yield* dependencies.workerGateway
-        .authorizeReconnect(claim.connection)
-        .pipe(
-          Effect.mapError(
-            (cause) =>
-              new CloudThreadLifecycleError({ code: "unauthorized", retryable: false, cause }),
-          ),
-        );
       const attempt = yield* storeEffect(() =>
         dependencies.lifecycle.getCurrent(principal.workspaceId, principal.threadId),
       );
@@ -786,7 +781,7 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
           .listPendingThreadCommands(attempt.workspaceId, attempt.threadId, 256)
           .pipe(Effect.mapError(mapThreadStoreFailure)),
         dependencies.threadEvents
-          .replayAfter(attempt.workspaceId, attempt.threadId, claim.afterSequence, 256)
+          .replayAfter(attempt.workspaceId, attempt.threadId, afterSequence, 256)
           .pipe(Effect.mapError(mapThreadStoreFailure)),
       ]);
       return {
@@ -801,6 +796,14 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
         replay,
       } satisfies WorkerReconnectReplay;
     });
+
+  const reconnectWorker = (claim: WorkerReconnectClaim) =>
+    dependencies.workerGateway.authorizeReconnect(claim.connection).pipe(
+      Effect.mapError(
+        (cause) => new CloudThreadLifecycleError({ code: "unauthorized", retryable: false, cause }),
+      ),
+      Effect.flatMap((principal) => reconnectVerifiedWorker(principal, claim.afterSequence)),
+    );
 
   const recoverPending = (limit = 25) =>
     Effect.gen(function* () {
@@ -830,6 +833,7 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
                 requestId: `${attempt.attemptId}:recover` as CommandId,
                 workspaceId: attempt.workspaceId,
                 environmentId: attempt.environmentId,
+                threadId: attempt.threadId,
                 sandboxId: reservation.identity.sandboxId,
                 requestedAt: now,
               }),
@@ -920,5 +924,12 @@ export const makeCloudThreadLifecycle = (dependencies: CloudThreadLifecycleDepen
       return recovered;
     });
 
-  return { createThread, connectThread, reconnectWorker, recoverPending };
+  return {
+    createThread,
+    connectThread,
+    reconnectWorker,
+    /** Trusted adapter for the relay's already-authenticated server-derived principal. */
+    reconnectVerifiedWorker,
+    recoverPending,
+  };
 };

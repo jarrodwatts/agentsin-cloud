@@ -267,6 +267,8 @@ export const makeHostedE2bProviderService = (
     );
 
     const client = makeE2bSdkClient({
+      operationUser: "agentsin-agent",
+      inspectorUser: "agentsin-inspector",
       apiKey: input.config.apiKey,
       trafficCredentials: input.trafficCredentials,
       ptySessions: input.ptySessions,

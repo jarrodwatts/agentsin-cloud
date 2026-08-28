@@ -2,6 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import type { EventId } from "@t3tools/contracts";
+import type { WorkerRelayInbound } from "@t3tools/contracts/worker";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -20,6 +21,8 @@ import { makeWorkerBootstrapHandler } from "./workerMtlsServer.ts";
 import {
   makeInMemoryWorkerRouteRegistry,
   makeWorkerRelay,
+  WorkerRelayServerError,
+  type AuthenticatedWorkerPrincipal,
   type WorkerRecoverySource,
   type WorkerRelay,
 } from "./workerRelay.ts";
@@ -65,11 +68,49 @@ export interface WorkerControlPlaneRuntime {
   readonly identities: ReturnType<typeof makeWorkerIdentityService>;
   readonly relay: WorkerRelay;
   readonly routeLifecycle: WorkerRouteLifecycle;
+  readonly bindLifecycleRecovery: (
+    recover: (
+      identity: AuthenticatedWorkerPrincipal,
+      confirmedEventCursor: number,
+    ) => Effect.Effect<ReadonlyArray<WorkerRelayInbound>, WorkerRelayServerError>,
+  ) => void;
   readonly githubWorker: GitHubWorkerDispatcher;
   readonly workerBootstrap: {
     readonly handleHttp: ReturnType<typeof makeWorkerBootstrapHandler>;
   };
 }
+
+export const makeLifecycleWorkerRecoveryBridge = (
+  protocol: Omit<WorkerRecoverySource, "recover">,
+) => {
+  let lifecycleRecovery:
+    | ((
+        identity: AuthenticatedWorkerPrincipal,
+        confirmedEventCursor: number,
+      ) => Effect.Effect<ReadonlyArray<WorkerRelayInbound>, WorkerRelayServerError>)
+    | undefined;
+  const source: WorkerRecoverySource = {
+    ...protocol,
+    recover: (identity, cursors) =>
+      lifecycleRecovery === undefined
+        ? Effect.fail(
+            new WorkerRelayServerError({
+              code: "internal",
+              operation: "recover-before-cloud-lifecycle-bound",
+            }),
+          )
+        : lifecycleRecovery(identity, cursors.confirmedEventCursor),
+  };
+  return {
+    source,
+    bind: (recover: NonNullable<typeof lifecycleRecovery>) => {
+      if (lifecycleRecovery !== undefined) {
+        throw new Error("Cloud thread lifecycle recovery is already bound");
+      }
+      lifecycleRecovery = recover;
+    },
+  };
+};
 
 /**
  * Compose the authoritative Postgres identity/lifecycle service, process-local
@@ -106,9 +147,10 @@ export const makeWorkerControlPlaneRuntime = (input: {
     });
     const routes = makeInMemoryWorkerRouteRegistry();
     const githubWorker = makeGitHubWorkerDispatcher({ routes });
+    const recoveryBridge = makeLifecycleWorkerRecoveryBridge(input.production.recovery);
     const relay = makeWorkerRelay({
       identities,
-      recovery: input.production.recovery,
+      recovery: recoveryBridge.source,
       processInstanceId: input.config.workerProcessInstanceId,
       coordination: input.coordination,
       routes,
@@ -139,6 +181,7 @@ export const makeWorkerControlPlaneRuntime = (input: {
       identities,
       relay,
       routeLifecycle,
+      bindLifecycleRecovery: recoveryBridge.bind,
       githubWorker,
       workerBootstrap: {
         handleHttp: makeWorkerBootstrapHandler({ identities }),

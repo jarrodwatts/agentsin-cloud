@@ -500,6 +500,7 @@ describe("cloud provider contracts", () => {
       requestId: "command-1",
       workspaceId: WORKSPACE_ID,
       environmentId: "environment-1",
+      threadId: "thread-1",
       sandboxId: "sandbox-1",
       requestedAt: NOW,
     };
@@ -544,6 +545,14 @@ describe("cloud provider contracts", () => {
       "usage",
       "destroy",
     ]);
+    const attemptedPrivilegeOverride = decodeSandboxRequest({
+      type: "execute",
+      ...requestBase,
+      command: "id",
+      arguments: [],
+      user: "root",
+    });
+    expect("user" in attemptedPrivilegeOverride).toBe(false);
   });
 
   it("round-trips immutable revisions and provider messages through JSON codecs", () => {

@@ -88,6 +88,9 @@ export interface E2bSdkClientOptions {
   readonly artifacts: Pick<R2ArtifactWriter, "resume">;
   /** Stable worker-process routing identity. Never contains a credential. */
   readonly ptyOwnerId: string;
+  /** Fixed non-root template user for every generic agent operation. */
+  readonly operationUser: "agentsin-agent";
+  readonly inspectorUser: "agentsin-inspector";
   /** Test seam around E2B's static SDK surface. */
   readonly sdk?: E2bSdkRuntime;
 }
@@ -261,8 +264,9 @@ const pumpFileToArtifact = async (
   sandbox: Sandbox,
   path: string,
   writer: StreamingArtifactWriter,
+  user: string,
 ) => {
-  const reader = (await sandbox.files.read(path, { format: "stream" })).getReader();
+  const reader = (await sandbox.files.read(path, { format: "stream", user })).getReader();
   const summary = new BoundedTextSummary();
   try {
     while (true) {
@@ -284,8 +288,8 @@ const abortArtifacts = async (...writers: ReadonlyArray<StreamingArtifactWriter>
   await Promise.allSettled(writers.map((writer) => writer.abort()));
 };
 
-const readBoundedFile = async (sandbox: Sandbox, path: string, maxBytes: number) => {
-  const info = await sandbox.files.getInfo(path);
+const readBoundedFile = async (sandbox: Sandbox, path: string, maxBytes: number, user: string) => {
+  const info = await sandbox.files.getInfo(path, { user });
   if (info.size > maxBytes) {
     throw new E2bClientFailure({
       code: "outputLimit",
@@ -293,7 +297,7 @@ const readBoundedFile = async (sandbox: Sandbox, path: string, maxBytes: number)
       retryable: false,
     });
   }
-  const reader = (await sandbox.files.read(path, { format: "stream" })).getReader();
+  const reader = (await sandbox.files.read(path, { format: "stream", user })).getReader();
   const chunks: Array<Uint8Array> = [];
   let byteLength = 0;
   try {
@@ -352,10 +356,16 @@ for await (const entry of directory) {
 }
 `;
 
-const listBoundedDirectory = async (sandbox: Sandbox, path: string, limits: E2bFileLimits) => {
+const listBoundedDirectory = async (
+  sandbox: Sandbox,
+  path: string,
+  limits: E2bFileLimits,
+  user: string,
+) => {
   const script = Buffer.from(DIRECTORY_LIST_SCRIPT).toString("base64");
   const result = await sandbox.commands.run(
     `printf %s ${shellQuote(script)} | base64 -d | node --input-type=module - ${shellQuote(path)} ${limits.maxListEntries} ${limits.maxListBytes}`,
+    { user },
   );
   if (new TextEncoder().encode(result.stdout).byteLength > limits.maxListBytes + 64) {
     throw new E2bClientFailure({
@@ -404,7 +414,7 @@ const listBoundedDirectory = async (sandbox: Sandbox, path: string, limits: E2bF
   return entries;
 };
 
-const directoryHasEntry = async (sandbox: Sandbox, path: string) => {
+const directoryHasEntry = async (sandbox: Sandbox, path: string, user: string) => {
   const script = Buffer.from(`
 import { opendir } from "node:fs/promises";
 const directory = await opendir(process.argv[2]);
@@ -414,6 +424,7 @@ process.stdout.write(entry === null ? "0" : "1");
 `).toString("base64");
   const result = await sandbox.commands.run(
     `printf %s ${shellQuote(script)} | base64 -d | node --input-type=module - ${shellQuote(path)}`,
+    { user },
   );
   return result.stdout === "1";
 };
@@ -805,19 +816,21 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
       safe("connect", () => connectAndDescribe(sandboxId, timeoutMs)),
     execute: (sandboxId, input, output, activeTimeoutMs) =>
       safe("execute", async (): Promise<E2bExecutionResult> => {
+        const user = options.operationUser;
         const sandbox = await connectRunning(sandboxId, activeTimeoutMs);
         const executionId = NodeCrypto.randomUUID();
         const stdoutPath = `/tmp/agentsin-cloud/${executionId}.stdout`;
         const stderrPath = `/tmp/agentsin-cloud/${executionId}.stderr`;
         let exitCode: number;
         try {
-          await sandbox.commands.run("mkdir -p /tmp/agentsin-cloud");
+          await sandbox.commands.run("mkdir -p /tmp/agentsin-cloud", { user });
           try {
             // E2B 2.46 accumulates callback output inside CommandHandle. Redirect remotely so the
             // control plane only receives bounded stream chunks from the filesystem API.
             const result = await sandbox.commands.run(
               `exec ${commandLine(input.command, input.arguments)} >${shellQuote(stdoutPath)} 2>${shellQuote(stderrPath)}`,
               {
+                user,
                 ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
                 ...(input.environment === undefined ? {} : { envs: { ...input.environment } }),
                 ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
@@ -829,8 +842,8 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
             exitCode = error.exitCode;
           }
           const [stdout, stderr] = await Promise.all([
-            pumpFileToArtifact(sandbox, stdoutPath, output.stdout),
-            pumpFileToArtifact(sandbox, stderrPath, output.stderr),
+            pumpFileToArtifact(sandbox, stdoutPath, output.stdout, user),
+            pumpFileToArtifact(sandbox, stderrPath, output.stderr, user),
           ]);
           return {
             exitCode,
@@ -844,29 +857,30 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
           throw cause;
         } finally {
           await Promise.allSettled([
-            sandbox.files.remove(stdoutPath),
-            sandbox.files.remove(stderrPath),
+            sandbox.files.remove(stdoutPath, { user }),
+            sandbox.files.remove(stderrPath, { user }),
           ]);
         }
       }),
     files: (sandboxId, operation, limits, activeTimeoutMs) =>
       safe("files", async () => {
+        const user = options.operationUser;
         const sandbox = await connectRunning(sandboxId, activeTimeoutMs);
         switch (operation.type) {
           case "read":
             return {
               type: "read",
               path: operation.path,
-              bytes: await readBoundedFile(sandbox, operation.path, limits.maxReadBytes),
+              bytes: await readBoundedFile(sandbox, operation.path, limits.maxReadBytes, user),
             };
           case "write": {
             if (operation.encoding === "utf8") {
-              await sandbox.files.write(operation.path, operation.content);
+              await sandbox.files.write(operation.path, operation.content, { user });
             } else {
               const decoded = Buffer.from(operation.content, "base64");
               const bytes = new ArrayBuffer(decoded.byteLength);
               new Uint8Array(bytes).set(decoded);
-              await sandbox.files.write(operation.path, bytes);
+              await sandbox.files.write(operation.path, bytes, { user });
             }
             return { type: "write", path: operation.path };
           }
@@ -874,15 +888,15 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
             return {
               type: "list",
               path: operation.path,
-              entries: await listBoundedDirectory(sandbox, operation.path, limits),
+              entries: await listBoundedDirectory(sandbox, operation.path, limits, user),
             };
           }
           case "remove": {
             if (!operation.recursive) {
-              const info = await sandbox.files.getInfo(operation.path);
+              const info = await sandbox.files.getInfo(operation.path, { user });
               if (
                 info.type === FileType.DIR &&
-                (await directoryHasEntry(sandbox, operation.path))
+                (await directoryHasEntry(sandbox, operation.path, user))
               ) {
                 throw new E2bClientFailure({
                   code: "invalidRequest",
@@ -891,13 +905,14 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
                 });
               }
             }
-            await sandbox.files.remove(operation.path);
+            await sandbox.files.remove(operation.path, { user });
             return { type: "remove", path: operation.path };
           }
         }
       }),
     pty: (sandboxId, operation, activeTimeoutMs, output) =>
       safe("pty", async () => {
+        const user = options.operationUser;
         const sandbox = await connectRunning(sandboxId, activeTimeoutMs);
         switch (operation.type) {
           case "open": {
@@ -924,6 +939,7 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
             let attachment: PtyAttachment | undefined;
             try {
               handle = await sandbox.pty.create({
+                user,
                 cols: operation.columns,
                 rows: operation.rows,
                 onData: (data) => {
@@ -1078,7 +1094,9 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
     desktop: (sandboxId, activeTimeoutMs) =>
       safe("desktop", async () => {
         const sandbox = await connectRunning(sandboxId, activeTimeoutMs);
-        const ports = listeningPorts((await sandbox.commands.run("ss -H -ltn")).stdout);
+        const ports = listeningPorts(
+          (await sandbox.commands.run("ss -H -ltn", { user: options.inspectorUser })).stdout,
+        );
         if (!ports.includes(E2B_DESKTOP_PORT)) return undefined;
         const connected = await describeConnected(sandbox);
         return {
@@ -1091,7 +1109,9 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
     ports: (sandboxId, activeTimeoutMs) =>
       safe("ports", async () => {
         const sandbox = await connectRunning(sandboxId, activeTimeoutMs);
-        const ports = listeningPorts((await sandbox.commands.run("ss -H -ltn")).stdout);
+        const ports = listeningPorts(
+          (await sandbox.commands.run("ss -H -ltn", { user: options.inspectorUser })).stdout,
+        );
         return ports.map((internalPort) => ({
           internalPort,
           endpoint: `https://${sandbox.getHost(internalPort)}`,
