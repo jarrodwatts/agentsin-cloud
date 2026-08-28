@@ -40,9 +40,10 @@ quality gates on pull requests and pushes to `main`:
 The protected check is authoritative only after this workflow exists on `main`. Bootstrap it in
 two steps: merge the base-owned workflow without requiring its check, then open a harmless follow-up
 pull request and confirm the distinct **Protected Worker Isolation** check passes. Only after that
-proof should branch protection require the check. A dependency-input change must likewise update
-the protected base first; the harness fails closed instead of installing PR-selected dependencies
-on the host.
+proof should branch protection require the check. The initial follow-up is intentionally
+documentation-only so it validates the default-branch-owned check without changing its inputs. A
+dependency-input change must likewise update the protected base first; the harness fails closed
+instead of installing PR-selected dependencies on the host.
 
 `.github/workflows/release.yml` builds macOS (`arm64` and `x64`), Linux (`x64`), and Windows (`x64`)
 desktop artifacts from a single `v*.*.*` tag and publishes one GitHub release. It auto-enables
