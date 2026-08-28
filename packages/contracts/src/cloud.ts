@@ -112,6 +112,10 @@ export const AutomationRunId = makeCloudEntityId("AutomationRunId");
 export type AutomationRunId = typeof AutomationRunId.Type;
 export const UsageSampleId = makeCloudEntityId("UsageSampleId");
 export type UsageSampleId = typeof UsageSampleId.Type;
+export const UsageEvidenceId = makeCloudEntityId("UsageEvidenceId");
+export type UsageEvidenceId = typeof UsageEvidenceId.Type;
+export const UsageAccrualId = makeCloudEntityId("UsageAccrualId");
+export type UsageAccrualId = typeof UsageAccrualId.Type;
 export const UsageReceiptId = makeCloudEntityId("UsageReceiptId");
 export type UsageReceiptId = typeof UsageReceiptId.Type;
 export const LedgerEntryId = makeCloudEntityId("LedgerEntryId");
@@ -154,7 +158,7 @@ export const USAGE_MARKUP_BASIS_POINTS = 500 as const;
 export const UsageMarkupRounding = Schema.Literal("half-up-to-nearest-micro-usdc");
 export type UsageMarkupRounding = typeof UsageMarkupRounding.Type;
 
-const fivePercentMarkupMicroUsdc = (upstreamMicroUsdc: number) =>
+export const fivePercentMarkupMicroUsdc = (upstreamMicroUsdc: number) =>
   Math.floor(upstreamMicroUsdc / 20) + (upstreamMicroUsdc % 20 >= 10 ? 1 : 0);
 
 export const EnvironmentResourceProfile = Schema.Struct({
@@ -2168,6 +2172,115 @@ export type AutomationRun = typeof AutomationRun.Type;
 
 export const HostedInfrastructureProvider = Schema.Literal("e2b");
 export type HostedInfrastructureProvider = typeof HostedInfrastructureProvider.Type;
+
+export const UsageEvidenceSha256 = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)).pipe(
+  Schema.brand("UsageEvidenceSha256"),
+);
+export type UsageEvidenceSha256 = typeof UsageEvidenceSha256.Type;
+const CanonicalUsageIsoDateTime = Schema.String.check(
+  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+);
+
+/**
+ * An exact upstream charge record retrieved through an authenticated E2B billing surface.
+ * Monitoring metrics and locally calculated estimates cannot satisfy this contract.
+ */
+export const VerifiedE2bUsageEvidence = Schema.Struct({
+  evidenceId: UsageEvidenceId,
+  revision: PositiveInt,
+  infrastructureProvider: HostedInfrastructureProvider,
+  verification: Schema.Literal("e2b-authenticated-billing-record"),
+  payloadSha256: UsageEvidenceSha256,
+  intervalStart: CanonicalUsageIsoDateTime,
+  intervalEnd: CanonicalUsageIsoDateTime,
+  upstreamMicroUsdc: MicroUsdc,
+  observedAt: CanonicalUsageIsoDateTime,
+})
+  .check(
+    Schema.makeFilter(
+      (input) =>
+        input.intervalStart < input.intervalEnd || "verified usage interval must be non-empty",
+      { identifier: "VerifiedE2bUsageEvidenceInterval" },
+    ),
+    Schema.makeFilter(
+      (input) =>
+        input.intervalEnd <= input.observedAt ||
+        "verified usage cannot be observed before its interval ends",
+      { identifier: "VerifiedE2bUsageEvidenceObservation" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type VerifiedE2bUsageEvidence = typeof VerifiedE2bUsageEvidence.Type;
+
+/**
+ * Immutable pricing result passed to H5 receipt signing. Corrections append a new accrual whose
+ * signed delta moves the ledger from the previous exact total to the corrected exact total.
+ */
+export const UsageAccrual = Schema.Struct({
+  accrualId: UsageAccrualId,
+  sampleId: UsageSampleId,
+  priorSampleId: Schema.optionalKey(UsageSampleId),
+  workspaceId: WorkspaceId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  sandboxId: SandboxId,
+  evidence: VerifiedE2bUsageEvidence,
+  previousUpstreamMicroUsdc: MicroUsdc,
+  previousMarkupMicroUsdc: MicroUsdc,
+  previousTotalMicroUsdc: MicroUsdc,
+  upstreamMicroUsdc: MicroUsdc,
+  markupBasisPoints: Schema.Literal(USAGE_MARKUP_BASIS_POINTS),
+  markupRounding: UsageMarkupRounding,
+  markupMicroUsdc: MicroUsdc,
+  totalMicroUsdc: MicroUsdc,
+  upstreamDeltaMicroUsdc: SignedMicroUsdc,
+  markupDeltaMicroUsdc: SignedMicroUsdc,
+  totalDeltaMicroUsdc: SignedMicroUsdc,
+  payloadSha256: UsageEvidenceSha256,
+  recordedAt: CanonicalUsageIsoDateTime,
+})
+  .check(
+    Schema.makeFilter(
+      (input) =>
+        (input.evidence.revision === 1
+          ? input.priorSampleId === undefined &&
+            input.previousUpstreamMicroUsdc === 0 &&
+            input.previousMarkupMicroUsdc === 0 &&
+            input.previousTotalMicroUsdc === 0
+          : input.priorSampleId !== undefined) ||
+        "only the first evidence revision may omit its prior sample",
+      { identifier: "UsageAccrualRevisionChain" },
+    ),
+    Schema.makeFilter(
+      (input) =>
+        (input.previousMarkupMicroUsdc ===
+          fivePercentMarkupMicroUsdc(input.previousUpstreamMicroUsdc) &&
+          input.previousTotalMicroUsdc ===
+            input.previousUpstreamMicroUsdc + input.previousMarkupMicroUsdc &&
+          input.upstreamMicroUsdc === input.evidence.upstreamMicroUsdc &&
+          input.markupMicroUsdc === fivePercentMarkupMicroUsdc(input.upstreamMicroUsdc) &&
+          input.totalMicroUsdc === input.upstreamMicroUsdc + input.markupMicroUsdc) ||
+        "usage accrual totals must equal exact upstream cost plus 5% rounded half-up",
+      { identifier: "UsageAccrualPricing" },
+    ),
+    Schema.makeFilter(
+      (input) =>
+        (input.upstreamDeltaMicroUsdc ===
+          input.upstreamMicroUsdc - input.previousUpstreamMicroUsdc &&
+          input.markupDeltaMicroUsdc === input.markupMicroUsdc - input.previousMarkupMicroUsdc &&
+          input.totalDeltaMicroUsdc === input.totalMicroUsdc - input.previousTotalMicroUsdc) ||
+        "usage accrual deltas must exactly move the prior total to the current total",
+      { identifier: "UsageAccrualDelta" },
+    ),
+    Schema.makeFilter(
+      (input) =>
+        input.evidence.observedAt <= input.recordedAt ||
+        "usage accrual cannot be recorded before evidence is observed",
+      { identifier: "UsageAccrualRecordedAt" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type UsageAccrual = typeof UsageAccrual.Type;
 
 /** Hosted billing accepts sandbox infrastructure meters only, never agent/provider usage. */
 export const UsageMeter = Schema.Literals([
