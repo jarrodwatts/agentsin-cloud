@@ -150,6 +150,35 @@ it.effect("does not fail open corrupt limiter replies", () =>
   }),
 );
 
+it.effect("decodes the three-field rate-limit tuple without weakening reply validation", () =>
+  Effect.gen(function* () {
+    const client = new ScriptedClient();
+    const coordination = makeValkeyEphemeralCoordinationFromClient(client, "aic-prod");
+    const input = {
+      workspaceId,
+      subjectKind: "session",
+      subjectId: "session-1",
+      policy: CONTROL_MUTATION_RATE_POLICY,
+    };
+
+    client.evalResult = [1, "2", 1_000];
+    expect(yield* coordination.consumeRateLimit(input)).toMatchObject({
+      allowed: true,
+      remaining: CONTROL_MUTATION_RATE_POLICY.limit - 2,
+      retryAfterMs: 1_000,
+      degraded: false,
+    });
+
+    client.evalResult = [1, 2];
+    const malformed = yield* Effect.flip(coordination.consumeRateLimit(input));
+    expect(malformed).toMatchObject({
+      code: "corruptState",
+      operation: "consume-rate-limit",
+      cause: "Valkey returned an invalid tuple",
+    });
+  }),
+);
+
 it.effect("rejects unbounded input before issuing any Valkey command", () =>
   Effect.gen(function* () {
     const client = new ScriptedClient();

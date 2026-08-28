@@ -1,8 +1,14 @@
-# T3 Code docs
+# Agents in Cloud docs
 
-## Using T3 Code
+Agents in Cloud is derived from T3 Code. The local runtime, provider, and client documentation below
+describes the inherited foundation; cloud-specific behavior is documented separately as it lands.
 
-- [Install and first run](./user/install.md)
+## Development
+
+- [Run Agents in Cloud from source](./user/install.md)
+
+## Inherited T3 runtime guides
+
 - [Permission modes](./user/permission-modes.md)
 - [Keyboard shortcuts](./user/keybindings.md)
 - [Organizing threads](./user/thread-sidebar.md)
@@ -15,11 +21,11 @@
 - [Background service (Linux)](./user/background-service.md)
 - Providers: [Codex](./user/providers-codex.md) · [Claude](./user/providers-claude.md)
 
-Mobile app: [apps/mobile/README.md](../apps/mobile/README.md)
+Inherited mobile client: [apps/mobile/README.md](../apps/mobile/README.md)
 
 ---
 
-## Working on T3 Code
+## Working on Agents in Cloud
 
 Everything below is for maintainers. Setup lives in the [root README](../README.md);
 policy in [CONTRIBUTING.md](../CONTRIBUTING.md); agent rules in [AGENTS.md](../AGENTS.md).
@@ -38,6 +44,13 @@ policy in [CONTRIBUTING.md](../CONTRIBUTING.md); agent rules in [AGENTS.md](../A
 - [T3 Connect](./internals/t3-connect.md)
 - [CI gates](./internals/ci.md)
 - [Engineering work artifacts](./internals/work-artifacts.md)
+- [Cloud coordination](./internals/cloud-coordination.md)
+- [Cloud thread runtime](./internals/cloud-thread-runtime.md)
+- [Cloud thread store](./internals/cloud-thread-store.md)
+- [E2B runtime](./internals/cloud-e2b-runtime.md)
+- [E2B worker image](./internals/e2b-worker-image.md)
+- [Worker mTLS](./internals/worker-mtls.md)
+- [Cloud live inspector](./internals/cloud-live-inspector.md)
 
 ### Runbooks
 

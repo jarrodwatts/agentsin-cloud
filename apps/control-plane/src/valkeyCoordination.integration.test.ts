@@ -13,6 +13,14 @@ import { makeRedisOptions, makeValkeyEphemeralCoordination } from "./valkeyCoord
 
 const integrationUrl = process.env.AGENTSIN_TEST_VALKEY_URL;
 
+const disconnectAndWaitForEnd = (client: Redis) =>
+  Effect.callback<void>((resume) => {
+    const onEnd = () => resume(Effect.void);
+    client.once("end", onEnd);
+    client.disconnect(false);
+    return Effect.sync(() => client.off("end", onEnd));
+  });
+
 describe.skipIf(integrationUrl === undefined)("Valkey production adapter", () => {
   it.effect("executes atomic routing, TTL, lease fencing, limiting, reconnect, and cleanup", () =>
     Effect.scoped(
@@ -147,10 +155,10 @@ describe.skipIf(integrationUrl === undefined)("Valkey production adapter", () =>
         ).toBe(0);
         expect(yield* Effect.promise(() => raw.exists(keys.leaseGeneration(leaseScope)))).toBe(0);
 
-        raw.disconnect(false);
+        yield* disconnectAndWaitForEnd(raw);
         yield* Effect.promise(() => raw.connect());
         expect(yield* Effect.promise(() => raw.ping())).toBe("PONG");
-        raw.disconnect(false);
+        yield* disconnectAndWaitForEnd(raw);
         yield* Effect.promise(() => expect(raw.get("offline-command")).rejects.toThrow());
 
         const deadlineClient = new Redis(makeRedisOptions({ ...config, commandTimeoutMs: 250 }));

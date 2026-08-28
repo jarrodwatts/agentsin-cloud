@@ -23,9 +23,7 @@ it("runs every control-plane PostgreSQL suite in the real-adapter CI job", () =>
     .filter((filename) => filename.endsWith(".postgres.test.ts"))
     .map((filename) => `src/${filename}`)
     .sort();
-  const configured = [
-    ...job.matchAll(/src\/[A-Za-z0-9./-]+\.postgres\.test\.ts/gu),
-  ]
+  const configured = [...job.matchAll(/src\/[A-Za-z0-9./-]+\.postgres\.test\.ts/gu)]
     .map(([filename]) => filename)
     .sort();
 

@@ -868,7 +868,13 @@ function isAgentInternalActivity(activity: OrchestrationThreadActivity): boolean
 export function deriveWorkLogEntries(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
 ): WorkLogEntry[] {
-  const ordered = [...activities].toSorted(compareActivitiesByOrder);
+  let ordered = activities;
+  for (let index = 1; index < activities.length; index += 1) {
+    if (compareActivitiesByOrder(activities[index - 1]!, activities[index]!) > 0) {
+      ordered = [...activities].toSorted(compareActivitiesByOrder);
+      break;
+    }
+  }
   const entries: DerivedWorkLogEntry[] = [];
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;

@@ -16,8 +16,8 @@ concurrency:
 jobs:
   check:
     name: Check
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -45,6 +45,9 @@ jobs:
       - name: Ensure Electron runtime is installed
         run: vp run --filter @t3tools/desktop ensure:electron
 
+      - name: Check protected worker workflow invariants
+        run: node --test .github/scripts/protected-worker-isolation.test.cjs
+
       - name: Check
         run: vp check
 
@@ -64,8 +67,8 @@ jobs:
   # limit stays at the default 4 so peak load per runner is unchanged.
   test:
     name: Test
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -89,7 +92,9 @@ jobs:
         run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' test
 
   test_worker_credential_isolation:
-    name: Test Worker Credential Isolation
+    # Compatibility only. The default-branch-owned pull_request_target workflow
+    # is the authoritative kernel boundary because this job executes PR code.
+    name: Test Worker Isolation Compatibility
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -108,23 +113,76 @@ jobs:
           cache: true
           run-install: true
 
+      - name: Test unprivileged worker isolation behavior
+        working-directory: apps/worker
+        run: >-
+          vp test run
+          src/ProviderCredentialExecutor.test.ts
+          src/ProviderRuntimeSupervisor.test.ts
+          src/ContainedWorkspace.test.ts
+          src/InspectorPtySandbox.test.ts
+          src/main.test.ts
+
+  test_worker_root_isolation_trusted_main:
+    name: Test Worker Root Isolation (Trusted Main)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup trusted-main Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: true
+
       - name: Install Bubblewrap security boundary
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes bubblewrap
 
+      - name: Stage audited Node interpreter for identity probes
+        run: |
+          sudo install -d -o root -g root -m 0755 /usr/local/lib/agentsin-ci
+          sudo install -o root -g root -m 0555 "$(command -v node)" /usr/local/lib/agentsin-ci/node
+          test "$(stat -c '%u:%g:%a' /usr/local/lib/agentsin-ci/node)" = "0:0:555"
+          sha256sum /usr/local/lib/agentsin-ci/node
+          sudo /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups -- \
+            /usr/local/lib/agentsin-ci/node -e \
+            'if(process.getuid()!==65534||process.getgid()!==65534||process.getgroups().some((group)=>group!==65534))process.exit(1)'
+
       - name: Prove worker and agent kernel isolation
-        run: >-
-          sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST=1
-          "$(command -v pnpm)" --filter @agentsin-cloud/worker exec vp test run
-          src/ProviderCredentialExecutor.root.test.ts
-          src/ProviderRuntimeSupervisor.root.test.ts
-          src/ContainedWorkspace.root.test.ts
-          src/InspectorPtySandbox.root.test.ts
-          src/main.root.test.ts
+        working-directory: apps/worker
+        env:
+          AGENTSIN_ROOT_SECURITY_TEST: "1"
+          AGENTSIN_ROOT_SECURITY_NODE: /usr/local/lib/agentsin-ci/node
+        run: |
+          vp_bin="$(command -v vp)"
+          test -n "$vp_bin"
+          sudo /usr/bin/env -i \
+            PATH=/usr/local/lib/agentsin-ci:/usr/bin:/bin \
+            HOME=/root \
+            CI=true \
+            AGENTSIN_ROOT_SECURITY_TEST="$AGENTSIN_ROOT_SECURITY_TEST" \
+            AGENTSIN_ROOT_SECURITY_NODE="$AGENTSIN_ROOT_SECURITY_NODE" \
+            "$vp_bin" test run \
+            src/ProviderCredentialExecutor.root.test.ts \
+            src/ProviderRuntimeSupervisor.root.test.ts \
+            src/ContainedWorkspace.root.test.ts \
+            src/InspectorPtySandbox.root.test.ts \
+            src/main.root.test.ts
 
   test_control_plane_coordination:
     name: Test Control Plane Coordination
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       valkey:
         image: valkey/valkey:8-alpine
@@ -191,8 +249,8 @@ jobs:
   # isolation that flag buys is preserved exactly.
   test_server:
     name: Test Server ${{ matrix.shard }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -258,8 +316,8 @@ jobs:
   # for checks that take under 3s, on the critical path of every PR.
   rust:
     name: Rust
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -286,7 +344,7 @@ jobs:
   # the diff cannot be resolved, the lint runs.
   mobile_native_changes:
     name: Mobile Native Changes
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -364,8 +422,8 @@ jobs:
     # Skip only on an explicit "no": a gate job that failed or errored leaves the
     # output empty, and that must run the lint rather than silently skip it.
     if: ${{ !cancelled() && needs.mobile_native_changes.outputs.changed != 'false' }}
-    runs-on: blacksmith-6vcpu-macos-26
-    timeout-minutes: 10
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -392,8 +450,8 @@ jobs:
 
   release_smoke:
     name: Release Smoke
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v6

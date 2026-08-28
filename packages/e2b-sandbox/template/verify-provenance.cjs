@@ -42,11 +42,13 @@ if (packageDigest !== lock.resolvedAptPackagesSha256) {
 }
 
 const packageRoot = path.dirname(require.resolve("node-pty/package.json"));
+// oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone image verifier has no Effect runtime.
+const architecture = process.arch;
 const nativeCandidates = [
   "build/Release/pty.node",
   "build/Release/spawn-helper",
-  `prebuilds/linux-${process.arch}/pty.node`,
-  `prebuilds/linux-${process.arch}/spawn-helper`,
+  `prebuilds/linux-${architecture}/pty.node`,
+  `prebuilds/linux-${architecture}/spawn-helper`,
 ];
 const nativeArtifacts = nativeCandidates
   .filter((relative) => fs.existsSync(path.join(packageRoot, relative)))

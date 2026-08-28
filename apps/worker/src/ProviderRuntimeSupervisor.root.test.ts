@@ -20,6 +20,7 @@ import { makeNodeWorkerCredentialIdentityRuntime } from "./ProviderCredentialExe
 
 const agentUid = 65_534;
 const agentGid = 65_534;
+const securityNodePath = NodeProcess.env.AGENTSIN_ROOT_SECURITY_NODE ?? NodeProcess.execPath;
 const sourceChildPath = NodeURL.fileURLToPath(
   new URL("./ProviderRuntimeChild.ts", import.meta.url),
 );
@@ -61,11 +62,9 @@ describe.skipIf(NodeProcess.env.AGENTSIN_ROOT_SECURITY_TEST !== "1")(
           const mtlsDirectory = NodePath.join(directory, "worker-mtls");
           const workspaceProof = NodePath.join(workspace, "provider-proof.json");
           const trustedRuntime = NodePath.join(directory, "trusted-runtime");
-          const interpreterPath = NodePath.join(directory, "trusted-node");
+          const interpreterPath = securityNodePath;
           const replaceableInterpreterPath = NodePath.join(directory, "replaceable-node");
-          await NodeFSP.copyFile(NodeProcess.execPath, interpreterPath);
-          await NodeFSP.copyFile(NodeProcess.execPath, replaceableInterpreterPath);
-          await NodeFSP.chmod(interpreterPath, 0o555);
+          await NodeFSP.copyFile(interpreterPath, replaceableInterpreterPath);
           await NodeFSP.chmod(replaceableInterpreterPath, 0o555);
           await NodeFSP.cp(NodePath.dirname(sourceChildPath), trustedRuntime, { recursive: true });
           const modulePath = NodePath.join(

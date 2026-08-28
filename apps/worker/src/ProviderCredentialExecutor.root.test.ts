@@ -20,6 +20,7 @@ const providerInstanceId = "codex-root-security" as ProviderInstanceId;
 const providerDriver = "codex" as ProviderDriverKind;
 const agentUid = 65_534;
 const agentGid = 65_534;
+const securityNodePath = NodeProcess.env.AGENTSIN_ROOT_SECURITY_NODE ?? NodeProcess.execPath;
 
 const encodedBundle = (contents: string) => {
   const path = Buffer.from("auth.json");
@@ -53,10 +54,8 @@ describe.skipIf(NodeProcess.env.AGENTSIN_ROOT_SECURITY_TEST !== "1")(
           await NodeFSP.chmod(directory, 0o711);
           const workspace = NodePath.join(directory, "checkout");
           const privateRoot = NodePath.join(directory, "provider-credentials");
-          const interpreterPath = NodePath.join(directory, "trusted-node");
+          const interpreterPath = securityNodePath;
           await NodeFSP.mkdir(workspace, { mode: 0o755 });
-          await NodeFSP.copyFile(NodeProcess.execPath, interpreterPath);
-          await NodeFSP.chmod(interpreterPath, 0o555);
           const interpreterSha256 = NodeCrypto.createHash("sha256")
             .update(await NodeFSP.readFile(interpreterPath))
             .digest("hex");

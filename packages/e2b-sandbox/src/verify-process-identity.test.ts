@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Test loads the root-owned CommonJS image verifier.
-import { createRequire } from "node:module";
+import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 
 import { expect, it } from "vite-plus/test";
@@ -34,7 +34,7 @@ type ProcessIdentityVerifier = {
   }) => void;
 };
 
-const require = createRequire(import.meta.url);
+const require = NodeModule.createRequire(import.meta.url);
 const verifier = require("../template/verify-process-identity.cjs") as ProcessIdentityVerifier;
 
 const pidRoot = "/fixture/run/desktop/pids";
