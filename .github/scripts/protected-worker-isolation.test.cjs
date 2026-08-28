@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
 const {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -35,7 +36,30 @@ test("protected workflow is default-branch-owned and read-only", () => {
     assert.match(action[2], /^[0-9a-f]{40}$/u, `${action[1]} must be commit pinned`);
   }
   assert.match(workflow, /cache: false/u);
-  assert.match(workflow, /\/usr\/bin\/git diff --exit-code/u);
+  assert.doesNotMatch(workflow, /actions\/checkout|git submodule/u);
+  assert.match(workflow, /GITHUB_EVENT_NAME" == "pull_request_target/u);
+  assert.match(workflow, /event_repository" == "\$GITHUB_REPOSITORY/u);
+  assert.match(workflow, /event_base_repository" == "\$GITHUB_REPOSITORY/u);
+  assert.match(workflow, /event_base_ref" == "\$event_default_branch/u);
+  assert.match(workflow, /event_base_sha" == "\$GITHUB_SHA/u);
+  assert.match(workflow, /PATH=\/usr\/bin:\/bin/u);
+  assert.match(workflow, /GIT_CONFIG_GLOBAL=\/dev\/null/u);
+  assert.match(workflow, /-c credential\.helper=/u);
+  assert.match(workflow, /\+\$\{GITHUB_SHA\}:refs\/aic\/protected-base/u);
+  assert.match(workflow, /--no-recurse-submodules/u);
+  assert.match(workflow, /":\(exclude\)\.repos"/u);
+  assert.match(workflow, /\[\[ ! -e "\$GITHUB_WORKSPACE\/\.git" \]\]/u);
+  assert.match(workflow, /\[\[ ! -e "\$GITHUB_WORKSPACE\/\.repos" \]\]/u);
+  assert.match(workflow, /\/usr\/bin\/sha256sum --check/u);
+  assert.doesNotMatch(workflow, /GITHUB_TOKEN|github\.token|Authorization|extraheader/u);
+  assert.ok(
+    workflow.indexOf('[[ "$event_base_sha" == "$GITHUB_SHA" ]]') <
+      workflow.indexOf('"+${GITHUB_SHA}:refs/aic/protected-base"'),
+  );
+  assert.ok(
+    workflow.indexOf("Fetch protected base without checkout") <
+      workflow.indexOf("Setup protected-base Vite+"),
+  );
   assert.match(
     workflow,
     /node@sha256:85a395c77b811fa7f5b5e4aa69cd6eb4c3b80c7f1a8e34704dc0ce061e5b404e/u,
@@ -45,6 +69,67 @@ test("protected workflow is default-branch-owned and read-only", () => {
   assert.ok(
     workflow.indexOf("Pull digest-pinned toolchain") < workflow.indexOf("Fetch inert PR source"),
   );
+});
+
+test("protected base archive excludes unconfigured gitlinks without creating a checkout", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "agentsin-protected-base-"));
+  const repository = path.join(root, "repository");
+  const extracted = path.join(root, "extracted");
+  const archive = path.join(root, "protected-base.tar");
+  const runGit = (...args) =>
+    execFileSync("/usr/bin/git", ["-C", repository, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+
+  try {
+    mkdirSync(repository);
+    mkdirSync(extracted);
+    execFileSync("/usr/bin/git", ["init", "--quiet", repository]);
+    runGit("config", "user.email", "protected-ci@example.invalid");
+    runGit("config", "user.name", "Protected CI");
+    writeFileSync(path.join(repository, "README.md"), "protected base\n");
+    runGit("add", "README.md");
+    runGit("commit", "--quiet", "-m", "base");
+
+    const commit = runGit("rev-parse", "HEAD");
+    runGit(
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${commit},.repos/alchemy-effect/.vendor/alchemy`,
+    );
+    runGit("commit", "--quiet", "-m", "unconfigured nested gitlink");
+    assert.equal(existsSync(path.join(repository, ".gitmodules")), false);
+    assert.throws(
+      () => runGit("submodule", "foreach", "--recursive", "true"),
+      /No url found for submodule path/u,
+    );
+
+    assert.doesNotThrow(() =>
+      execFileSync(
+        "/usr/bin/git",
+        [
+          "-C",
+          repository,
+          "archive",
+          "--format=tar",
+          `--output=${archive}`,
+          "HEAD",
+          "--",
+          ".",
+          ":(exclude).repos",
+        ],
+        { stdio: "pipe" },
+      ),
+    );
+    execFileSync("/usr/bin/tar", ["--extract", `--file=${archive}`, `--directory=${extracted}`]);
+    assert.equal(readFileSync(path.join(extracted, "README.md"), "utf8"), "protected base\n");
+    assert.equal(existsSync(path.join(extracted, ".git")), false);
+    assert.equal(existsSync(path.join(extracted, ".repos")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("normal pull-request CI never explicitly elevates its compatibility command", () => {
@@ -181,6 +266,7 @@ test("real recursive Git trees validate nested files and reject nested unsafe en
 test("bootstrap documentation delays branch protection until a follow-up PR proves the check", () => {
   assert.match(ciDocumentation, /authoritative only after this workflow exists on `main`/u);
   assert.match(ciDocumentation, /harmless follow-up\s+pull request/u);
+  assert.match(ciDocumentation, /new documentation-only follow-up/u);
   assert.match(ciDocumentation, /Protected Worker Isolation/u);
 });
 
