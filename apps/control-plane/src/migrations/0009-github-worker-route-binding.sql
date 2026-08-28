@@ -56,23 +56,43 @@ BEGIN
 END
 $$;
 
-ALTER TABLE github_worker_token_lease
-  ADD CONSTRAINT github_worker_token_lease_route_operation_key
-    UNIQUE (workspace_id, sandbox_id, operation_id, route_generation),
-  ADD CONSTRAINT github_worker_token_lease_route_binding_required
-    CHECK (
-      used_at IS NOT NULL OR (
-        environment_revision_id IS NOT NULL AND
-        reservation_id IS NOT NULL AND
-        worker_id IS NOT NULL AND
-        provider_instance_id IS NOT NULL AND
-        provider_driver IS NOT NULL AND
-        process_instance_id IS NOT NULL AND
-        certificate_fingerprint IS NOT NULL AND
-        certificate_generation > 0 AND
-        worker_lease_generation > 0 AND
-        route_generation > 0
-      )
-    );
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+     WHERE conrelid = 'github_worker_token_lease'::regclass
+       AND conname = 'github_worker_token_lease_route_operation_key'
+  ) THEN
+    ALTER TABLE github_worker_token_lease
+      ADD CONSTRAINT github_worker_token_lease_route_operation_key
+      UNIQUE (workspace_id, sandbox_id, operation_id, route_generation);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+     WHERE conrelid = 'github_worker_token_lease'::regclass
+       AND conname = 'github_worker_token_lease_route_binding_required'
+  ) THEN
+    ALTER TABLE github_worker_token_lease
+      ADD CONSTRAINT github_worker_token_lease_route_binding_required
+      CHECK (
+        used_at IS NOT NULL OR (
+          environment_revision_id IS NOT NULL AND
+          reservation_id IS NOT NULL AND
+          worker_id IS NOT NULL AND
+          provider_instance_id IS NOT NULL AND
+          provider_driver IS NOT NULL AND
+          process_instance_id IS NOT NULL AND
+          certificate_fingerprint IS NOT NULL AND
+          certificate_generation > 0 AND
+          worker_lease_generation > 0 AND
+          route_generation > 0
+        )
+      );
+  END IF;
+END
+$$;
 
 COMMIT;
