@@ -2336,6 +2336,22 @@ describe("session activity performance", () => {
     }
   }
 
+  function measureBatch(
+    activities: ReadonlyArray<OrchestrationThreadActivity>,
+    repetitions: number,
+  ): number {
+    const startedAt = performance.now();
+    for (let repetition = 0; repetition < repetitions; repetition += 1) {
+      deriveWorkLogEntries(activities);
+    }
+    return performance.now() - startedAt;
+  }
+
+  function median(values: ReadonlyArray<number>): number {
+    const ordered = values.toSorted((left, right) => left - right);
+    return ordered[Math.floor(ordered.length / 2)] ?? 0;
+  }
+
   it("reuses entries for unchanged activities", () => {
     const activities = ["status", "diff", "log"].map((command, index) =>
       makeActivity({
@@ -2392,5 +2408,33 @@ describe("session activity performance", () => {
     expect(() => assertLinearReadGrowth(quadraticSmaller, quadraticLarger, 2)).toThrow(
       "input reads grew superlinearly",
     );
+  });
+
+  it("keeps derived-entry processing well below quadratic growth", () => {
+    const smallerActivities = makeOrderedToolActivities(2_000, "timed-small");
+    const largerActivities = makeOrderedToolActivities(16_000, "timed-large");
+    deriveWorkLogEntries(smallerActivities);
+    deriveWorkLogEntries(largerActivities);
+
+    const smallerSamples: number[] = [];
+    const largerSamples: number[] = [];
+    for (let sample = 0; sample < 7; sample += 1) {
+      const measureSmaller = () => smallerSamples.push(measureBatch(smallerActivities, 8));
+      const measureLarger = () => largerSamples.push(measureBatch(largerActivities, 1));
+      if (sample % 2 === 0) {
+        measureSmaller();
+        measureLarger();
+      } else {
+        measureLarger();
+        measureSmaller();
+      }
+    }
+
+    // Both batches process 16,000 total entries. Linear work therefore takes
+    // similar time, while quadratic work takes about 8x longer in the single
+    // large call. Alternating order and comparing medians filters isolated
+    // shared-runner pauses without relying on an absolute machine-speed limit.
+    const normalizedGrowth = median(largerSamples) / median(smallerSamples);
+    expect(normalizedGrowth).toBeLessThan(5);
   });
 });
