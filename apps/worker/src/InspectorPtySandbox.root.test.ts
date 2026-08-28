@@ -28,8 +28,22 @@ const runProbe = (
     let output = "";
     let receipt: ReadonlyArray<string> | undefined;
     const parse = () => {
-      const line = output.split(/\r?\n/u).find((candidate) => candidate.startsWith(`${marker}|`));
-      if (line !== undefined) receipt = line.split("|").slice(1);
+      for (const line of output.split(/\r?\n/u)) {
+        if (!line.startsWith(`${marker}|`)) continue;
+        const fields = line.split("|").slice(1);
+        if (
+          fields.length === 12 &&
+          /^\d+$/u.test(fields[0] ?? "") &&
+          /^\d+$/u.test(fields[1] ?? "") &&
+          /^\d+(?: \d+)*$/u.test(fields[2] ?? "") &&
+          /^[a-fA-F0-9]+$/u.test(fields[3] ?? "") &&
+          /^[01]$/u.test(fields[4] ?? "") &&
+          /^net:\[\d+\]$/u.test(fields[5] ?? "") &&
+          fields.slice(6).every((field) => /^[01]$/u.test(field))
+        ) {
+          receipt = fields;
+        }
+      }
     };
     const dataSubscription = pty.onData((chunk) => {
       output += chunk;

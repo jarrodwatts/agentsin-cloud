@@ -111,16 +111,28 @@ jobs:
       - name: Install Bubblewrap security boundary
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes bubblewrap
 
+      - name: Stage audited Node interpreter for identity probes
+        run: |
+          sudo install -d -o root -g root -m 0755 /usr/local/lib/agentsin-ci
+          sudo install -o root -g root -m 0555 "$(command -v node)" /usr/local/lib/agentsin-ci/node
+          test "$(stat -c '%u:%g:%a' /usr/local/lib/agentsin-ci/node)" = "0:0:555"
+          sha256sum /usr/local/lib/agentsin-ci/node
+          sudo /usr/bin/setpriv --reuid=65534 --regid=65534 --clear-groups -- \
+            /usr/local/lib/agentsin-ci/node -e \
+            'if(process.getuid()!==65534||process.getgid()!==65534||process.getgroups().some((group)=>group!==65534))process.exit(1)'
+
       - name: Prove worker and agent kernel isolation
         working-directory: apps/worker
         env:
           AGENTSIN_ROOT_SECURITY_TEST: "1"
+          AGENTSIN_ROOT_SECURITY_NODE: /usr/local/lib/agentsin-ci/node
         run: |
           # setup-vp guarantees this executable, while pnpm is an implementation
           # detail that is not placed on PATH by every supported runner.
           vp_bin="$(command -v vp)"
           test -n "$vp_bin"
           sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST="$AGENTSIN_ROOT_SECURITY_TEST" \
+            AGENTSIN_ROOT_SECURITY_NODE="$AGENTSIN_ROOT_SECURITY_NODE" \
             "$vp_bin" test run \
             src/ProviderCredentialExecutor.root.test.ts \
             src/ProviderRuntimeSupervisor.root.test.ts \

@@ -13,6 +13,7 @@ import { openContainedWorkspace } from "./ContainedWorkspace.ts";
 
 const agentUid = 65_534;
 const agentGid = 65_534;
+const securityNodePath = NodeProcess.env.AGENTSIN_ROOT_SECURITY_NODE ?? NodeProcess.execPath;
 
 const probePreparedPath = (
   workspace: string,
@@ -21,7 +22,7 @@ const probePreparedPath = (
   new Promise((resolve, reject) => {
     let output = "";
     const child = NodeChildProcess.spawn(
-      NodeProcess.execPath,
+      securityNodePath,
       [
         "-e",
         `const fs=require("node:fs");
