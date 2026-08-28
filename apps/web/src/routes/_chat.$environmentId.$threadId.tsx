@@ -112,6 +112,7 @@ function ChatThreadRouteView() {
                   enabled: true as const,
                   view: visualFixture.timeline,
                 },
+                devCloudThreadFocusCanvas: visualFixture.focusCanvas,
               })}
         />
       ) : null}

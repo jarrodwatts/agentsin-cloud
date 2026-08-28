@@ -12,6 +12,10 @@ import {
 } from "../../rightPanelStore";
 import { CloudDesktopInspector } from "./CloudDesktopInspector";
 import {
+  DevCloudThreadFocusCanvas,
+  shouldRenderDevCloudThreadFocusCanvas,
+} from "./DevCloudThreadFocusCanvas";
+import {
   CLOUD_THREAD_VISUAL_FIXTURE_QUERY_KEY,
   CLOUD_THREAD_VISUAL_FIXTURE_QUERY_VALUE,
   resolveDevCloudThreadVisualFixture,
@@ -115,6 +119,7 @@ afterEach(() => {
 
 describe("active cloud-thread visual fixture", () => {
   it("requires the exact hidden query value and stays disabled by default", () => {
+    expect(shouldRenderDevCloudThreadFocusCanvas(false)).toBe(false);
     expect(resolveDevCloudThreadVisualFixture({ ...input, search: "" })).toBeNull();
     expect(
       resolveDevCloudThreadVisualFixture({
@@ -129,6 +134,7 @@ describe("active cloud-thread visual fixture", () => {
     vi.stubEnv("DEV", false);
 
     expect(resolveDevCloudThreadVisualFixture(input)).toBeNull();
+    expect(shouldRenderDevCloudThreadFocusCanvas(true)).toBe(false);
   });
 
   it("provides a healthy active thread with realistic cloud activity", () => {
@@ -153,6 +159,33 @@ describe("active cloud-thread visual fixture", () => {
       accruedMicroUsdc: 180_000,
       composerState: "ready",
     });
+    expect(fixture.focusCanvas).toMatchObject({
+      userRequest:
+        "Fix the checkout race, verify it with focused tests, and push a safe checkpoint.",
+      checkpoint: { sha: "8c1f2ab", label: "Verified checkpoint pushed" },
+    });
+  });
+
+  it("renders a deterministic focus canvas instead of persisted thread content", () => {
+    const fixture = resolveDevCloudThreadVisualFixture(input);
+    if (fixture === null) throw new Error("fixture was not enabled");
+    const markup = renderToStaticMarkup(
+      <DevCloudThreadFocusCanvas fixture={fixture.focusCanvas} view={fixture.timeline} />,
+    );
+
+    expect(shouldRenderDevCloudThreadFocusCanvas(true)).toBe(true);
+    expect(markup).toContain('data-dev-cloud-focus-canvas="true"');
+    expect(markup).toContain(fixture.focusCanvas.userRequest);
+    expect(markup).toContain("Started the E2B cloud workspace");
+    expect(markup).toContain("Codex is working in the cloud");
+    expect(markup).toContain("Ran 28 focused tests");
+    expect(markup).toContain("Pushed a verified checkpoint");
+    expect(markup).toContain("2 files changed");
+    expect(markup).toContain("src/services/checkout.ts");
+    expect(markup).toContain("tests/checkout/checkout.test.ts");
+    expect(markup).toContain("Verified checkpoint pushed");
+    expect(markup).toContain("8c1f2ab");
+    expect(markup).not.toContain("expired");
   });
 
   it("renders the existing live inspector in agent and user control states", () => {
@@ -166,13 +199,20 @@ describe("active cloud-thread visual fixture", () => {
       sendInput: vi.fn(() => true),
     };
     const agentMarkup = renderToStaticMarkup(
-      <CloudDesktopInspector snapshot={fixture.desktop.agentControlled} actions={actions} />,
+      <CloudDesktopInspector
+        snapshot={fixture.desktop.agentControlled}
+        actions={actions}
+        referenceMode
+      />,
     );
     const userMarkup = renderToStaticMarkup(
       <CloudDesktopInspector snapshot={fixture.desktop.userControlled} actions={actions} />,
     );
 
     expect(agentMarkup).toContain('data-cloud-desktop-status="live"');
+    expect(agentMarkup).toContain('data-cloud-desktop-reference-mode="true"');
+    expect(agentMarkup).toContain("object-cover object-[center_12%]");
+    expect(agentMarkup).not.toContain("object-contain");
     expect(agentMarkup).toContain("Agent controlling");
     expect(agentMarkup).toContain("Take Control");
     expect(agentMarkup).toContain('src="/assets/agents-in-cloud-desktop-preview.png"');

@@ -51,6 +51,8 @@ export interface CloudDesktopInspectorProps extends Omit<ComponentProps<"section
   readonly actions: CloudDesktopInspectorActions;
   /** Reference-only fallback override for deterministic visual tests. */
   readonly referenceAssetSrc?: string;
+  /** Crops the deterministic portrait fixture into the live landscape surface. */
+  readonly referenceMode?: boolean;
 }
 
 export function cloudDesktopTabStatus(snapshot: LiveDesktopSnapshot): CloudDesktopTabStatus {
@@ -258,6 +260,7 @@ export function CloudDesktopInspector({
   snapshot,
   actions,
   referenceAssetSrc = CLOUD_DESKTOP_PREVIEW_ASSET,
+  referenceMode = false,
   className,
   ...props
 }: CloudDesktopInspectorProps) {
@@ -310,6 +313,7 @@ export function CloudDesktopInspector({
       aria-label="Cloud desktop inspector"
       className={cn("flex min-h-0 min-w-0 flex-1 flex-col bg-background", className)}
       data-cloud-desktop-inspector
+      data-cloud-desktop-reference-mode={referenceMode ? "true" : undefined}
       data-cloud-desktop-status={cloudDesktopTabStatus(snapshot)}
       {...props}
     >
@@ -375,8 +379,11 @@ export function CloudDesktopInspector({
               <img
                 key={snapshot.frameUrl}
                 src={snapshot.frameUrl}
-                alt="Live cloud desktop frame"
-                className="block size-full select-none object-contain"
+                alt={referenceMode ? "Cloud desktop reference frame" : "Live cloud desktop frame"}
+                className={cn(
+                  "block size-full select-none",
+                  referenceMode ? "object-cover object-[center_12%]" : "object-contain",
+                )}
                 draggable={false}
               />
             ) : unavailable ? (

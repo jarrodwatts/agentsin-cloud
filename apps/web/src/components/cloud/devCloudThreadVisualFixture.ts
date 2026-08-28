@@ -36,8 +36,23 @@ export interface CloudDesktopVisualFixture {
   readonly userControlled: LiveDesktopSnapshot;
 }
 
+export interface DevCloudThreadFocusCanvasFixture {
+  readonly userRequest: string;
+  readonly agentSummary: string;
+  readonly files: ReadonlyArray<{
+    readonly path: string;
+    readonly additions: number;
+    readonly deletions: number;
+  }>;
+  readonly checkpoint: {
+    readonly sha: string;
+    readonly label: string;
+  };
+}
+
 export interface DevCloudThreadVisualFixture {
   readonly desktop: CloudDesktopVisualFixture;
+  readonly focusCanvas: DevCloudThreadFocusCanvasFixture;
   readonly timeline: CloudThreadTimelineView;
 }
 
@@ -179,6 +194,20 @@ export function resolveDevCloudThreadVisualFixture(input: {
 
   return {
     desktop: desktopSnapshots(input),
+    focusCanvas: {
+      userRequest:
+        "Fix the checkout race, verify it with focused tests, and push a safe checkpoint.",
+      agentSummary:
+        "I found the checkout ownership race and moved the lock boundary around the shared transaction. I’m verifying the fix before preparing the branch for review.",
+      files: [
+        { path: "src/services/checkout.ts", additions: 86, deletions: 12 },
+        { path: "tests/checkout/checkout.test.ts", additions: 54, deletions: 0 },
+      ],
+      checkpoint: {
+        sha: "8c1f2ab",
+        label: "Verified checkpoint pushed",
+      },
+    },
     timeline: {
       phase: "ready",
       events,

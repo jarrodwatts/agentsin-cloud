@@ -113,6 +113,7 @@ function DraftChatThreadRouteView() {
                 enabled: true as const,
                 view: visualFixture.timeline,
               },
+              devCloudThreadFocusCanvas: visualFixture.focusCanvas,
             })}
       />
     </SidebarInset>
