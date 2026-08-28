@@ -1,58 +1,33 @@
-# Install T3 Code
+# Run Agents in Cloud from source
 
-T3 Code is a web and desktop GUI for running coding agents on your machine.
+Agents in Cloud does not have a public desktop binary or hosted beta yet. The
+[Releases page](https://github.com/jarrodwatts/agentsin-cloud/releases) is the source of truth for
+future published builds. The upstream T3 Code downloads and package-registry entries are not Agents
+in Cloud releases.
 
 ## Requirements
 
-Node.js `^22.16 || ^23.11 || >=24.10` on the machine that runs the T3 Code server.
+Node.js `^24.13.1` and the [Vite+](https://viteplus.dev/guide/) `vp` command.
 
-At least one provider CLI, installed and authenticated. See [Providers](#providers) below.
+For the inherited local development runtime, install and authenticate at least one provider CLI.
+See [Providers](#providers) below.
 
-## Run Without Installing
-
-```bash
-npx t3@latest
-```
-
-This starts the T3 Code server on your machine and opens the local web app. Use
-`npx t3@latest --help` for the full CLI reference.
-
-## Desktop App
-
-Download the latest release from
-[GitHub Releases](https://github.com/pingdotgg/t3code/releases), or install from a package
-registry.
-
-Windows:
+## Start the development app
 
 ```bash
-winget install T3Tools.T3Code
+curl -fsSL https://vite.plus | bash
+vp i
+vp run dev:desktop
 ```
 
-macOS:
-
-```bash
-brew install --cask t3-code
-```
-
-Arch Linux:
-
-Stable:
-
-```bash
-yay -S t3code-bin
-```
-
-Nightly:
-
-```bash
-yay -S t3code-nightly-bin
-```
+This starts the Electron development client and its local T3-derived server. It is a source
+development workflow, not a production cloud deployment. Worktree development uses repository-local
+`.t3` state; never point it at a live `~/.t3` data directory.
 
 ## Providers
 
-T3 Code drives provider CLIs; it does not ship them. Install the CLI for each provider you want
-to use, then authenticate it.
+The inherited local runtime drives provider CLIs; it does not ship them. Install the CLI for each
+provider you want to use, then authenticate it.
 
 | Provider   | CLI                                                   | Default binary | Log in with           |
 | ---------- | ----------------------------------------------------- | -------------- | --------------------- |
@@ -66,34 +41,34 @@ Codex and Claude are on by default. Cursor, Grok Build, and OpenCode are off by 
 them on in **Settings** → the provider's card when you want to use them.
 
 Cursor is the one to watch: install Cursor CLI, which provides the `cursor-agent` binary that
-T3 Code looks for, but authenticate with `agent login`, not `cursor-agent login`.
+the runtime looks for, but authenticate with `agent login`, not `cursor-agent login`.
 
 Grok models that support adjustable reasoning show a **Reasoning** control beside the model picker.
 The available levels and default come from the installed Grok Build CLI, so they can vary by model
 and CLI version.
 
-Run the login command on the machine running the T3 Code server, not on the device you browse
-from.
+Run the login command on the machine running the development server. These local credentials are
+for development only; Agents in Cloud never copies raw local provider credentials into cloud
+sandboxes.
 
 ### Binary Discovery
 
 Each provider CLI must be on the server's `PATH`, or have an explicit binary path set in
 **Settings** → the provider instance → **Binary path**. Use the explicit path when a version
 manager or a non-standard install location keeps the CLI off the `PATH` of the shell that
-started T3 Code.
+started the server.
 
 ### When Auth Is Needed
 
-Provider auth is required before you start a session with that provider, not before you start
-T3 Code. You can install T3 Code, open it, and add providers afterwards. A provider that is not
-authenticated shows its status in **Settings** and fails at session start with the login command
-to run.
+Provider auth is required before you start a local development session with that provider, not
+before you start the app. A provider that is not authenticated shows its status in **Settings** and
+fails at session start with the login command to run.
 
 For multi-account setups, see [Codex](./providers-codex.md) and [Claude](./providers-claude.md).
 
 ## Next Steps
 
-- [Permission modes](./permission-modes.md): how much T3 Code asks before acting
+- [Permission modes](./permission-modes.md): how much the inherited runtime asks before acting
 - [Remote access](./remote-access.md): connect from a phone, tablet, or another desktop
-- [Keeping T3 Code in sync](./updating.md): client and server version skew
+- [Keeping the inherited runtime in sync](./updating.md): client and server version skew
 - [Running in the background](./background-service.md): Linux background service
