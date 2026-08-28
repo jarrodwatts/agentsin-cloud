@@ -13,14 +13,83 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Checkout protected base
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+      - name: Fetch protected base without checkout
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "pull_request_target" ]]
+          [[ "$GITHUB_SERVER_URL" == "https://github.com" ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          event_repository="$(/usr/bin/jq --exit-status --raw-output '.repository.full_name' "$GITHUB_EVENT_PATH")"
+          event_base_repository="$(/usr/bin/jq --exit-status --raw-output '.pull_request.base.repo.full_name' "$GITHUB_EVENT_PATH")"
+          event_base_ref="$(/usr/bin/jq --exit-status --raw-output '.pull_request.base.ref' "$GITHUB_EVENT_PATH")"
+          event_default_branch="$(/usr/bin/jq --exit-status --raw-output '.repository.default_branch' "$GITHUB_EVENT_PATH")"
+          event_base_sha="$(/usr/bin/jq --exit-status --raw-output '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
+          [[ "$event_repository" == "$GITHUB_REPOSITORY" ]]
+          [[ "$event_base_repository" == "$GITHUB_REPOSITORY" ]]
+          [[ "$event_base_ref" == "$event_default_branch" ]]
+          [[ "$event_base_sha" == "$GITHUB_SHA" ]]
+          [[ -z "$(/usr/bin/find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
+          object_directory="$(/usr/bin/mktemp -d "$RUNNER_TEMP/agentsin-protected-base-objects.XXXXXX")"
+          archive="$(/usr/bin/mktemp "$RUNNER_TEMP/agentsin-protected-base.XXXXXX.tar")"
+          cleanup() {
+            /usr/bin/rm -rf "$object_directory" "$archive"
+          }
+          trap cleanup EXIT
+
+          git_command=(
+            /usr/bin/env
+            PATH=/usr/bin:/bin
+            GIT_CONFIG_GLOBAL=/dev/null
+            GIT_CONFIG_NOSYSTEM=1
+            GIT_TERMINAL_PROMPT=0
+            /usr/bin/git
+            -c credential.helper=
+          )
+          "${git_command[@]}" init --quiet "$object_directory"
+          "${git_command[@]}" -C "$object_directory" remote add origin \
+            "https://github.com/${GITHUB_REPOSITORY}.git"
+          "${git_command[@]}" -C "$object_directory" fetch \
+            --quiet \
+            --no-tags \
+            --no-recurse-submodules \
+            --depth=1 \
+            --filter=blob:none \
+            origin \
+            "+${GITHUB_SHA}:refs/aic/protected-base"
+          fetched_sha="$("${git_command[@]}" -C "$object_directory" rev-parse \
+            'refs/aic/protected-base^{commit}')"
+          [[ "$fetched_sha" == "$GITHUB_SHA" ]]
+          "${git_command[@]}" -C "$object_directory" archive \
+            --format=tar \
+            --output="$archive" \
+            refs/aic/protected-base \
+            -- \
+            . \
+            ":(exclude).repos"
+          /usr/bin/tar \
+            --extract \
+            --file="$archive" \
+            --directory="$GITHUB_WORKSPACE" \
+            --no-same-owner \
+            --no-same-permissions
+          [[ ! -e "$GITHUB_WORKSPACE/.git" ]]
+          [[ ! -e "$GITHUB_WORKSPACE/.repos" ]]
+
+          protected_files=(
+            .github/scripts/protected-worker-container-entrypoint.sh
+            .github/scripts/protected-worker-container-probe.mjs
+            .github/scripts/protected-worker-isolation.sh
+            .github/scripts/protected-worker-isolation.test.cjs
+            .github/scripts/protected-worker-source-lib.cjs
+            .github/scripts/protected-worker-source.cjs
+            .github/workflows/protected-worker-isolation.yml
+          )
+          (
+            cd "$GITHUB_WORKSPACE"
+            /usr/bin/sha256sum "${protected_files[@]}"
+          ) > "$RUNNER_TEMP/agentsin-protected-base.sha256"
 
       - name: Setup protected-base Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb
@@ -31,17 +100,8 @@ jobs:
 
       - name: Verify base harness stayed immutable
         run: |
-          protected_files=(
-            .github/scripts/protected-worker-container-entrypoint.sh
-            .github/scripts/protected-worker-container-probe.mjs
-            .github/scripts/protected-worker-isolation.sh
-            .github/scripts/protected-worker-isolation.test.cjs
-            .github/scripts/protected-worker-source-lib.cjs
-            .github/scripts/protected-worker-source.cjs
-            .github/workflows/protected-worker-isolation.yml
-          )
-          /usr/bin/git diff --exit-code -- "${protected_files[@]}"
-          /usr/bin/git diff --cached --exit-code -- "${protected_files[@]}"
+          cd "$GITHUB_WORKSPACE"
+          /usr/bin/sha256sum --check "$RUNNER_TEMP/agentsin-protected-base.sha256"
 
       - name: Verify protected workflow invariants
         run: node --test .github/scripts/protected-worker-isolation.test.cjs
