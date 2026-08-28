@@ -1492,6 +1492,16 @@ it.effect("rebinds only after an uncertain transfer is definitively not applied"
           ),
         )).rows,
       ).toEqual([{ generation: 1 }]);
+      expect(
+        (yield* settlementService(
+          pool,
+          chain,
+          signer(),
+          runtime.runtime,
+          "settler-rebind-pause-authorization",
+          "2026-08-28T00:15:11.000Z",
+        ).recoverPending()).billingPaused,
+      ).toBe(1);
       yield* Effect.promise(() => addAuthorization(pool, "settlement-authorization-rebound"));
       yield* Effect.promise(() =>
         makePostgresUsageSettlementRepository(pool).claimAuthorizationRecovery(
