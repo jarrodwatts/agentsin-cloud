@@ -44,6 +44,7 @@ const migrate = async () => {
       "0013-cloud-thread-runtime.sql",
       "0014-usage-ledger.sql",
       "0015-e2b-template-identity.sql",
+      "0016-usage-settlements.sql",
     ];
     for (const filename of applicationMigrations) {
       const migration = await NodeFSP.readFile(

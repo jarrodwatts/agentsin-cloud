@@ -2365,6 +2365,175 @@ export const UsageAccrualSettlementInput = Schema.Struct({
   .annotate({ parseOptions: { onExcessProperty: "error" } });
 export type UsageAccrualSettlementInput = typeof UsageAccrualSettlementInput.Type;
 
+export const UsageSettlementTrigger = Schema.Literals([
+  "five-minute-window",
+  "amount-threshold",
+  "sandbox-paused",
+  "sandbox-closed",
+]);
+export type UsageSettlementTrigger = typeof UsageSettlementTrigger.Type;
+
+export const UsageSettlementAttemptState = Schema.Literals([
+  "reserved",
+  "submission-pending",
+  "reconciliation-required",
+  "transfer-applied",
+  "low-balance-pause-pending",
+  "low-balance-paused",
+  "finalized",
+]);
+export type UsageSettlementAttemptState = typeof UsageSettlementAttemptState.Type;
+
+/** One immutable H4 pricing transition included in a settlement without repricing. */
+export const UsageSettlementAccrualPosting = Schema.Struct({
+  accrualId: UsageAccrualId,
+  sampleId: UsageSampleId,
+  environmentId: EnvironmentId,
+  sandboxId: SandboxId,
+  evidenceId: UsageEvidenceId,
+  evidenceRevision: PositiveInt,
+  evidencePayloadSha256: UsageEvidenceSha256,
+  receiptInputSha256: UsageEvidenceSha256,
+  pricingSequence: PositiveInt,
+  intervalStart: CanonicalUsageIsoDateTime,
+  intervalEnd: CanonicalUsageIsoDateTime,
+  upstreamDeltaMicroUsdc: SignedMicroUsdc,
+  markupDeltaMicroUsdc: SignedMicroUsdc,
+  totalDeltaMicroUsdc: SignedMicroUsdc,
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      (input.intervalStart < input.intervalEnd &&
+        input.totalDeltaMicroUsdc === input.upstreamDeltaMicroUsdc + input.markupDeltaMicroUsdc) ||
+      "settlement posting must preserve its immutable interval and signed H4 deltas",
+    { identifier: "UsageSettlementAccrualPostingLinkage" },
+  ),
+);
+export type UsageSettlementAccrualPosting = typeof UsageSettlementAccrualPosting.Type;
+
+export const UsageSettlementEvidenceRange = Schema.Struct({
+  firstSampleId: UsageSampleId,
+  lastSampleId: UsageSampleId,
+  firstEvidenceId: UsageEvidenceId,
+  firstEvidenceRevision: PositiveInt,
+  lastEvidenceId: UsageEvidenceId,
+  lastEvidenceRevision: PositiveInt,
+  firstPricingSequence: PositiveInt,
+  lastPricingSequence: PositiveInt,
+  accrualCount: PositiveInt,
+  intervalStart: CanonicalUsageIsoDateTime,
+  intervalEnd: CanonicalUsageIsoDateTime,
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      (input.firstPricingSequence <= input.lastPricingSequence &&
+        input.intervalStart < input.intervalEnd) ||
+      "settlement evidence range must be ordered and non-empty",
+    { identifier: "UsageSettlementEvidenceRangeOrder" },
+  ),
+);
+export type UsageSettlementEvidenceRange = typeof UsageSettlementEvidenceRange.Type;
+
+/** Signed receipt payload produced only after one exact Monad USDC transfer is observed. */
+export const UsageSettlementReceiptPayload = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  settlementId: SettlementId,
+  workspaceId: WorkspaceId,
+  threadId: ThreadId,
+  infrastructureProvider: HostedInfrastructureProvider,
+  evidenceRange: UsageSettlementEvidenceRange,
+  postings: Schema.Array(UsageSettlementAccrualPosting).check(Schema.isMinLength(1)),
+  upstreamMicroUsdc: SignedMicroUsdc,
+  markupMicroUsdc: SignedMicroUsdc,
+  totalMicroUsdc: MicroUsdc.check(Schema.isGreaterThan(0)),
+  txHash: EvmTransactionHash,
+  createdAt: CanonicalUsageIsoDateTime,
+  submittedAt: CanonicalUsageIsoDateTime,
+})
+  .check(
+    Schema.makeFilter(
+      (input) => {
+        const upstream = input.postings.reduce(
+          (total, posting) => total + BigInt(posting.upstreamDeltaMicroUsdc),
+          0n,
+        );
+        const markup = input.postings.reduce(
+          (total, posting) => total + BigInt(posting.markupDeltaMicroUsdc),
+          0n,
+        );
+        const total = input.postings.reduce(
+          (sum, posting) => sum + BigInt(posting.totalDeltaMicroUsdc),
+          0n,
+        );
+        const first = input.postings[0];
+        const last = input.postings[input.postings.length - 1];
+        const ordered = input.postings.every(
+          (posting, index) =>
+            index === 0 || input.postings[index - 1]!.pricingSequence < posting.pricingSequence,
+        );
+        const intervalStart = input.postings.reduce(
+          (minimum, posting) => (posting.intervalStart < minimum ? posting.intervalStart : minimum),
+          first?.intervalStart ?? input.evidenceRange.intervalStart,
+        );
+        const intervalEnd = input.postings.reduce(
+          (maximum, posting) => (posting.intervalEnd > maximum ? posting.intervalEnd : maximum),
+          first?.intervalEnd ?? input.evidenceRange.intervalEnd,
+        );
+        return (
+          (first !== undefined &&
+            last !== undefined &&
+            input.createdAt <= input.submittedAt &&
+            ordered &&
+            upstream === BigInt(input.upstreamMicroUsdc) &&
+            markup === BigInt(input.markupMicroUsdc) &&
+            total === BigInt(input.totalMicroUsdc) &&
+            total === upstream + markup &&
+            input.evidenceRange.accrualCount === input.postings.length &&
+            input.evidenceRange.intervalStart === intervalStart &&
+            input.evidenceRange.intervalEnd === intervalEnd &&
+            input.evidenceRange.firstSampleId === first.sampleId &&
+            input.evidenceRange.lastSampleId === last.sampleId &&
+            input.evidenceRange.firstEvidenceId === first.evidenceId &&
+            input.evidenceRange.firstEvidenceRevision === first.evidenceRevision &&
+            input.evidenceRange.lastEvidenceId === last.evidenceId &&
+            input.evidenceRange.lastEvidenceRevision === last.evidenceRevision &&
+            input.evidenceRange.firstPricingSequence === first.pricingSequence &&
+            input.evidenceRange.lastPricingSequence === last.pricingSequence) ||
+          "settlement receipt must exactly bind its ordered signed H4 postings and transfer"
+        );
+      },
+      { identifier: "UsageSettlementReceiptPayloadLinkage" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type UsageSettlementReceiptPayload = typeof UsageSettlementReceiptPayload.Type;
+
+export const UsageSettlementReceiptSignature = Schema.Struct({
+  algorithm: TrimmedNonEmptyString,
+  keyId: TrimmedNonEmptyString,
+  payloadHash: UsageEvidenceSha256,
+  signature: TrimmedNonEmptyString,
+  signedAt: CanonicalUsageIsoDateTime,
+});
+export type UsageSettlementReceiptSignature = typeof UsageSettlementReceiptSignature.Type;
+
+export const UsageSettlementReceipt = Schema.Struct({
+  payload: UsageSettlementReceiptPayload,
+  payloadSha256: UsageEvidenceSha256,
+  signature: UsageSettlementReceiptSignature,
+})
+  .check(
+    Schema.makeFilter(
+      (input) =>
+        (input.signature.payloadHash === input.payloadSha256 &&
+          input.signature.signedAt >= input.payload.submittedAt) ||
+        "settlement receipt signature must bind the exact payload hash",
+      { identifier: "UsageSettlementReceiptSignatureLinkage" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type UsageSettlementReceipt = typeof UsageSettlementReceipt.Type;
+
 /** Hosted billing accepts sandbox infrastructure meters only, never agent/provider usage. */
 export const UsageMeter = Schema.Literals([
   "e2b.sandbox.cpu.millisecond",

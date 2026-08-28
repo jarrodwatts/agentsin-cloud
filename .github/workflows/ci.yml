@@ -182,6 +182,7 @@ jobs:
           src/providerCredentialStore.postgres.test.ts
           src/threadEventStore.postgres.test.ts
           src/usageLedger.postgres.test.ts
+          src/usageSettlement.postgres.test.ts
           src/walletService.postgres.test.ts
 
   # apps/server sets `fileParallelism: false`, so its 239 files run strictly

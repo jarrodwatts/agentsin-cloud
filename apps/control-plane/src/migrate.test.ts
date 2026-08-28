@@ -4,7 +4,7 @@ import * as NodeFSP from "node:fs/promises";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
-it.effect("runs application migrations in strict 0001 through 0015 order", () =>
+it.effect("keeps E2B template identity migration 0015 before settlement migration 0016", () =>
   Effect.gen(function* () {
     const source = yield* Effect.promise(() =>
       NodeFSP.readFile(new URL("./migrate.ts", import.meta.url), "utf8"),
@@ -25,6 +25,7 @@ it.effect("runs application migrations in strict 0001 through 0015 order", () =>
       "0013-",
       "0014-",
       "0015-",
+      "0016-",
     ].map((marker) => source.indexOf(marker));
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));
