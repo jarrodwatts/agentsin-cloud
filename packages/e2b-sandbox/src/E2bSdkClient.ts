@@ -706,7 +706,10 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
             metadata: { ...input.metadata },
             secure: true,
             network: { allowPublicTraffic: false },
-            lifecycle: { onTimeout: "pause", autoResume: false },
+            lifecycle: {
+              onTimeout: { action: "pause", keepMemory: true },
+              autoResume: false,
+            },
           });
         } catch (cause) {
           const failure =
@@ -997,7 +1000,14 @@ export const makeE2bSdkClient = (options: E2bSdkClientOptions): E2bClient => {
       }),
     pause: (sandboxId) =>
       safe("pause", async () => {
-        await sdk.pause(sandboxId, { ...connection(), keepMemory: true });
+        const paused = await sdk.pause(sandboxId, { ...connection(), keepMemory: true });
+        if (!paused) {
+          throw new E2bClientFailure({
+            code: "unavailable",
+            message: "E2B did not confirm the sandbox pause",
+            retryable: true,
+          });
+        }
       }),
     snapshot: (sandboxId, label, activeTimeoutMs) =>
       safe("snapshot", async () => {

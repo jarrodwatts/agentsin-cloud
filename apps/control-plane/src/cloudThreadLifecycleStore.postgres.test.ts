@@ -195,6 +195,10 @@ it.effect("tenant-scopes reservation identity and preserves the cleanup fence in
         sharedReservationId,
         identity(reservationA, sandboxA),
       );
+      expect(await store.reserve(reservationA)).toMatchObject({
+        state: "active",
+        identity: { sandboxId: sandboxA, threadId: threads.identityA },
+      });
       await store.markReservationFailed(
         workspaceB,
         sharedReservationId,

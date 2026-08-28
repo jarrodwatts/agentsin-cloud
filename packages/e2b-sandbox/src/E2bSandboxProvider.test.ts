@@ -142,6 +142,7 @@ const makeHarness = (options?: {
   readonly createFailure?: boolean;
   readonly clientOverride?: E2bClient;
   readonly destroyFailure?: boolean;
+  readonly destroyUnconfirmed?: boolean;
   readonly ptyOutput?: string;
   readonly activeTimeoutMs?: number;
 }) => {
@@ -300,6 +301,7 @@ const makeHarness = (options?: {
           retryable: true,
         });
       }
+      if (options?.destroyUnconfirmed === true) return false;
       destroyed = true;
       return true;
     },
@@ -313,6 +315,23 @@ const makeHarness = (options?: {
         if (options?.identityReservationFailure === true) {
           throw new Error("identity reservation failed");
         }
+        const idempotent = reservations.get(record.reservationId);
+        if (idempotent !== undefined) {
+          if (
+            idempotent.workspaceId !== record.workspaceId ||
+            idempotent.threadId !== record.threadId ||
+            idempotent.environmentId !== record.environmentId ||
+            idempotent.revisionId !== record.revisionId
+          ) {
+            throw new Error("reservation identity changed");
+          }
+          if (idempotent.state === "active" && idempotent.providerHandle !== undefined) {
+            const identity = records.get(idempotent.providerHandle);
+            if (identity === undefined) throw new Error("active identity missing");
+            return { state: "active" as const, identity };
+          }
+          return { state: "reserved" as const, disposition: "existing" as const };
+        }
         if (
           [...reservations.values()].some(
             (existing) =>
@@ -324,6 +343,7 @@ const makeHarness = (options?: {
           throw new Error("thread already has a sandbox fence");
         }
         reservations.set(record.reservationId, { ...record, state: "pending" });
+        return { state: "reserved" as const, disposition: "created" as const };
       },
       activateReservation: async (_workspaceId, reservationId, record) => {
         if (options?.identityActivationFailure === true) {
@@ -559,6 +579,17 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
+  it.effect("returns the active durable reservation without creating duplicate compute", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const first = yield* harness.provider.create(createRequest);
+      const replay = yield* harness.provider.create(createRequest);
+
+      expect(replay.sandbox).toEqual(first.sandbox);
+      expect(harness.createCalls()).toBe(1);
+    }),
+  );
+
   it.effect("stores full command output in R2 and keeps summaries bounded", () =>
     Effect.gen(function* () {
       const stdout = "a".repeat(8_000);
@@ -684,7 +715,7 @@ describe("E2B SandboxProvider", () => {
       });
 
       const secondFailure = yield* Effect.flip(harness.provider.create(createRequest));
-      expect(secondFailure.code).toBe("E2B_INTERNAL_ERROR");
+      expect(secondFailure.code).toBe("E2B_CREATE_RECONCILIATION_REQUIRED");
       expect(sdkCreateCalls).toBe(1);
     }),
   );
@@ -842,6 +873,23 @@ describe("E2B SandboxProvider", () => {
       expect(harness.connectCalls()).toBe(1);
       expect(harness.connectTimeouts).toEqual([900_000]);
       expect(connected.connection.credentialRef).toBe("secret-broker/e2b/sandbox-1");
+    }),
+  );
+
+  it.effect("keeps the durable identity active when E2B does not confirm destroy", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness({ destroyUnconfirmed: true });
+      const created = yield* harness.provider.create(createRequest);
+      const failure = yield* Effect.flip(
+        harness.provider.destroy(
+          harness.request(SandboxProviderDestroyRequest, "destroy", {
+            sandboxId: created.sandbox.sandboxId,
+          }),
+        ),
+      );
+
+      expect(failure.code).toBe("E2B_DESTROY_NOT_CONFIRMED");
+      expect(harness.records.get(created.sandbox.sandboxId)?.destroyedAt).toBeUndefined();
     }),
   );
 

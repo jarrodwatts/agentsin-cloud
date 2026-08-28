@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Result from "effect/Result";
 
+import { e2bDescriptionMatchesIdentity, e2bIdentityMetadataFor } from "./identity.ts";
 import { E2B_ACTIVE_TIMEOUT_MS, parseE2bTemplateReference } from "./template.ts";
 import {
   E2bClientFailure,
@@ -22,17 +23,6 @@ import {
 const DEFAULT_MAX_INLINE_FILE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_LIST_ENTRIES = 2_000;
 const DEFAULT_MAX_LIST_BYTES = 2 * 1024 * 1024;
-
-const METADATA = {
-  provider: "agentsin_cloud_provider",
-  workspaceId: "agentsin_cloud_workspace_id",
-  environmentId: "agentsin_cloud_environment_id",
-  projectId: "agentsin_cloud_project_id",
-  threadId: "agentsin_cloud_thread_id",
-  revisionId: "agentsin_cloud_revision_id",
-  reservationId: "agentsin_cloud_reservation_id",
-  repositoryCanonicalKey: "agentsin_cloud_repository_canonical_key",
-} as const;
 
 const error = (
   code: string,
@@ -93,17 +83,6 @@ const inlineFileContent = (bytes: Uint8Array) => {
   }
 };
 
-const metadataFor = (request: Parameters<SandboxProvider["create"]>[0]) => ({
-  [METADATA.provider]: "e2b",
-  [METADATA.workspaceId]: request.workspaceId,
-  [METADATA.environmentId]: request.environmentId,
-  [METADATA.projectId]: request.workspace.projectId,
-  [METADATA.threadId]: request.workspace.threadId,
-  [METADATA.revisionId]: request.revision.revisionId,
-  [METADATA.reservationId]: request.requestId,
-  [METADATA.repositoryCanonicalKey]: request.workspace.repositoryIdentity.canonicalKey,
-});
-
 const createDispositionFrom = (failure: SandboxProviderError) => {
   if (typeof failure.details !== "object" || failure.details === null) return undefined;
   if (!("createDisposition" in failure.details)) return undefined;
@@ -136,17 +115,6 @@ const createDispositionFrom = (failure: SandboxProviderError) => {
     reclaimMetadata: disposition.reclaimMetadata as Readonly<Record<string, string>>,
   };
 };
-
-const remoteIdentityMatches = (remote: E2bSandboxDescription, identity: SandboxIdentityRecord) =>
-  remote.sandboxId === identity.providerHandle &&
-  remote.metadata[METADATA.provider] === "e2b" &&
-  remote.metadata[METADATA.workspaceId] === identity.workspaceId &&
-  remote.metadata[METADATA.environmentId] === identity.environmentId &&
-  remote.metadata[METADATA.projectId] === identity.projectId &&
-  remote.metadata[METADATA.threadId] === identity.threadId &&
-  remote.metadata[METADATA.revisionId] === identity.revisionId &&
-  remote.metadata[METADATA.reservationId] === identity.reservationId &&
-  remote.metadata[METADATA.repositoryCanonicalKey] === identity.repositoryIdentity.canonicalKey;
 
 const toSandbox = (
   identity: SandboxIdentityRecord,
@@ -266,7 +234,7 @@ export const makeE2bSandboxProvider = (
           error("E2B_SANDBOX_NOT_FOUND", "The registered E2B sandbox no longer exists", false),
         );
       }
-      if (!remoteIdentityMatches(remote, identity)) {
+      if (!e2bDescriptionMatchesIdentity(remote, identity)) {
         return yield* Effect.fail(
           error(
             "E2B_IDENTITY_MISMATCH",
@@ -328,14 +296,49 @@ export const makeE2bSandboxProvider = (
           workspaceDirectory: request.workspace.workspaceDirectory,
           requestedAt: request.requestedAt,
         };
-        yield* attempt("identity reservation", () => dependencies.identities.reserve(reservation));
+        const reservationResult = yield* attempt("identity reservation", () =>
+          dependencies.identities.reserve(reservation),
+        );
+        if (reservationResult.state === "active") {
+          const identity = reservationResult.identity;
+          const remote = yield* attempt("inspect idempotent create", () =>
+            dependencies.client.inspect(identity.providerHandle),
+          );
+          if (remote === undefined || !e2bDescriptionMatchesIdentity(remote, identity)) {
+            return yield* Effect.fail(
+              error(
+                "E2B_RESERVATION_RECONCILIATION_REQUIRED",
+                "The existing E2B sandbox reservation requires reconciliation",
+                true,
+                { reservationId: reservation.reservationId },
+              ),
+            );
+          }
+          return {
+            type: "created",
+            requestId: request.requestId,
+            workspaceId: request.workspaceId,
+            sandbox: toSandbox(identity, remote, iso(dependencies.clock.now())),
+            completedAt: iso(dependencies.clock.now()),
+          };
+        }
+        if (reservationResult.disposition === "existing") {
+          return yield* Effect.fail(
+            error(
+              "E2B_CREATE_RECONCILIATION_REQUIRED",
+              "An earlier E2B create with this reservation has an unknown outcome",
+              true,
+              { reservationId: reservation.reservationId },
+            ),
+          );
+        }
         const creation = yield* Effect.result(
           attempt("create", () =>
             dependencies.client.create({
               templateId,
               timeoutMs: activeTimeoutMs,
               metadata: {
-                ...metadataFor(request),
+                ...e2bIdentityMetadataFor(request),
               },
             }),
           ),
@@ -357,7 +360,8 @@ export const makeE2bSandboxProvider = (
                   ...(cleanupRequired?.providerHandle === undefined
                     ? {}
                     : { providerHandle: cleanupRequired.providerHandle }),
-                  reclaimMetadata: cleanupRequired?.reclaimMetadata ?? metadataFor(request),
+                  reclaimMetadata:
+                    cleanupRequired?.reclaimMetadata ?? e2bIdentityMetadataFor(request),
                   recordedAt: iso(dependencies.clock.now()),
                 }),
               ),
@@ -372,7 +376,8 @@ export const makeE2bSandboxProvider = (
                   ...(cleanupRequired?.providerHandle === undefined
                     ? {}
                     : { providerHandle: cleanupRequired.providerHandle }),
-                  reclaimMetadata: cleanupRequired?.reclaimMetadata ?? metadataFor(request),
+                  reclaimMetadata:
+                    cleanupRequired?.reclaimMetadata ?? e2bIdentityMetadataFor(request),
                   durableFenceRecorded: true,
                   durableReclaimRecorded: Exit.isSuccess(reclaim),
                 },
@@ -459,7 +464,7 @@ export const makeE2bSandboxProvider = (
           providerHandle: remote.sandboxId,
           createdAt,
         };
-        if (!remoteIdentityMatches(remote, identity)) {
+        if (!e2bDescriptionMatchesIdentity(remote, identity)) {
           const cleanup = yield* Effect.exit(
             attempt("create cleanup", () => dependencies.client.destroy(remote.sandboxId)),
           );
@@ -611,7 +616,7 @@ export const makeE2bSandboxProvider = (
         const remote = yield* attempt("connect", () =>
           dependencies.client.connect(identity.providerHandle, activeTimeoutMs),
         );
-        if (!remoteIdentityMatches(remote, identity)) {
+        if (!e2bDescriptionMatchesIdentity(remote, identity)) {
           return yield* Effect.fail(
             error("E2B_IDENTITY_MISMATCH", "Connected E2B sandbox metadata changed", false),
           );
@@ -803,7 +808,7 @@ export const makeE2bSandboxProvider = (
         const remote = yield* attempt("resume", () =>
           dependencies.client.connect(identity.providerHandle, activeTimeoutMs),
         );
-        if (!remoteIdentityMatches(remote, identity)) {
+        if (!e2bDescriptionMatchesIdentity(remote, identity)) {
           return yield* Effect.fail(
             error("E2B_IDENTITY_MISMATCH", "Resumed E2B sandbox metadata changed", false),
           );
@@ -941,7 +946,7 @@ export const makeE2bSandboxProvider = (
           const remote = yield* attempt("inspect", () =>
             dependencies.client.inspect(identity.providerHandle),
           );
-          if (remote !== undefined && !remoteIdentityMatches(remote, identity)) {
+          if (remote !== undefined && !e2bDescriptionMatchesIdentity(remote, identity)) {
             return yield* Effect.fail(
               error("E2B_IDENTITY_MISMATCH", "E2B sandbox metadata changed before destroy", false),
             );
@@ -949,7 +954,18 @@ export const makeE2bSandboxProvider = (
           yield* attempt("PTY destroy reconciliation", () =>
             dependencies.client.reconcilePtys(identity.providerHandle, "destroy", activeTimeoutMs),
           );
-          yield* attempt("destroy", () => dependencies.client.destroy(identity.providerHandle));
+          const destroyed = yield* attempt("destroy", () =>
+            dependencies.client.destroy(identity.providerHandle),
+          );
+          if (!destroyed) {
+            return yield* Effect.fail(
+              error(
+                "E2B_DESTROY_NOT_CONFIRMED",
+                "E2B did not confirm that the sandbox was destroyed",
+                true,
+              ),
+            );
+          }
           yield* attempt("identity destroy", () =>
             dependencies.identities.markDestroyed(
               request.workspaceId,

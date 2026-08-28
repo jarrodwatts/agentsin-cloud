@@ -25,6 +25,11 @@ import {
   EphemeralCoordination,
   type EphemeralCoordinationService,
 } from "./ephemeralCoordination.ts";
+import { E2bSandboxConfig, e2bSandboxConfigLayer } from "./e2bSandboxConfig.ts";
+import {
+  makeHostedE2bProviderService,
+  type HostedE2bProviderDependencies,
+} from "./e2bSandboxProduction.ts";
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
 import { makeInspectorBridge, type InspectorInputAuthorizer } from "./inspectorBridge.ts";
 import { currentOnrampProductionPolicyLayer, OnrampProductionPolicy } from "./onrampPolicy.ts";
@@ -393,6 +398,7 @@ export const runtimeLayer = Layer.mergeAll(
   valkeyProductionLayer,
   artifactStorageLayer,
   currentOnrampProductionPolicyLayer,
+  e2bSandboxConfigLayer,
 ).pipe(Layer.provideMerge(controlPlaneConfigLayer));
 
 export interface ControlPlaneApplicationDependencies {
@@ -515,6 +521,7 @@ export const makeApplication = ({
 export interface HostedProductionDependencies extends WorkerProductionDependencies {
   readonly providerCredentialKeyEncryption: ProviderCredentialKeyEncryption;
   readonly providerCredentialLoginRunner: ProviderCredentialLoginRunner;
+  readonly e2b: Omit<HostedE2bProviderDependencies, "config" | "database" | "ptyOwnerId" | "sdk">;
 }
 
 export const makeProgram = (production: HostedProductionDependencies) =>
@@ -524,6 +531,7 @@ export const makeProgram = (production: HostedProductionDependencies) =>
     const workspaces = yield* WorkspaceRepository;
     const threadEvents = yield* ThreadEventStore;
     const artifactStorage = yield* ArtifactStorage;
+    const e2bConfig = yield* E2bSandboxConfig;
     yield* OnrampProductionPolicy;
     const artifactOutbox = makeArtifactOutboxProcessor({
       repository: makePostgresArtifactRepository(database),
@@ -533,6 +541,22 @@ export const makeProgram = (production: HostedProductionDependencies) =>
     yield* startArtifactOutboxDrain(artifactOutbox);
     const coordination = yield* EphemeralCoordination;
     yield* coordination.ping;
+    const e2b = yield* makeHostedE2bProviderService({
+      ...production.e2b,
+      config: e2bConfig,
+      database,
+      ptyOwnerId: config.workerProcessInstanceId,
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ServerStartupError({
+            cause: { message: "E2B provider startup validation failed", error: cause },
+          }),
+      ),
+    );
+    yield* Effect.addFinalizer(() =>
+      e2b.shutdown.pipe(Effect.catch((cause) => Effect.logError("E2B PTY handoff failed", cause))),
+    );
     const worker = yield* makeWorkerControlPlaneRuntime({
       config,
       database,

@@ -1,5 +1,10 @@
 export { makeE2bSandboxProvider } from "./E2bSandboxProvider.ts";
 export {
+  E2B_IDENTITY_METADATA,
+  e2bDescriptionMatchesIdentity,
+  e2bIdentityMetadataFor,
+} from "./identity.ts";
+export {
   E2B_ACTIVE_TIMEOUT_MS,
   E2B_BASE_TEMPLATE_MANIFEST,
   E2B_BASE_TEMPLATE_NAME,

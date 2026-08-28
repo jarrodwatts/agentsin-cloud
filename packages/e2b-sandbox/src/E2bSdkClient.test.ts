@@ -1,6 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 
-import type { CommandHandle, Sandbox, SandboxConnectOpts, SandboxInfo } from "e2b";
+import type { CommandHandle, Sandbox, SandboxConnectOpts, SandboxInfo, SandboxOpts } from "e2b";
 import { SandboxPtyId } from "@t3tools/contracts/cloud";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
@@ -241,13 +241,15 @@ describe("E2B SDK client", () => {
     expect(launchTag).toBe(`agentsin-cloud-base:build-${buildId}`);
     if (launchTag === undefined) throw new Error("Expected an immutable E2B launch tag");
     let createdTemplate = "";
+    let createdOptions: SandboxOpts | undefined;
     const sandbox = makeSandbox();
     const client = makeTestClient({
       apiKey: "test-api-key",
       trafficCredentials: acceptingBroker,
       sdk: makeSdk(sandbox, {
-        create: async (template) => {
+        create: async (template, options) => {
           createdTemplate = template;
+          createdOptions = options;
           return sandbox;
         },
       }),
@@ -255,6 +257,14 @@ describe("E2B SDK client", () => {
 
     await client.create({ templateId: launchTag, metadata: {}, timeoutMs: 60_000 });
     expect(createdTemplate).toBe(`agentsin-cloud-base:build-${buildId}`);
+    expect(createdOptions).toMatchObject({
+      secure: true,
+      network: { allowPublicTraffic: false },
+      lifecycle: {
+        onTimeout: { action: "pause", keepMemory: true },
+        autoResume: false,
+      },
+    });
   });
 
   it("destroys a newly created sandbox when traffic-token sealing fails", async () => {
@@ -309,6 +319,20 @@ describe("E2B SDK client", () => {
     });
     expect(pauseCalls).toBe(1);
     expect(connectOptions?.timeoutMs).toBe(900_000);
+  });
+
+  it("rejects a pause that the E2B API does not confirm", async () => {
+    const client = makeTestClient({
+      apiKey: "test-api-key",
+      trafficCredentials: acceptingBroker,
+      sdk: makeSdk(makeSandbox(), { pause: async () => false }),
+    });
+
+    await expect(client.pause("sandbox-1")).rejects.toMatchObject({
+      code: "unavailable",
+      message: "E2B did not confirm the sandbox pause",
+      retryable: true,
+    });
   });
 
   it("sanitizes broker and cleanup failures without exposing token material", async () => {

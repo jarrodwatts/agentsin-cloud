@@ -278,7 +278,12 @@ export interface SandboxCreateReconciliationRecord {
  */
 export interface SandboxIdentityStore {
   /** Atomically creates the one-sandbox-per-thread fence before remote compute exists. */
-  readonly reserve: (record: SandboxIdentityReservation) => Promise<void>;
+  readonly reserve: (
+    record: SandboxIdentityReservation,
+  ) => Promise<
+    | { readonly state: "reserved"; readonly disposition: "created" | "existing" }
+    | { readonly state: "active"; readonly identity: SandboxIdentityRecord }
+  >;
   /** Atomically replaces the pending reservation with its active sandbox identity. */
   readonly activateReservation: (
     workspaceId: WorkspaceId,

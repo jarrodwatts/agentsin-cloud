@@ -127,7 +127,7 @@ const requireReservation = async (
 export const makePostgresSandboxIdentityStore = (pool: Pool): SandboxIdentityStore => ({
   reserve: (record) =>
     transaction(pool, async (client) => {
-      await client.query(
+      const inserted = await client.query(
         `INSERT INTO cloud_e2b_sandbox_identity
           (reservation_id, workspace_id, thread_id, environment_id, project_id, revision_id,
            repository_identity, workspace_directory, state, requested_at)
@@ -149,6 +149,14 @@ export const makePostgresSandboxIdentityStore = (pool: Pool): SandboxIdentitySto
       if (!sameReservation(row, record) || !["reserved", "active"].includes(row.state)) {
         throw new Error("E2B sandbox reservation identity conflicts with durable state");
       }
+      const identity = toIdentity(row);
+      if (row.state === "active" && identity !== undefined) {
+        return { state: "active" as const, identity };
+      }
+      return {
+        state: "reserved" as const,
+        disposition: inserted.rowCount === 1 ? ("created" as const) : ("existing" as const),
+      };
     }),
 
   activateReservation: (workspaceId, reservationId, record) =>
