@@ -174,8 +174,15 @@ jobs:
           src/valkeyCoordination.integration.test.ts
           src/workerRouteGeneration.postgres.test.ts
           src/artifactRepository.postgres.test.ts
+          src/cloudThreadLifecycleStore.postgres.test.ts
+          src/cloudThreadRuntimeStore.postgres.test.ts
+          src/desktopLeaseRepository.postgres.test.ts
           src/githubThreadWorkflowStore.postgres.test.ts
+          src/migrations/application-migrations.postgres.test.ts
           src/providerCredentialStore.postgres.test.ts
+          src/threadEventStore.postgres.test.ts
+          src/usageLedger.postgres.test.ts
+          src/walletService.postgres.test.ts
 
   # apps/server sets `fileParallelism: false`, so its 239 files run strictly
   # one at a time. Sharding spreads them over separate runners instead of
