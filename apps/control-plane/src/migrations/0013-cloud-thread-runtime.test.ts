@@ -14,6 +14,7 @@ it.effect("keeps idle, pause, resume, and activity state authoritative in Postgr
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS cloud_thread_runtime");
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS cloud_thread_runtime_activity");
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS cloud_thread_runtime_activity_event");
+    expect(migration).toContain("(event_kind = 'ended') = (expires_at IS NULL)");
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS cloud_thread_runtime_resume_request");
     expect(migration).toContain("cloud_thread_runtime_idle_idx");
     expect(migration).toContain("cloud_thread_runtime_recovery_idx");

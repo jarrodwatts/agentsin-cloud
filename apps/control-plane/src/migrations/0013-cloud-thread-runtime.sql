@@ -96,10 +96,13 @@ CREATE TABLE IF NOT EXISTS cloud_thread_runtime_activity_event (
   event_kind text NOT NULL CHECK (event_kind IN ('started', 'heartbeat', 'ended')),
   request_fingerprint text NOT NULL CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
   occurred_at timestamptz NOT NULL,
+  expires_at timestamptz,
   PRIMARY KEY (workspace_id, event_id),
   FOREIGN KEY (workspace_id, activity_id)
     REFERENCES cloud_thread_runtime_activity (workspace_id, activity_id)
-    ON DELETE CASCADE
+    ON DELETE CASCADE,
+  CHECK ((event_kind = 'ended') = (expires_at IS NULL)),
+  CHECK (expires_at IS NULL OR occurred_at < expires_at)
 );
 
 CREATE TABLE IF NOT EXISTS cloud_thread_runtime_resume_request (

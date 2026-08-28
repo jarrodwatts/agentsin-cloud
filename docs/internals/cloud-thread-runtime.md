@@ -6,14 +6,16 @@ keeps alive a thread.
 
 `cloud_thread_runtime` is the authoritative pause/resume state for the one current lifecycle
 attempt. `cloud_thread_runtime_activity` contains short, server-timed agent and preview leases.
-Desktop control remains authoritative in `cloud_desktop_lease`; the idle claim checks both tables
-in the same PostgreSQL transaction. Valkey may accelerate scheduling or presence, but it cannot
-make a pause decision.
+Desktop control remains authoritative in `cloud_desktop_lease`. Desktop acquire/renew operations
+and the idle claim share one durable per-thread PostgreSQL fence. Whichever obtains it first commits
+its decision; the idle claimant then rechecks both activity tables before advancing runtime state.
+Valkey may accelerate scheduling or presence, but it cannot make a pause decision.
 
 The activity API accepts an authenticated worker generation and a bounded lease duration. The
 control plane assigns the occurrence and expiry times. Starts, heartbeats, and ends have durable
-event identities, so duplicate delivery is idempotent while changed content or an old worker
-generation fails closed. When an activity lease or desktop lease expires, its expiry time begins
+event identities, so duplicate delivery replays the original stored timing even after a delayed
+retry, while changed stable content or an old worker generation fails closed. When an activity
+lease or desktop lease expires, its expiry time begins
 the 15-minute idle window. The boundary is inclusive: a runtime last active at 12:00 is eligible at
 12:15:00, never before.
 

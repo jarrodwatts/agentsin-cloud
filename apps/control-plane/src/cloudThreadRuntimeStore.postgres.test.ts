@@ -10,6 +10,7 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import { Pool } from "pg";
 
+import { lockCloudThreadMutation } from "./cloudThreadMutationLock.ts";
 import {
   CloudThreadRuntimeStoreError,
   makePostgresCloudThreadRuntimeStore,
@@ -151,6 +152,7 @@ it.effect("uses expiring agent and preview claims without trusting transient pre
         activityId: "agent-turn",
         source: "agent" as const,
         generation: 1,
+        leaseMs: 60_000,
         occurredAt: "2026-08-28T12:10:00.000Z",
         expiresAt: "2026-08-28T12:11:00.000Z",
       };
@@ -158,6 +160,70 @@ it.effect("uses expiring agent and preview claims without trusting transient pre
       await store.recordActivity(started);
       expect(await store.claimIdlePauses("2026-08-28T12:25:59.999Z")).toHaveLength(0);
       expect(await store.claimIdlePauses("2026-08-28T12:26:00.000Z")).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect("replays delayed activity delivery with its original server timing", () =>
+  withPostgres(({ pool }) =>
+    Effect.promise(async () => {
+      const store = makePostgresCloudThreadRuntimeStore(pool);
+      const first = await store.recordActivity({
+        type: "started",
+        workspaceId,
+        threadId,
+        attemptId,
+        eventId: "delayed-retry-start",
+        activityId: "delayed-retry-agent",
+        source: "agent",
+        generation: 1,
+        leaseMs: 60_000,
+        occurredAt: "2026-08-28T12:01:00.000Z",
+        expiresAt: "2026-08-28T12:02:00.000Z",
+      });
+      const replay = await store.recordActivity({
+        type: "started",
+        workspaceId,
+        threadId,
+        attemptId,
+        eventId: "delayed-retry-start",
+        activityId: "delayed-retry-agent",
+        source: "agent",
+        generation: 1,
+        leaseMs: 60_000,
+        occurredAt: "2026-08-28T12:10:00.000Z",
+        expiresAt: "2026-08-28T12:11:00.000Z",
+      });
+
+      expect(first).toMatchObject({
+        disposition: "applied",
+        event: {
+          occurredAt: "2026-08-28T12:01:00.000Z",
+          expiresAt: "2026-08-28T12:02:00.000Z",
+        },
+      });
+      expect(replay).toMatchObject({
+        disposition: "replayed",
+        event: {
+          occurredAt: "2026-08-28T12:01:00.000Z",
+          expiresAt: "2026-08-28T12:02:00.000Z",
+        },
+      });
+      const persisted = await pool.query<{
+        readonly occurred_at: string;
+        readonly expires_at: string;
+      }>(
+        `SELECT
+           to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS occurred_at,
+           to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at
+           FROM cloud_thread_runtime_activity_event
+          WHERE workspace_id = $1 AND event_id = $2`,
+        [workspaceId, "delayed-retry-start"],
+      );
+      expect(persisted.rows[0]).toEqual({
+        occurred_at: "2026-08-28T12:01:00.000Z",
+        expires_at: "2026-08-28T12:02:00.000Z",
+      });
     }),
   ),
 );
@@ -175,6 +241,7 @@ it.effect("serializes concurrent active claims against idle pause and rejects st
         activityId: "preview-service",
         source: "preview" as const,
         generation: 1,
+        leaseMs: 300_500,
         occurredAt: "2026-08-28T12:14:59.500Z",
         expiresAt: "2026-08-28T12:20:00.000Z",
       };
@@ -187,6 +254,7 @@ it.effect("serializes concurrent active claims against idle pause and rejects st
           eventId: "stale-heartbeat",
           type: "heartbeat",
           generation: 2,
+          leaseMs: 360_000,
           occurredAt: "2026-08-28T12:15:00.000Z",
           expiresAt: "2026-08-28T12:21:00.000Z",
         }),
@@ -218,6 +286,7 @@ it.effect("allows exactly one winner when activity starts at the idle boundary",
         activityId: "boundary-agent",
         source: "agent",
         generation: 1,
+        leaseMs: 60_000,
         occurredAt: "2026-08-28T12:15:00.000Z",
         expiresAt: "2026-08-28T12:16:00.000Z",
       });
@@ -273,6 +342,80 @@ it.effect("counts an unexpired desktop control lease as authoritative activity",
       expect(await store.claimIdlePauses("2026-08-28T12:15:00.000Z")).toHaveLength(0);
       expect(await store.claimIdlePauses("2026-08-28T12:30:59.999Z")).toHaveLength(0);
       expect(await store.claimIdlePauses("2026-08-28T12:31:00.000Z")).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect("rechecks desktop control after waiting on the shared pause fence", () =>
+  withPostgres(({ pool, schema }) =>
+    Effect.promise(async () => {
+      const holder = await pool.connect();
+      let reachedPauseFence!: () => void;
+      const pauseReachedFence = new Promise<void>((resolve) => {
+        reachedPauseFence = resolve;
+      });
+      const observedPool = new Pool({
+        connectionString: postgresUrl!,
+        max: 1,
+        options: `-c search_path=${schema}`,
+        connectionTimeoutMillis: 5_000,
+        query_timeout: 10_000,
+        statement_timeout: 10_000,
+      });
+      observedPool.on("connect", (client) => {
+        const query = client.query.bind(client);
+        client.query = ((...args: unknown[]) => {
+          if (typeof args[0] === "string" && args[0].includes("pg_advisory_xact_lock")) {
+            reachedPauseFence();
+          }
+          return Reflect.apply(query, client, args);
+        }) as typeof client.query;
+      });
+
+      try {
+        await holder.query("BEGIN");
+        await lockCloudThreadMutation(holder, { workspaceId, threadId });
+        const claim = makePostgresCloudThreadRuntimeStore(observedPool).claimIdlePauses(
+          "2026-08-28T12:15:00.000Z",
+        );
+        await pauseReachedFence;
+        await holder.query(
+          `INSERT INTO cloud_desktop_lease (
+            workspace_id, thread_id, lease_id, generation, acquire_idempotency_key,
+            acquire_fingerprint, attempt_id, environment_id, environment_revision_id,
+            sandbox_id, worker_id, route_generation, holder_user_id, holder_auth_session_id,
+            holder_client_id, resume_secret_hash, connection_state, state, acquired_at,
+            heartbeat_at, expires_at, updated_at
+          ) VALUES (
+            $1,$2,$3,1,'racing-desktop-acquire',$4,$5,$6,'runtime-revision',$7,$8,1,
+            'runtime-user','runtime-session','runtime-client',$9,'connected','active',
+            $10::timestamptz,$10::timestamptz,$11::timestamptz,$10::timestamptz
+          )`,
+          [
+            workspaceId,
+            threadId,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "c".repeat(64),
+            attemptId,
+            environmentId,
+            sandboxId,
+            initialWorkerId,
+            "d".repeat(64),
+            instant,
+            "2026-08-28T12:16:00.000Z",
+          ],
+        );
+        await holder.query("COMMIT");
+
+        expect(await claim).toHaveLength(0);
+        expect(
+          await makePostgresCloudThreadRuntimeStore(pool).getCurrent(workspaceId, threadId),
+        ).toMatchObject({ state: "running" });
+      } finally {
+        await holder.query("ROLLBACK").catch(() => undefined);
+        holder.release();
+        await observedPool.end().catch(() => undefined);
+      }
     }),
   ),
 );
@@ -333,6 +476,7 @@ it.effect("coalesces a resume race and fences the replaced worker generation", (
           activityId: "old-worker",
           source: "agent",
           generation: 1,
+          leaseMs: 60_000,
           occurredAt: "2026-08-28T12:15:01.000Z",
           expiresAt: "2026-08-28T12:16:01.000Z",
         }),

@@ -133,7 +133,8 @@ const makeStore = (initial: CloudThreadRuntimeRecord) => {
   let idleClaimed = false;
   const store: CloudThreadRuntimeStore = {
     getCurrent: () => Promise.resolve(current),
-    recordActivity: (_event: CloudThreadActivityEvent) => Promise.resolve(current),
+    recordActivity: (event: CloudThreadActivityEvent) =>
+      Promise.resolve({ disposition: "applied", runtime: current, event }),
     claimIdlePauses: () => {
       if (idleClaimed || current.state !== "running") return Promise.resolve([]);
       idleClaimed = true;
@@ -313,7 +314,7 @@ it.effect("assigns activity time in the control plane and bounds worker leases",
       ...state.store,
       recordActivity: (event) => {
         recorded = event;
-        return Promise.resolve(state.current());
+        return Promise.resolve({ disposition: "applied", runtime: state.current(), event });
       },
     };
     const service = makeCloudThreadRuntime({

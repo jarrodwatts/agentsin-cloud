@@ -30,6 +30,7 @@ import type {
   CloudThreadLifecycleAttempt,
   CloudThreadLifecycleStore,
 } from "./cloudThreadLifecycleStore.ts";
+import { makePostgresCloudThreadRuntimeStore } from "./cloudThreadRuntimeStore.ts";
 import { makeCloudRpc } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import {
@@ -159,6 +160,7 @@ const withPostgres = <E>(use: (pool: Pool) => Effect.Effect<void, E>) => {
           "0002-cloud-thread-store.sql",
           "0004-cloud-thread-lifecycle.sql",
           "0011-desktop-leases.sql",
+          "0013-cloud-thread-runtime.sql",
         ]) {
           await pool.query(
             await NodeFSP.readFile(new URL(`./migrations/${filename}`, import.meta.url), "utf8"),
@@ -243,6 +245,37 @@ it.effect(
         expect(otherTenant.lease.binding.workspaceId).toBe(workspaceB);
       }),
     ),
+);
+
+it.effect("rejects desktop acquisition and renewal after the durable pause fence wins", () =>
+  withPostgres((pool) =>
+    Effect.promise(async () => {
+      const repository = makePostgresDesktopLeaseRepository(pool);
+      const acquired = await repository.acquire(
+        acquireInput(workspaceA, "11000000-0000-4000-8000-000000000001", "pause-race-acquire"),
+      );
+      const runtimeStore = makePostgresCloudThreadRuntimeStore(pool);
+      const claimed = await runtimeStore.claimIdlePauses("2026-08-27T12:15:30.000Z");
+      expect(claimed.some((runtime) => runtime.workspaceId === workspaceA)).toBe(true);
+
+      await expect(
+        repository.heartbeat({
+          leaseId: acquired.lease.leaseId,
+          generation: acquired.lease.generation,
+          binding: binding(workspaceA),
+          actor: acquired.lease.actor,
+          idempotencyKey: "pause-race-heartbeat" as DesktopLeaseIdempotencyKey,
+          now: "2026-08-27T12:15:31.000Z",
+          expiresAt: "2026-08-27T12:16:01.000Z",
+        }),
+      ).rejects.toMatchObject({ code: "staleBinding" });
+      await expect(
+        repository.acquire(
+          acquireInput(workspaceA, "11000000-0000-4000-8000-000000000002", "pause-race-reacquire"),
+        ),
+      ).rejects.toMatchObject({ code: "staleBinding" });
+    }),
+  ),
 );
 
 it.effect(

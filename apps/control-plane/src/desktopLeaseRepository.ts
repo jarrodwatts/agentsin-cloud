@@ -13,6 +13,8 @@ import type { DesktopLeaseId, WorkspaceId } from "@t3tools/contracts/cloud";
 import * as DateTime from "effect/DateTime";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 
+import { lockCloudThreadMutation } from "./cloudThreadMutationLock.ts";
+
 export type DesktopLeaseRecordState = "active" | "released" | "expired" | "revoked";
 export type DesktopLeaseConnectionState = "connected" | "disconnected";
 export type DesktopLeaseReleaseReason =
@@ -270,15 +272,11 @@ const transaction = async <A>(pool: Pool, use: (client: PoolClient) => Promise<A
   }
 };
 
-const lockThread = (
+const assertCurrentLifecycle = async (
   client: PoolClient,
-  binding: Pick<DesktopControlBinding, "workspaceId" | "threadId">,
-) =>
-  client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-    JSON.stringify([binding.workspaceId, binding.threadId]),
-  ]);
-
-const assertCurrentLifecycle = async (client: PoolClient, binding: DesktopControlBinding) => {
+  binding: DesktopControlBinding,
+  requireRunningRuntime = false,
+) => {
   const result = await client.query<{
     readonly attempt_id: string;
     readonly environment_id: string;
@@ -286,17 +284,25 @@ const assertCurrentLifecycle = async (client: PoolClient, binding: DesktopContro
     readonly sandbox_id: string | null;
     readonly worker_id: string | null;
     readonly state: string;
+    readonly runtime_state: string | null;
   }>(
-    `SELECT attempt_id, environment_id, environment_revision_id, sandbox_id, worker_id, state
-       FROM cloud_thread_lifecycle_attempt
-      WHERE workspace_id = $1 AND thread_id = $2 AND is_current
-      FOR SHARE`,
+    `SELECT attempt.attempt_id, attempt.environment_id, attempt.environment_revision_id,
+            attempt.sandbox_id, attempt.worker_id, attempt.state,
+            runtime.state AS runtime_state
+       FROM cloud_thread_lifecycle_attempt AS attempt
+       JOIN cloud_thread_runtime AS runtime
+         ON runtime.workspace_id = attempt.workspace_id
+        AND runtime.thread_id = attempt.thread_id
+        AND runtime.attempt_id = attempt.attempt_id
+      WHERE attempt.workspace_id = $1 AND attempt.thread_id = $2 AND attempt.is_current
+      FOR SHARE OF attempt, runtime`,
     [binding.workspaceId, binding.threadId],
   );
   const current = result.rows[0];
   if (
     current === undefined ||
     current.state !== "ready" ||
+    (requireRunningRuntime && current.runtime_state !== "running") ||
     current.attempt_id !== binding.attemptId ||
     current.environment_id !== binding.environmentId ||
     current.environment_revision_id !== binding.environmentRevisionId ||
@@ -513,13 +519,13 @@ const requireActive = (
 export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepository => ({
   current: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input);
+      await lockCloudThreadMutation(client, input);
       return loadActive(client, input.workspaceId, input.threadId);
     }),
 
   expireCurrent: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
       await assertCurrentLifecycle(client, input.binding);
       const active = await loadActive(client, input.binding.workspaceId, input.binding.threadId);
       if (active === undefined || !sameBinding(active.binding, input.binding)) return undefined;
@@ -528,8 +534,8 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   acquire: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
-      await assertCurrentLifecycle(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
+      await assertCurrentLifecycle(client, input.binding, true);
       const requestFingerprint = fingerprint({
         type: "acquire",
         binding: input.binding,
@@ -605,8 +611,8 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   heartbeat: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
-      await assertCurrentLifecycle(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
+      await assertCurrentLifecycle(client, input.binding, true);
       const requestFingerprint = fingerprint({
         type: "heartbeat",
         leaseId: input.leaseId,
@@ -670,7 +676,7 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   release: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
       const requestFingerprint = fingerprint({
         type: "release",
         leaseId: input.leaseId,
@@ -723,7 +729,7 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   disconnect: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
       const active = await loadActive(client, input.binding.workspaceId, input.binding.threadId);
       if (active === undefined || !sameBinding(active.binding, input.binding)) return undefined;
       if (!sameActor(active.actor, input.actor)) return active;
@@ -769,8 +775,8 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   resume: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
-      await assertCurrentLifecycle(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
+      await assertCurrentLifecycle(client, input.binding, true);
       const requestFingerprint = fingerprint({
         type: "resume",
         leaseId: input.leaseId,
@@ -859,8 +865,8 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   rebindRoute: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
-      await assertCurrentLifecycle(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
+      await assertCurrentLifecycle(client, input.binding, true);
       const active = await loadActive(client, input.binding.workspaceId, input.binding.threadId);
       const current = await expireIfDue(client, active, input.now);
       if (current === undefined || current.state !== "active") {
@@ -926,8 +932,8 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   authorizeUserInput: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
-      await assertCurrentLifecycle(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
+      await assertCurrentLifecycle(client, input.binding, true);
       const active = await loadActive(client, input.binding.workspaceId, input.binding.threadId);
       if (active === undefined) {
         throw new DesktopLeaseRepositoryError("forbidden", "User does not hold desktop control");
@@ -950,8 +956,8 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   authorizeAgentInput: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
-      await assertCurrentLifecycle(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
+      await assertCurrentLifecycle(client, input.binding, true);
       const active = await loadActive(client, input.binding.workspaceId, input.binding.threadId);
       if (active !== undefined) {
         throw new DesktopLeaseRepositoryError(
@@ -963,7 +969,7 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   revokeBinding: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input.binding);
+      await lockCloudThreadMutation(client, input.binding);
       const active = await loadActive(client, input.binding.workspaceId, input.binding.threadId);
       if (active === undefined || !sameBinding(active.binding, input.binding)) return undefined;
       const requestFingerprint = fingerprint({
@@ -992,7 +998,7 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
 
   revokeCurrent: (input) =>
     transaction(pool, async (client) => {
-      await lockThread(client, input);
+      await lockCloudThreadMutation(client, input);
       const active = await loadActive(client, input.workspaceId, input.threadId);
       if (
         active === undefined ||

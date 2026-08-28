@@ -12,6 +12,8 @@ import type { WorkerInstanceId } from "@t3tools/contracts/worker";
 import * as DateTime from "effect/DateTime";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 
+import { lockCloudThreadMutation } from "./cloudThreadMutationLock.ts";
+
 export const CLOUD_THREAD_IDLE_MS = 15 * 60_000;
 
 export type CloudThreadRuntimeState =
@@ -61,6 +63,7 @@ export type CloudThreadActivityEvent =
       readonly activityId: string;
       readonly source: CloudThreadRuntimeActivitySource;
       readonly generation: number;
+      readonly leaseMs: number;
       readonly occurredAt: string;
       readonly expiresAt: string;
     }
@@ -72,6 +75,7 @@ export type CloudThreadActivityEvent =
       readonly eventId: string;
       readonly activityId: string;
       readonly generation: number;
+      readonly leaseMs: number;
       readonly occurredAt: string;
       readonly expiresAt: string;
     }
@@ -85,6 +89,12 @@ export type CloudThreadActivityEvent =
       readonly generation: number;
       readonly occurredAt: string;
     };
+
+export interface CloudThreadActivityReceipt {
+  readonly disposition: "applied" | "replayed";
+  readonly runtime: CloudThreadRuntimeRecord;
+  readonly event: CloudThreadActivityEvent;
+}
 
 export interface CloudThreadResumeRequest {
   readonly workspaceId: WorkspaceId;
@@ -154,6 +164,7 @@ interface ActivityEventRow extends QueryResultRow {
   readonly event_kind: CloudThreadActivityEvent["type"];
   readonly request_fingerprint: string;
   readonly occurred_at: string;
+  readonly expires_at: string | null;
 }
 
 interface ResumeRequestRow extends QueryResultRow {
@@ -275,7 +286,41 @@ const exactGeneration = (runtime: CloudThreadRuntimeRecord, generation: number) 
   }
 };
 
-const eventFingerprint = (event: CloudThreadActivityEvent) => fingerprint(event);
+const eventFingerprint = (event: CloudThreadActivityEvent) =>
+  fingerprint(
+    event.type === "started"
+      ? {
+          type: event.type,
+          workspaceId: event.workspaceId,
+          threadId: event.threadId,
+          attemptId: event.attemptId,
+          eventId: event.eventId,
+          activityId: event.activityId,
+          source: event.source,
+          generation: event.generation,
+          leaseMs: event.leaseMs,
+        }
+      : event.type === "heartbeat"
+        ? {
+            type: event.type,
+            workspaceId: event.workspaceId,
+            threadId: event.threadId,
+            attemptId: event.attemptId,
+            eventId: event.eventId,
+            activityId: event.activityId,
+            generation: event.generation,
+            leaseMs: event.leaseMs,
+          }
+        : {
+            type: event.type,
+            workspaceId: event.workspaceId,
+            threadId: event.threadId,
+            attemptId: event.attemptId,
+            eventId: event.eventId,
+            activityId: event.activityId,
+            generation: event.generation,
+          },
+  );
 const resumeFingerprint = (request: CloudThreadResumeRequest) => fingerprint(request);
 
 export interface CloudThreadRuntimeStore {
@@ -283,7 +328,7 @@ export interface CloudThreadRuntimeStore {
     workspaceId: WorkspaceId,
     threadId: ThreadId,
   ) => Promise<CloudThreadRuntimeRecord | undefined>;
-  readonly recordActivity: (event: CloudThreadActivityEvent) => Promise<CloudThreadRuntimeRecord>;
+  readonly recordActivity: (event: CloudThreadActivityEvent) => Promise<CloudThreadActivityReceipt>;
   readonly claimIdlePauses: (
     now: string,
     idleForMs?: number,
@@ -339,11 +384,25 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
 
   recordActivity: (event) =>
     transaction(pool, async (client) => {
+      if (
+        event.type !== "ended" &&
+        Date.parse(event.expiresAt) - Date.parse(event.occurredAt) !== event.leaseMs
+      ) {
+        throw new CloudThreadRuntimeStoreError(
+          "conflict",
+          "Activity expiry did not match its stable lease duration",
+        );
+      }
       const runtime = await loadRuntime(client, event.workspaceId, event.threadId, true);
       exactAttempt(runtime, event.attemptId);
       const digest = eventFingerprint(event);
       const existingEvent = await client.query<ActivityEventRow>(
-        `SELECT thread_id, activity_id, event_kind, request_fingerprint, occurred_at::text
+        `SELECT thread_id, activity_id, event_kind, request_fingerprint,
+                to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                  AS occurred_at,
+                CASE WHEN expires_at IS NULL THEN NULL ELSE
+                  to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                END AS expires_at
            FROM cloud_thread_runtime_activity_event
           WHERE workspace_id = $1 AND event_id = $2`,
         [event.workspaceId, event.eventId],
@@ -361,7 +420,17 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
             "Activity event identity was reused with different content",
           );
         }
-        return runtime;
+        if (event.type !== "ended" && prior.expires_at === null) {
+          throw new CloudThreadRuntimeStoreError(
+            "databaseFailure",
+            "Persisted activity event is missing its original expiry",
+          );
+        }
+        const replayedEvent: CloudThreadActivityEvent =
+          event.type === "ended"
+            ? { ...event, occurredAt: prior.occurred_at }
+            : { ...event, occurredAt: prior.occurred_at, expiresAt: prior.expires_at! };
+        return { disposition: "replayed", runtime, event: replayedEvent };
       }
       exactGeneration(runtime, event.generation);
       if (runtime.state !== "running") {
@@ -459,8 +528,8 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
       await client.query(
         `INSERT INTO cloud_thread_runtime_activity_event
           (workspace_id, event_id, thread_id, activity_id, event_kind,
-           request_fingerprint, occurred_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz)`,
+           request_fingerprint, occurred_at, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,$8::timestamptz)`,
         [
           event.workspaceId,
           event.eventId,
@@ -469,6 +538,7 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
           event.type,
           digest,
           event.occurredAt,
+          event.type === "ended" ? null : event.expiresAt,
         ],
       );
 
@@ -497,7 +567,11 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
           WHERE workspace_id = $1 AND thread_id = $2`,
         [event.workspaceId, event.threadId, event.occurredAt],
       );
-      return loadRuntime(client, event.workspaceId, event.threadId);
+      return {
+        disposition: "applied",
+        runtime: await loadRuntime(client, event.workspaceId, event.threadId),
+        event,
+      };
     }),
 
   claimIdlePauses: (now, idleForMs = CLOUD_THREAD_IDLE_MS, limit = 25) =>
@@ -555,39 +629,112 @@ export const makePostgresCloudThreadRuntimeStore = (pool: Pool): CloudThreadRunt
                  AND lease.attempt_id = runtime.attempt_id
                  AND lease.state = 'active' AND lease.expires_at > $1::timestamptz
              )
-         ), selected AS (
-           SELECT runtime.workspace_id, runtime.thread_id, candidates.effective_idle_since
-           FROM cloud_thread_runtime AS runtime
-           JOIN candidates
-             ON candidates.workspace_id = runtime.workspace_id
-            AND candidates.thread_id = runtime.thread_id
-           WHERE candidates.effective_idle_since <= $2::timestamptz
-           ORDER BY candidates.effective_idle_since, runtime.workspace_id, runtime.thread_id
-           LIMIT $3
-           FOR UPDATE OF runtime SKIP LOCKED
          )
-         UPDATE cloud_thread_runtime AS runtime
-            SET state = 'pause_dispatched', idle_since = NULL,
-                transition_id = 'pause:' || runtime.attempt_id || ':' || runtime.generation::text,
-                transition_kind = 'pause', transition_started_at = $1::timestamptz,
-                route_fenced_at = NULL, credentials_scrubbed_at = NULL,
-                provider_completed_at = NULL, failure_code = NULL,
-                updated_at = $1::timestamptz
-           FROM selected
-          WHERE runtime.workspace_id = selected.workspace_id
-            AND runtime.thread_id = selected.thread_id
-         RETURNING runtime.workspace_id::text AS workspace_id, runtime.thread_id`,
+         SELECT workspace_id::text AS workspace_id, thread_id
+           FROM candidates
+          WHERE effective_idle_since <= $2::timestamptz
+          ORDER BY effective_idle_since, workspace_id, thread_id
+          LIMIT $3`,
         [now, cutoff, boundedLimit],
       );
-      return Promise.all(
-        candidates.rows.map((candidate) =>
-          loadRuntime(
-            client,
-            candidate.workspace_id as WorkspaceId,
-            candidate.thread_id as ThreadId,
-          ),
-        ),
-      );
+      const claimed: CloudThreadRuntimeRecord[] = [];
+      for (const candidate of candidates.rows) {
+        const binding = {
+          workspaceId: candidate.workspace_id as WorkspaceId,
+          threadId: candidate.thread_id as ThreadId,
+        };
+        // Desktop lease mutations take this lock before inspecting runtime state. The pause
+        // decision takes it in the same order, then rechecks all durable activity below.
+        await lockCloudThreadMutation(client, binding);
+        const locked = await client.query<
+          { readonly attempt_id: string; readonly generation: string } & QueryResultRow
+        >(
+          `SELECT runtime.attempt_id, runtime.generation::text
+             FROM cloud_thread_runtime AS runtime
+             JOIN cloud_thread_lifecycle_attempt AS attempt
+               ON attempt.workspace_id = runtime.workspace_id
+              AND attempt.attempt_id = runtime.attempt_id
+            WHERE runtime.workspace_id = $1 AND runtime.thread_id = $2
+              AND runtime.state = 'running' AND attempt.is_current AND attempt.state = 'ready'
+            FOR UPDATE OF runtime`,
+          [binding.workspaceId, binding.threadId],
+        );
+        const current = locked.rows[0];
+        if (current === undefined) continue;
+
+        const eligible = await client.query<{ readonly eligible: boolean } & QueryResultRow>(
+          `SELECT
+             NOT EXISTS (
+               SELECT 1 FROM cloud_thread_runtime_activity AS active
+                WHERE active.workspace_id = runtime.workspace_id
+                  AND active.thread_id = runtime.thread_id
+                  AND active.attempt_id = runtime.attempt_id
+                  AND active.state = 'active' AND active.expires_at > $3::timestamptz
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM cloud_desktop_lease AS lease
+                WHERE lease.workspace_id = runtime.workspace_id
+                  AND lease.thread_id = runtime.thread_id
+                  AND lease.attempt_id = runtime.attempt_id
+                  AND lease.state = 'active' AND lease.expires_at > $3::timestamptz
+             )
+             AND GREATEST(
+               runtime.last_activity_at,
+               COALESCE((
+                 SELECT MAX(CASE
+                   WHEN activity.state = 'ended' THEN activity.ended_at
+                   WHEN activity.expires_at <= $3::timestamptz THEN activity.expires_at
+                   ELSE NULL END)
+                   FROM cloud_thread_runtime_activity AS activity
+                  WHERE activity.workspace_id = runtime.workspace_id
+                    AND activity.thread_id = runtime.thread_id
+                    AND activity.attempt_id = runtime.attempt_id
+               ), runtime.last_activity_at),
+               COALESCE((
+                 SELECT MAX(CASE
+                   WHEN lease.state = 'active' AND lease.expires_at <= $3::timestamptz
+                     THEN lease.expires_at
+                   WHEN lease.state <> 'active' THEN lease.ended_at
+                   ELSE NULL END)
+                   FROM cloud_desktop_lease AS lease
+                  WHERE lease.workspace_id = runtime.workspace_id
+                    AND lease.thread_id = runtime.thread_id
+                    AND lease.attempt_id = runtime.attempt_id
+               ), runtime.last_activity_at)
+             ) <= $4::timestamptz AS eligible
+             FROM cloud_thread_runtime AS runtime
+            WHERE runtime.workspace_id = $1 AND runtime.thread_id = $2
+              AND runtime.attempt_id = $5 AND runtime.generation = $6
+              AND runtime.state = 'running'`,
+          [
+            binding.workspaceId,
+            binding.threadId,
+            now,
+            cutoff,
+            current.attempt_id,
+            current.generation,
+          ],
+        );
+        if (eligible.rows[0]?.eligible !== true) continue;
+
+        const updated = await client.query(
+          `UPDATE cloud_thread_runtime
+              SET state = 'pause_dispatched', idle_since = NULL,
+                  transition_id = 'pause:' || attempt_id || ':' || generation::text,
+                  transition_kind = 'pause', transition_started_at = $5::timestamptz,
+                  route_fenced_at = NULL, credentials_scrubbed_at = NULL,
+                  provider_completed_at = NULL, failure_code = NULL,
+                  updated_at = $5::timestamptz
+            WHERE workspace_id = $1 AND thread_id = $2 AND attempt_id = $3
+              AND generation = $4 AND state = 'running'
+            RETURNING thread_id`,
+          [binding.workspaceId, binding.threadId, current.attempt_id, current.generation, now],
+        );
+        if (updated.rowCount === 1) {
+          claimed.push(await loadRuntime(client, binding.workspaceId, binding.threadId));
+        }
+      }
+      return claimed;
     }),
 
   recordPauseStep: (runtime, step, occurredAt) =>
