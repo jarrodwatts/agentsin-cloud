@@ -762,9 +762,12 @@ const ensureWorkspaceBillingFence = async (client: PoolClient, input: BillingFen
   for (const thread of threads.rows) {
     const isSource = thread.thread_id === workspaceFence.source_thread_id;
     await ensureThreadBillingFence(client, {
-      ...input,
+      workspaceId: input.workspaceId,
       threadId: thread.thread_id as ThreadId,
       reason: workspaceFence.reason,
+      processorId: input.processorId,
+      leaseExpiresAt: input.leaseExpiresAt,
+      now: input.now,
       workspaceFenceId: workspaceFence.fence_id,
       mayLinkExisting: isSource,
       ...(isSource && workspaceFence.settlement_id !== null

@@ -876,8 +876,10 @@ it.effect(
             readonly thread_id: string;
             readonly state: string;
             readonly workspace_fence_id: string | null;
+            readonly settlement_id: string | null;
           }>(
-            `SELECT thread_id, state, workspace_fence_id FROM cloud_usage_billing_fence
+            `SELECT thread_id, state, workspace_fence_id, settlement_id
+               FROM cloud_usage_billing_fence
               WHERE workspace_id = $1 AND state <> 'cleared' ORDER BY thread_id`,
             [workspaceId],
           ),
@@ -887,11 +889,13 @@ it.effect(
             thread_id: threadId,
             state: "paused",
             workspace_fence_id: activeWorkspaceFence.rows[0]!.fence_id,
+            settlement_id: settlementId,
           },
           {
             thread_id: siblingThreadId,
             state: "pause-pending",
             workspace_fence_id: activeWorkspaceFence.rows[0]!.fence_id,
+            settlement_id: null,
           },
         ]);
         expect(
