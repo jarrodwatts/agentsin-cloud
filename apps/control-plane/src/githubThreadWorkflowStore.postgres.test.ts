@@ -115,6 +115,16 @@ const makeDatabase = (pool: Pool): DatabaseService => ({
   ping: Effect.void,
 });
 
+const setWorkflowCommandAvailableAt = (pool: Pool, commandId: string, availableAt: string) =>
+  Effect.promise(() =>
+    pool.query(
+      `UPDATE github_thread_workflow_outbox
+          SET available_at = $3
+        WHERE workspace_id = $1 AND command_id = $2`,
+      [workspaceId, commandId, availableAt],
+    ),
+  ).pipe(Effect.asVoid);
+
 const makeTestStore = (database: DatabaseService) => {
   const store = makeGitHubWorkflowStore(database);
   return {
@@ -413,6 +423,7 @@ it.effect("atomically coalesces duplicate commands and records one external rece
         "accepted",
         "duplicate",
       ]);
+      yield* setWorkflowCommandAvailableAt(pool, workflowCommand.commandId, instant);
 
       const claim = yield* store.claim({
         workspaceId,
@@ -464,6 +475,7 @@ it.effect("atomically coalesces duplicate commands and records one external rece
 
       const checkpoint = checkpointCommand("command-postgres-checkpoint");
       yield* store.submit({ idempotencyKey: "idem-checkpoint", command: checkpoint });
+      yield* setWorkflowCommandAvailableAt(pool, checkpoint.commandId, instant);
       const firstCheckpointClaim = yield* store.claimNext({
         workspaceId,
         now: instant,
@@ -516,6 +528,7 @@ it.effect("atomically coalesces duplicate commands and records one external rece
 
       const draft = draftCommand("command-postgres-draft");
       yield* store.submit({ idempotencyKey: "idem-draft", command: draft });
+      yield* setWorkflowCommandAvailableAt(pool, draft.commandId, instant);
       yield* store.claim({
         workspaceId,
         commandId: draft.commandId,
@@ -547,6 +560,7 @@ it.effect("atomically coalesces duplicate commands and records one external rece
 
       const retry = checkpointCommand("command-postgres-retry");
       yield* store.submit({ idempotencyKey: "idem-retry", command: retry });
+      yield* setWorkflowCommandAvailableAt(pool, retry.commandId, instant);
       yield* store.claim({
         workspaceId,
         commandId: retry.commandId,
@@ -590,6 +604,7 @@ it.effect("atomically coalesces duplicate commands and records one external rece
 
       const conflict = checkpointCommand("command-postgres-conflict");
       yield* store.submit({ idempotencyKey: "idem-stale", command: conflict });
+      yield* setWorkflowCommandAvailableAt(pool, conflict.commandId, instant);
       yield* store.claim({
         workspaceId,
         commandId: conflict.commandId,
