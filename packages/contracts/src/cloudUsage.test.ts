@@ -1,10 +1,11 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { UsageAccrual, VerifiedE2bUsageEvidence } from "./cloud.ts";
+import { UsageAccrual, UsageAccrualSettlementInput, VerifiedE2bUsageEvidence } from "./cloud.ts";
 
 const decodeEvidence = Schema.decodeUnknownSync(VerifiedE2bUsageEvidence);
 const decodeAccrual = Schema.decodeUnknownSync(UsageAccrual);
+const decodeSettlementInput = Schema.decodeUnknownSync(UsageAccrualSettlementInput);
 
 const evidence = {
   evidenceId: "e2b-charge-1",
@@ -26,15 +27,20 @@ const accrual = {
   threadId: "thread-1",
   sandboxId: "sandbox-1",
   evidence,
-  previousUpstreamMicroUsdc: 0,
-  previousMarkupMicroUsdc: 0,
-  previousTotalMicroUsdc: 0,
-  upstreamMicroUsdc: 1_010,
+  pricingScope: { kind: "workspace", workspaceId: "workspace-1" },
+  pricingVersion: 1,
+  pricingSequence: 1,
+  evidencePreviousUpstreamMicroUsdc: 0,
+  evidenceUpstreamMicroUsdc: 1_010,
   markupBasisPoints: 500,
   markupRounding: "half-up-to-nearest-micro-usdc",
-  markupMicroUsdc: 51,
-  totalMicroUsdc: 1_061,
   upstreamDeltaMicroUsdc: 1_010,
+  cumulativeUpstreamBeforeMicroUsdc: 0,
+  cumulativeUpstreamAfterMicroUsdc: 1_010,
+  cumulativeMarkupBeforeMicroUsdc: 0,
+  cumulativeMarkupAfterMicroUsdc: 51,
+  cumulativeTotalBeforeMicroUsdc: 0,
+  cumulativeTotalAfterMicroUsdc: 1_061,
   markupDeltaMicroUsdc: 51,
   totalDeltaMicroUsdc: 1_061,
   payloadSha256: "b".repeat(64),
@@ -44,7 +50,7 @@ const accrual = {
 describe("verified cloud usage contracts", () => {
   it("accepts exact E2B evidence and immutable 5% accrual input", () => {
     expect(decodeEvidence(evidence)).toEqual(evidence);
-    expect(decodeAccrual(accrual).totalMicroUsdc).toBe(1_061);
+    expect(decodeAccrual(accrual).cumulativeTotalAfterMicroUsdc).toBe(1_061);
   });
 
   it("rejects monitoring estimates, malformed evidence, and invalid monetary arithmetic", () => {
@@ -53,7 +59,7 @@ describe("verified cloud usage contracts", () => {
     ).toThrow();
     expect(() => decodeEvidence({ ...evidence, intervalEnd: evidence.intervalStart })).toThrow();
     expect(() => decodeEvidence({ ...evidence, payloadSha256: "not-sha256" })).toThrow();
-    expect(() => decodeAccrual({ ...accrual, markupMicroUsdc: 50 })).toThrow();
+    expect(() => decodeAccrual({ ...accrual, cumulativeMarkupAfterMicroUsdc: 50 })).toThrow();
     expect(() => decodeAccrual({ ...accrual, totalDeltaMicroUsdc: 1_060 })).toThrow();
   });
 
@@ -69,17 +75,35 @@ describe("verified cloud usage contracts", () => {
         payloadSha256: "c".repeat(64),
         upstreamMicroUsdc: 1_000,
       },
-      previousUpstreamMicroUsdc: 1_010,
-      previousMarkupMicroUsdc: 51,
-      previousTotalMicroUsdc: 1_061,
-      upstreamMicroUsdc: 1_000,
-      markupMicroUsdc: 50,
-      totalMicroUsdc: 1_050,
+      pricingSequence: 2,
+      evidencePreviousUpstreamMicroUsdc: 1_010,
+      evidenceUpstreamMicroUsdc: 1_000,
       upstreamDeltaMicroUsdc: -10,
+      cumulativeUpstreamBeforeMicroUsdc: 1_010,
+      cumulativeUpstreamAfterMicroUsdc: 1_000,
+      cumulativeMarkupBeforeMicroUsdc: 51,
+      cumulativeMarkupAfterMicroUsdc: 50,
+      cumulativeTotalBeforeMicroUsdc: 1_061,
+      cumulativeTotalAfterMicroUsdc: 1_050,
       markupDeltaMicroUsdc: -1,
       totalDeltaMicroUsdc: -11,
     } as const;
     expect(decodeAccrual(correction).totalDeltaMicroUsdc).toBe(-11);
     expect(() => decodeAccrual({ ...correction, priorSampleId: undefined })).toThrow();
+    const settlementInput = {
+      accrualId: correction.accrualId,
+      workspaceId: correction.workspaceId,
+      pricingScope: correction.pricingScope,
+      pricingVersion: correction.pricingVersion,
+      pricingSequence: correction.pricingSequence,
+      receiptInputSha256: correction.payloadSha256,
+      totalDeltaMicroUsdc: correction.totalDeltaMicroUsdc,
+      walletLedgerAmountMicroUsdc: 11,
+      direction: "credit",
+    } as const;
+    expect(() => decodeSettlementInput(settlementInput)).not.toThrow();
+    expect(() =>
+      decodeSettlementInput({ ...settlementInput, walletLedgerAmountMicroUsdc: 10 }),
+    ).toThrow();
   });
 });

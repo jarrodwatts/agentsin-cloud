@@ -34,6 +34,10 @@ const threadId = "usage-thread" as ThreadId;
 const projectId = "usage-project" as ProjectId;
 const sandboxA = "usage-sandbox-a" as SandboxId;
 const sandboxB = "usage-sandbox-b" as SandboxId;
+const threadB = "usage-thread-b" as ThreadId;
+const environmentB = "usage-environment-b" as EnvironmentId;
+const projectB = "usage-project-b" as ProjectId;
+const sandboxC = "usage-sandbox-c" as SandboxId;
 const now = "2026-08-28T00:30:00.000Z";
 
 const fixture = (url: string) =>
@@ -88,7 +92,14 @@ const fixture = (url: string) =>
       }),
   );
 
-const insertActiveSandbox = (pool: Pool, sandboxId: SandboxId, reservationId: string) =>
+const insertActiveSandbox = (
+  pool: Pool,
+  sandboxId: SandboxId,
+  reservationId: string,
+  targetThreadId = threadId,
+  targetEnvironmentId = environmentId,
+  targetProjectId = projectId,
+) =>
   pool.query(
     `INSERT INTO cloud_e2b_sandbox_identity (
        workspace_id, reservation_id, thread_id, environment_id, project_id, revision_id,
@@ -98,9 +109,9 @@ const insertActiveSandbox = (pool: Pool, sandboxId: SandboxId, reservationId: st
     [
       workspaceId,
       reservationId,
-      threadId,
-      environmentId,
-      projectId,
+      targetThreadId,
+      targetEnvironmentId,
+      targetProjectId,
       "usage-revision",
       { canonicalKey: "github.com/jarrodwatts/agentsin-cloud" },
       "/workspace/agentsin-cloud",
@@ -138,10 +149,12 @@ const request = (
   evidenceValue: VerifiedE2bUsageEvidence,
   idempotencyKey: string,
   sandboxId = sandboxA,
+  targetThreadId = threadId,
+  targetEnvironmentId = environmentId,
 ): UsageMeteringRequest => ({
   workspaceId,
-  environmentId,
-  threadId,
+  environmentId: targetEnvironmentId,
+  threadId: targetThreadId,
   sandboxId,
   evidenceId: evidenceValue.evidenceId,
   intervalStart: evidenceValue.intervalStart,
@@ -189,9 +202,9 @@ it.effect("posts one exact usage debit and returns duplicates without charging t
       const duplicate = yield* service.accrue({ service: "e2b-usage-sampler", workspaceId }, input);
       expect(created.disposition).toBe("created");
       expect(created.accrual).toMatchObject({
-        upstreamMicroUsdc: 1_010,
-        markupMicroUsdc: 51,
-        totalMicroUsdc: 1_061,
+        evidenceUpstreamMicroUsdc: 1_010,
+        cumulativeMarkupAfterMicroUsdc: 51,
+        cumulativeTotalAfterMicroUsdc: 1_061,
         totalDeltaMicroUsdc: 1_061,
       });
       expect(duplicate).toEqual({ disposition: "duplicate", accrual: created.accrual });
@@ -379,8 +392,9 @@ it.effect("appends provider corrections and permits old-sandbox correction after
         request(correction, "correction-v2"),
       );
       expect(corrected.accrual).toMatchObject({
-        previousTotalMicroUsdc: 1_061,
-        totalMicroUsdc: 1_050,
+        evidencePreviousUpstreamMicroUsdc: 1_010,
+        cumulativeTotalBeforeMicroUsdc: 1_061,
+        cumulativeTotalAfterMicroUsdc: 1_050,
         totalDeltaMicroUsdc: -11,
         priorSampleId: "sample-correction-v1",
       });
@@ -450,6 +464,89 @@ it.effect("appends provider corrections and permits old-sandbox correction after
   ),
 );
 
+it.effect(
+  "serializes cumulative pricing across parallel threads and preserves delayed replay",
+  () =>
+    withPostgres((pool) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          pool.query(
+            "INSERT INTO cloud_thread (workspace_id, thread_id, environment_id) VALUES ($1,$2,$3)",
+            [workspaceId, threadB, environmentB],
+          ),
+        );
+        yield* Effect.promise(() =>
+          insertActiveSandbox(pool, sandboxC, "reservation-c", threadB, environmentB, projectB),
+        );
+
+        const first = evidence(
+          "partition-thread-a",
+          1,
+          "2026-08-28T00:00:00.000Z",
+          "2026-08-28T00:05:00.000Z",
+          10,
+        );
+        const second = evidence(
+          "partition-thread-b",
+          1,
+          "2026-08-28T00:00:00.000Z",
+          "2026-08-28T00:05:00.000Z",
+          10,
+          "b",
+        );
+        const source = sourceFor(
+          new Map([first, second].map((record) => [record.evidenceId, record])),
+        );
+        const service = serviceFor(pool, source.source);
+        const firstRequest = request(first, "partition-a-once");
+        const [firstResult, secondResult] = yield* Effect.all(
+          [
+            service.accrue({ service: "e2b-usage-sampler", workspaceId }, firstRequest),
+            service.accrue(
+              { service: "e2b-usage-sampler", workspaceId },
+              request(second, "partition-b-once", sandboxC, threadB, environmentB),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+        const originalFirst = firstResult.accrual;
+        const delayedReplay = yield* service.accrue(
+          { service: "e2b-usage-sampler", workspaceId },
+          firstRequest,
+        );
+
+        expect(delayedReplay).toEqual({ disposition: "duplicate", accrual: originalFirst });
+        expect(source.reads()).toBe(2);
+        expect(
+          [firstResult.accrual.pricingSequence, secondResult.accrual.pricingSequence].sort(),
+        ).toEqual([1, 2]);
+        expect(
+          firstResult.accrual.totalDeltaMicroUsdc + secondResult.accrual.totalDeltaMicroUsdc,
+        ).toBe(21);
+
+        const cursor = yield* Effect.promise(() =>
+          pool.query<{
+            readonly transition_count: string;
+            readonly cumulative_upstream_micro_usdc: string;
+            readonly cumulative_markup_micro_usdc: string;
+            readonly cumulative_total_micro_usdc: string;
+          }>(
+            `SELECT transition_count::text, cumulative_upstream_micro_usdc::text,
+                  cumulative_markup_micro_usdc::text, cumulative_total_micro_usdc::text
+             FROM cloud_usage_pricing_cursor WHERE workspace_id = $1`,
+            [workspaceId],
+          ),
+        );
+        expect(cursor.rows[0]).toEqual({
+          transition_count: "2",
+          cumulative_upstream_micro_usdc: "20",
+          cumulative_markup_micro_usdc: "1",
+          cumulative_total_micro_usdc: "21",
+        });
+      }),
+    ),
+);
+
 it.effect("serializes concurrent duplicate delivery and makes accounting rows immutable", () =>
   withPostgres((pool) =>
     Effect.gen(function* () {
@@ -475,7 +572,9 @@ it.effect("serializes concurrent duplicate delivery and makes accounting rows im
           yield* Effect.exit(
             Effect.tryPromise(() =>
               pool.query(
-                "UPDATE cloud_usage_ledger_entry SET total_micro_usdc = total_micro_usdc + 1",
+                `UPDATE cloud_usage_ledger_entry
+                    SET cumulative_total_after_micro_usdc =
+                        cumulative_total_after_micro_usdc + 1`,
               ),
             ),
           ),

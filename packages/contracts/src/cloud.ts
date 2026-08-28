@@ -2212,9 +2212,15 @@ export const VerifiedE2bUsageEvidence = Schema.Struct({
   .annotate({ parseOptions: { onExcessProperty: "error" } });
 export type VerifiedE2bUsageEvidence = typeof VerifiedE2bUsageEvidence.Type;
 
+export const UsagePricingScope = Schema.Struct({
+  kind: Schema.Literal("workspace"),
+  workspaceId: WorkspaceId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type UsagePricingScope = typeof UsagePricingScope.Type;
+
 /**
- * Immutable pricing result passed to H5 receipt signing. Corrections append a new accrual whose
- * signed delta moves the ledger from the previous exact total to the corrected exact total.
+ * Immutable pricing transition passed to H5 receipt signing. Pricing is cumulative per workspace,
+ * so evidence partitioning, parallel threads, and settlement boundaries cannot change the fee.
  */
 export const UsageAccrual = Schema.Struct({
   accrualId: UsageAccrualId,
@@ -2225,15 +2231,20 @@ export const UsageAccrual = Schema.Struct({
   threadId: ThreadId,
   sandboxId: SandboxId,
   evidence: VerifiedE2bUsageEvidence,
-  previousUpstreamMicroUsdc: MicroUsdc,
-  previousMarkupMicroUsdc: MicroUsdc,
-  previousTotalMicroUsdc: MicroUsdc,
-  upstreamMicroUsdc: MicroUsdc,
+  pricingScope: UsagePricingScope,
+  pricingVersion: Schema.Literal(1),
+  pricingSequence: PositiveInt,
+  evidencePreviousUpstreamMicroUsdc: MicroUsdc,
+  evidenceUpstreamMicroUsdc: MicroUsdc,
   markupBasisPoints: Schema.Literal(USAGE_MARKUP_BASIS_POINTS),
   markupRounding: UsageMarkupRounding,
-  markupMicroUsdc: MicroUsdc,
-  totalMicroUsdc: MicroUsdc,
   upstreamDeltaMicroUsdc: SignedMicroUsdc,
+  cumulativeUpstreamBeforeMicroUsdc: MicroUsdc,
+  cumulativeUpstreamAfterMicroUsdc: MicroUsdc,
+  cumulativeMarkupBeforeMicroUsdc: MicroUsdc,
+  cumulativeMarkupAfterMicroUsdc: MicroUsdc,
+  cumulativeTotalBeforeMicroUsdc: MicroUsdc,
+  cumulativeTotalAfterMicroUsdc: MicroUsdc,
   markupDeltaMicroUsdc: SignedMicroUsdc,
   totalDeltaMicroUsdc: SignedMicroUsdc,
   payloadSha256: UsageEvidenceSha256,
@@ -2243,33 +2254,39 @@ export const UsageAccrual = Schema.Struct({
     Schema.makeFilter(
       (input) =>
         (input.evidence.revision === 1
-          ? input.priorSampleId === undefined &&
-            input.previousUpstreamMicroUsdc === 0 &&
-            input.previousMarkupMicroUsdc === 0 &&
-            input.previousTotalMicroUsdc === 0
+          ? input.priorSampleId === undefined && input.evidencePreviousUpstreamMicroUsdc === 0
           : input.priorSampleId !== undefined) ||
         "only the first evidence revision may omit its prior sample",
       { identifier: "UsageAccrualRevisionChain" },
     ),
     Schema.makeFilter(
       (input) =>
-        (input.previousMarkupMicroUsdc ===
-          fivePercentMarkupMicroUsdc(input.previousUpstreamMicroUsdc) &&
-          input.previousTotalMicroUsdc ===
-            input.previousUpstreamMicroUsdc + input.previousMarkupMicroUsdc &&
-          input.upstreamMicroUsdc === input.evidence.upstreamMicroUsdc &&
-          input.markupMicroUsdc === fivePercentMarkupMicroUsdc(input.upstreamMicroUsdc) &&
-          input.totalMicroUsdc === input.upstreamMicroUsdc + input.markupMicroUsdc) ||
-        "usage accrual totals must equal exact upstream cost plus 5% rounded half-up",
-      { identifier: "UsageAccrualPricing" },
+        (input.pricingScope.workspaceId === input.workspaceId &&
+          input.evidenceUpstreamMicroUsdc === input.evidence.upstreamMicroUsdc) ||
+        "usage pricing scope and evidence must match the accrual identity",
+      { identifier: "UsageAccrualIdentity" },
     ),
     Schema.makeFilter(
       (input) =>
         (input.upstreamDeltaMicroUsdc ===
-          input.upstreamMicroUsdc - input.previousUpstreamMicroUsdc &&
-          input.markupDeltaMicroUsdc === input.markupMicroUsdc - input.previousMarkupMicroUsdc &&
-          input.totalDeltaMicroUsdc === input.totalMicroUsdc - input.previousTotalMicroUsdc) ||
-        "usage accrual deltas must exactly move the prior total to the current total",
+          input.evidenceUpstreamMicroUsdc - input.evidencePreviousUpstreamMicroUsdc &&
+          input.cumulativeUpstreamAfterMicroUsdc ===
+            input.cumulativeUpstreamBeforeMicroUsdc + input.upstreamDeltaMicroUsdc &&
+          input.cumulativeMarkupBeforeMicroUsdc ===
+            fivePercentMarkupMicroUsdc(input.cumulativeUpstreamBeforeMicroUsdc) &&
+          input.cumulativeMarkupAfterMicroUsdc ===
+            fivePercentMarkupMicroUsdc(input.cumulativeUpstreamAfterMicroUsdc) &&
+          input.cumulativeTotalBeforeMicroUsdc ===
+            input.cumulativeUpstreamBeforeMicroUsdc + input.cumulativeMarkupBeforeMicroUsdc &&
+          input.cumulativeTotalAfterMicroUsdc ===
+            input.cumulativeUpstreamAfterMicroUsdc + input.cumulativeMarkupAfterMicroUsdc &&
+          input.markupDeltaMicroUsdc ===
+            input.cumulativeMarkupAfterMicroUsdc - input.cumulativeMarkupBeforeMicroUsdc &&
+          input.totalDeltaMicroUsdc ===
+            input.cumulativeTotalAfterMicroUsdc - input.cumulativeTotalBeforeMicroUsdc &&
+          input.totalDeltaMicroUsdc ===
+            input.upstreamDeltaMicroUsdc + input.markupDeltaMicroUsdc) ||
+        "usage accrual must be one exact cumulative workspace pricing transition",
       { identifier: "UsageAccrualDelta" },
     ),
     Schema.makeFilter(
@@ -2281,6 +2298,38 @@ export const UsageAccrual = Schema.Struct({
   )
   .annotate({ parseOptions: { onExcessProperty: "error" } });
 export type UsageAccrual = typeof UsageAccrual.Type;
+
+export const UsageAccrualPostingDirection = Schema.Literals(["debit", "credit", "none"]);
+export type UsageAccrualPostingDirection = typeof UsageAccrualPostingDirection.Type;
+
+/** H5 consumes this signed posting without repricing or rounding at settlement boundaries. */
+export const UsageAccrualSettlementInput = Schema.Struct({
+  accrualId: UsageAccrualId,
+  workspaceId: WorkspaceId,
+  pricingScope: UsagePricingScope,
+  pricingVersion: Schema.Literal(1),
+  pricingSequence: PositiveInt,
+  receiptInputSha256: UsageEvidenceSha256,
+  totalDeltaMicroUsdc: SignedMicroUsdc,
+  walletLedgerAmountMicroUsdc: SignedMicroUsdc,
+  direction: UsageAccrualPostingDirection,
+})
+  .check(
+    Schema.makeFilter(
+      (input) =>
+        (input.pricingScope.workspaceId === input.workspaceId &&
+          input.walletLedgerAmountMicroUsdc === -input.totalDeltaMicroUsdc &&
+          (input.totalDeltaMicroUsdc > 0
+            ? input.direction === "debit"
+            : input.totalDeltaMicroUsdc < 0
+              ? input.direction === "credit"
+              : input.direction === "none")) ||
+        "settlement input must preserve the signed accrual delta without repricing",
+      { identifier: "UsageAccrualSettlementInputLinkage" },
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type UsageAccrualSettlementInput = typeof UsageAccrualSettlementInput.Type;
 
 /** Hosted billing accepts sandbox infrastructure meters only, never agent/provider usage. */
 export const UsageMeter = Schema.Literals([

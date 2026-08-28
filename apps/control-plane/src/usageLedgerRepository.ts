@@ -5,6 +5,7 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   UsageAccrual,
   type MicroUsdc,
+  type SignedMicroUsdc,
   type UsageAccrualId,
   type UsageEvidenceSha256,
   type UsageSampleId,
@@ -16,7 +17,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 
-import { exactUsagePriceDelta } from "./usagePricing.ts";
+import { exactCumulativeUsageTransition } from "./usagePricing.ts";
 
 export class UsageLedgerRepositoryError extends Schema.TaggedErrorClass<UsageLedgerRepositoryError>()(
   "UsageLedgerRepositoryError",
@@ -79,13 +80,18 @@ interface AccrualRow extends QueryResultRow {
   readonly interval_start: string;
   readonly interval_end: string;
   readonly observed_at: string;
-  readonly previous_upstream_micro_usdc: string;
-  readonly previous_markup_micro_usdc: string;
-  readonly previous_total_micro_usdc: string;
+  readonly pricing_scope_kind: "workspace";
+  readonly pricing_scope_id: string;
+  readonly pricing_version: number;
+  readonly pricing_sequence: string;
+  readonly evidence_previous_upstream_micro_usdc: string;
   readonly evidence_upstream_micro_usdc: string;
-  readonly upstream_micro_usdc: string;
-  readonly markup_micro_usdc: string;
-  readonly total_micro_usdc: string;
+  readonly cumulative_upstream_before_micro_usdc: string;
+  readonly cumulative_upstream_after_micro_usdc: string;
+  readonly cumulative_markup_before_micro_usdc: string;
+  readonly cumulative_markup_after_micro_usdc: string;
+  readonly cumulative_total_before_micro_usdc: string;
+  readonly cumulative_total_after_micro_usdc: string;
   readonly upstream_delta_micro_usdc: string;
   readonly markup_delta_micro_usdc: string;
   readonly total_delta_micro_usdc: string;
@@ -100,13 +106,16 @@ const accrualColumns = `sample.request_fingerprint, ledger.accrual_id, sample.sa
   to_char(sample.interval_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS interval_start,
   to_char(sample.interval_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS interval_end,
   to_char(sample.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS observed_at,
-  ledger.previous_upstream_micro_usdc::text AS previous_upstream_micro_usdc,
-  ledger.previous_markup_micro_usdc::text AS previous_markup_micro_usdc,
-  ledger.previous_total_micro_usdc::text AS previous_total_micro_usdc,
+  ledger.pricing_scope_kind, ledger.pricing_scope_id::text AS pricing_scope_id,
+  ledger.pricing_version, ledger.pricing_sequence::text AS pricing_sequence,
+  ledger.evidence_previous_upstream_micro_usdc::text AS evidence_previous_upstream_micro_usdc,
   sample.upstream_micro_usdc::text AS evidence_upstream_micro_usdc,
-  ledger.upstream_micro_usdc::text AS upstream_micro_usdc,
-  ledger.markup_micro_usdc::text AS markup_micro_usdc,
-  ledger.total_micro_usdc::text AS total_micro_usdc,
+  ledger.cumulative_upstream_before_micro_usdc::text AS cumulative_upstream_before_micro_usdc,
+  ledger.cumulative_upstream_after_micro_usdc::text AS cumulative_upstream_after_micro_usdc,
+  ledger.cumulative_markup_before_micro_usdc::text AS cumulative_markup_before_micro_usdc,
+  ledger.cumulative_markup_after_micro_usdc::text AS cumulative_markup_after_micro_usdc,
+  ledger.cumulative_total_before_micro_usdc::text AS cumulative_total_before_micro_usdc,
+  ledger.cumulative_total_after_micro_usdc::text AS cumulative_total_after_micro_usdc,
   ledger.upstream_delta_micro_usdc::text AS upstream_delta_micro_usdc,
   ledger.markup_delta_micro_usdc::text AS markup_delta_micro_usdc,
   ledger.total_delta_micro_usdc::text AS total_delta_micro_usdc,
@@ -114,6 +123,7 @@ const accrualColumns = `sample.request_fingerprint, ledger.accrual_id, sample.sa
   to_char(ledger.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at`;
 
 const decodeAccrual = Schema.decodeUnknownSync(UsageAccrual);
+const isUsageLedgerRepositoryError = Schema.is(UsageLedgerRepositoryError);
 const money = (value: string) => Number(value);
 const toAccrual = (row: AccrualRow): UsageAccrual =>
   decodeAccrual({
@@ -135,15 +145,23 @@ const toAccrual = (row: AccrualRow): UsageAccrual =>
       upstreamMicroUsdc: money(row.evidence_upstream_micro_usdc),
       observedAt: row.observed_at,
     },
-    previousUpstreamMicroUsdc: money(row.previous_upstream_micro_usdc),
-    previousMarkupMicroUsdc: money(row.previous_markup_micro_usdc),
-    previousTotalMicroUsdc: money(row.previous_total_micro_usdc),
-    upstreamMicroUsdc: money(row.upstream_micro_usdc),
+    pricingScope: {
+      kind: row.pricing_scope_kind,
+      workspaceId: row.pricing_scope_id,
+    },
+    pricingVersion: row.pricing_version,
+    pricingSequence: money(row.pricing_sequence),
+    evidencePreviousUpstreamMicroUsdc: money(row.evidence_previous_upstream_micro_usdc),
+    evidenceUpstreamMicroUsdc: money(row.evidence_upstream_micro_usdc),
     markupBasisPoints: 500,
     markupRounding: "half-up-to-nearest-micro-usdc",
-    markupMicroUsdc: money(row.markup_micro_usdc),
-    totalMicroUsdc: money(row.total_micro_usdc),
     upstreamDeltaMicroUsdc: money(row.upstream_delta_micro_usdc),
+    cumulativeUpstreamBeforeMicroUsdc: money(row.cumulative_upstream_before_micro_usdc),
+    cumulativeUpstreamAfterMicroUsdc: money(row.cumulative_upstream_after_micro_usdc),
+    cumulativeMarkupBeforeMicroUsdc: money(row.cumulative_markup_before_micro_usdc),
+    cumulativeMarkupAfterMicroUsdc: money(row.cumulative_markup_after_micro_usdc),
+    cumulativeTotalBeforeMicroUsdc: money(row.cumulative_total_before_micro_usdc),
+    cumulativeTotalAfterMicroUsdc: money(row.cumulative_total_after_micro_usdc),
     markupDeltaMicroUsdc: money(row.markup_delta_micro_usdc),
     totalDeltaMicroUsdc: money(row.total_delta_micro_usdc),
     payloadSha256: row.receipt_input_sha256,
@@ -169,9 +187,18 @@ export const usageReceiptInputSha256 = (
   value: Omit<UsageAccrual, "payloadSha256">,
 ): UsageEvidenceSha256 =>
   NodeCrypto.createHash("sha256")
-    .update("agents-in-cloud/usage-accrual/v1\0")
+    .update("agents-in-cloud/usage-accrual/v2\0")
     .update(canonical(value))
     .digest("hex") as UsageEvidenceSha256;
+
+const verifiedAccrualFromRow = (row: AccrualRow) => {
+  const accrual = toAccrual(row);
+  const { payloadSha256, ...receiptInput } = accrual;
+  if (usageReceiptInputSha256(receiptInput) !== payloadSha256) {
+    throw new TypeError("stored usage receipt input hash does not match its immutable payload");
+  }
+  return accrual;
+};
 
 const repositoryError = (
   code: UsageLedgerRepositoryError["code"],
@@ -205,7 +232,7 @@ const queryExisting = async (
     : {
         disposition: "duplicate" as const,
         requestFingerprint: row.request_fingerprint,
-        accrual: toAccrual(row),
+        accrual: verifiedAccrualFromRow(row),
       };
 };
 
@@ -220,6 +247,24 @@ interface PriorRow extends QueryResultRow {
   readonly interval_end: string;
   readonly upstream_micro_usdc: string;
 }
+
+interface PricingCursorRow extends QueryResultRow {
+  readonly pricing_scope_kind: "workspace";
+  readonly pricing_scope_id: string;
+  readonly pricing_version: number;
+  readonly transition_count: string;
+  readonly cumulative_upstream_micro_usdc: string;
+  readonly cumulative_markup_micro_usdc: string;
+  readonly cumulative_total_micro_usdc: string;
+}
+
+const signedDifference = (current: MicroUsdc, previous: MicroUsdc): SignedMicroUsdc => {
+  const delta = BigInt(current) - BigInt(previous);
+  if (delta < BigInt(Number.MIN_SAFE_INTEGER) || delta > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError("usage evidence correction delta exceeds safe micro-USDC bounds");
+  }
+  return Number(delta) as SignedMicroUsdc;
+};
 
 const withTransaction = async <A>(pool: Pool, use: (client: PoolClient) => Promise<A>) => {
   const client = await pool.connect();
@@ -258,6 +303,31 @@ export const makePostgresUsageLedgerRepository = (pool: Pool): UsageLedgerReposi
               throw repositoryError("conflict", "append-verified-usage", false);
             }
             return existing;
+          }
+
+          await client.query(
+            `INSERT INTO cloud_usage_pricing_cursor (
+               workspace_id, pricing_scope_kind, pricing_scope_id, pricing_version,
+               transition_count, cumulative_upstream_micro_usdc,
+               cumulative_markup_micro_usdc, cumulative_total_micro_usdc, updated_at
+             ) VALUES ($1,'workspace',$1,1,0,0,0,0,$2)
+             ON CONFLICT (workspace_id) DO NOTHING`,
+            [input.workspaceId, input.recordedAt],
+          );
+          const cursorResult = await client.query<PricingCursorRow>(
+            `SELECT pricing_scope_kind, pricing_scope_id::text AS pricing_scope_id,
+                    pricing_version, transition_count::text AS transition_count,
+                    cumulative_upstream_micro_usdc::text AS cumulative_upstream_micro_usdc,
+                    cumulative_markup_micro_usdc::text AS cumulative_markup_micro_usdc,
+                    cumulative_total_micro_usdc::text AS cumulative_total_micro_usdc
+               FROM cloud_usage_pricing_cursor
+              WHERE workspace_id = $1
+              FOR UPDATE`,
+            [input.workspaceId],
+          );
+          const pricingCursor = cursorResult.rows[0];
+          if (pricingCursor === undefined) {
+            throw repositoryError("databaseFailure", "lock-pricing-cursor", true);
           }
 
           const priorResult = await client.query<PriorRow>(
@@ -327,11 +397,24 @@ export const makePostgresUsageLedgerRepository = (pool: Pool): UsageLedgerReposi
           }
 
           let price;
+          let evidencePreviousUpstreamMicroUsdc: MicroUsdc;
+          let pricingSequence: number;
           try {
-            const priorUpstream = (
+            evidencePreviousUpstreamMicroUsdc = (
               prior === undefined ? 0 : money(prior.upstream_micro_usdc)
             ) as MicroUsdc;
-            price = exactUsagePriceDelta(priorUpstream, input.evidence.upstreamMicroUsdc);
+            const upstreamDeltaMicroUsdc = signedDifference(
+              input.evidence.upstreamMicroUsdc,
+              evidencePreviousUpstreamMicroUsdc,
+            );
+            price = exactCumulativeUsageTransition(
+              money(pricingCursor.cumulative_upstream_micro_usdc) as MicroUsdc,
+              upstreamDeltaMicroUsdc,
+            );
+            pricingSequence = money(pricingCursor.transition_count) + 1;
+            if (!Number.isSafeInteger(pricingSequence)) {
+              throw new RangeError("pricing sequence exceeds safe integer bounds");
+            }
           } catch (cause) {
             throw repositoryError("moneyOverflow", "price-verified-usage", false, cause);
           }
@@ -345,15 +428,23 @@ export const makePostgresUsageLedgerRepository = (pool: Pool): UsageLedgerReposi
             threadId: input.threadId,
             sandboxId: input.sandboxId,
             evidence: input.evidence,
-            previousUpstreamMicroUsdc: price.previous.upstreamMicroUsdc,
-            previousMarkupMicroUsdc: price.previous.markupMicroUsdc,
-            previousTotalMicroUsdc: price.previous.totalMicroUsdc,
-            upstreamMicroUsdc: price.upstreamMicroUsdc,
+            pricingScope: {
+              kind: pricingCursor.pricing_scope_kind,
+              workspaceId: pricingCursor.pricing_scope_id as WorkspaceId,
+            },
+            pricingVersion: 1,
+            pricingSequence,
+            evidencePreviousUpstreamMicroUsdc,
+            evidenceUpstreamMicroUsdc: input.evidence.upstreamMicroUsdc,
             markupBasisPoints: 500,
             markupRounding: "half-up-to-nearest-micro-usdc",
-            markupMicroUsdc: price.markupMicroUsdc,
-            totalMicroUsdc: price.totalMicroUsdc,
             upstreamDeltaMicroUsdc: price.upstreamDeltaMicroUsdc,
+            cumulativeUpstreamBeforeMicroUsdc: price.before.upstreamMicroUsdc,
+            cumulativeUpstreamAfterMicroUsdc: price.after.upstreamMicroUsdc,
+            cumulativeMarkupBeforeMicroUsdc: price.before.markupMicroUsdc,
+            cumulativeMarkupAfterMicroUsdc: price.after.markupMicroUsdc,
+            cumulativeTotalBeforeMicroUsdc: price.before.totalMicroUsdc,
+            cumulativeTotalAfterMicroUsdc: price.after.totalMicroUsdc,
             markupDeltaMicroUsdc: price.markupDeltaMicroUsdc,
             totalDeltaMicroUsdc: price.totalDeltaMicroUsdc,
             recordedAt: input.recordedAt,
@@ -391,16 +482,36 @@ export const makePostgresUsageLedgerRepository = (pool: Pool): UsageLedgerReposi
             ],
           );
           await client.query(
+            `UPDATE cloud_usage_pricing_cursor
+                SET transition_count = $2,
+                    cumulative_upstream_micro_usdc = $3,
+                    cumulative_markup_micro_usdc = $4,
+                    cumulative_total_micro_usdc = $5,
+                    updated_at = $6
+              WHERE workspace_id = $1`,
+            [
+              input.workspaceId,
+              pricingSequence,
+              price.after.upstreamMicroUsdc,
+              price.after.markupMicroUsdc,
+              price.after.totalMicroUsdc,
+              input.recordedAt,
+            ],
+          );
+          await client.query(
             `INSERT INTO cloud_usage_ledger_entry (
                workspace_id, accrual_id, sample_id, environment_id, thread_id, sandbox_id,
-               entry_kind, previous_upstream_micro_usdc, previous_markup_micro_usdc,
-               previous_total_micro_usdc, upstream_micro_usdc, markup_basis_points,
-               markup_rounding, markup_micro_usdc, total_micro_usdc,
+               entry_kind, evidence_revision, pricing_scope_kind, pricing_scope_id,
+               pricing_version, pricing_sequence, evidence_previous_upstream_micro_usdc,
+               evidence_upstream_micro_usdc, cumulative_upstream_before_micro_usdc,
+               cumulative_upstream_after_micro_usdc, markup_basis_points, markup_rounding,
+               cumulative_markup_before_micro_usdc, cumulative_markup_after_micro_usdc,
+               cumulative_total_before_micro_usdc, cumulative_total_after_micro_usdc,
                upstream_delta_micro_usdc, markup_delta_micro_usdc, total_delta_micro_usdc,
                receipt_input_sha256, recorded_at
              ) VALUES (
-               $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,500,'half-up-to-nearest-micro-usdc',
-               $12,$13,$14,$15,$16,$17,$18
+               $1,$2,$3,$4,$5,$6,$7,$8,'workspace',$1,1,$9,$10,$11,$12,$13,
+               500,'half-up-to-nearest-micro-usdc',$14,$15,$16,$17,$18,$19,$20,$21,$22
              )`,
             [
               input.workspaceId,
@@ -410,12 +521,16 @@ export const makePostgresUsageLedgerRepository = (pool: Pool): UsageLedgerReposi
               input.threadId,
               input.sandboxId,
               prior === undefined ? "usage" : "correction",
-              price.previous.upstreamMicroUsdc,
-              price.previous.markupMicroUsdc,
-              price.previous.totalMicroUsdc,
-              price.upstreamMicroUsdc,
-              price.markupMicroUsdc,
-              price.totalMicroUsdc,
+              input.evidence.revision,
+              pricingSequence,
+              evidencePreviousUpstreamMicroUsdc,
+              input.evidence.upstreamMicroUsdc,
+              price.before.upstreamMicroUsdc,
+              price.after.upstreamMicroUsdc,
+              price.before.markupMicroUsdc,
+              price.after.markupMicroUsdc,
+              price.before.totalMicroUsdc,
+              price.after.totalMicroUsdc,
               price.upstreamDeltaMicroUsdc,
               price.markupDeltaMicroUsdc,
               price.totalDeltaMicroUsdc,
@@ -430,7 +545,7 @@ export const makePostgresUsageLedgerRepository = (pool: Pool): UsageLedgerReposi
           };
         }),
       catch: (cause) => {
-        if (Schema.is(UsageLedgerRepositoryError)(cause)) return cause;
+        if (isUsageLedgerRepositoryError(cause)) return cause;
         const code =
           typeof cause === "object" && cause !== null && "code" in cause
             ? String(cause.code)

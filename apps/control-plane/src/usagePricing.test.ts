@@ -1,7 +1,7 @@
-import type { MicroUsdc } from "@t3tools/contracts/cloud";
+import type { MicroUsdc, SignedMicroUsdc } from "@t3tools/contracts/cloud";
 import { describe, expect, it } from "vite-plus/test";
 
-import { exactUsagePrice, exactUsagePriceDelta } from "./usagePricing.ts";
+import { exactCumulativeUsageTransition, exactUsagePrice } from "./usagePricing.ts";
 
 describe("exact usage pricing", () => {
   it("charges exact upstream cost plus 5% with half-up micro-USDC rounding", () => {
@@ -30,20 +30,43 @@ describe("exact usage pricing", () => {
     }
   });
 
-  it("posts corrections as the exact delta between fully repriced totals", () => {
-    expect(exactUsagePriceDelta(1_010 as MicroUsdc, 1_000 as MicroUsdc)).toMatchObject({
+  it("posts corrections as the exact delta on the cumulative pricing cursor", () => {
+    expect(
+      exactCumulativeUsageTransition(1_010 as MicroUsdc, -10 as SignedMicroUsdc),
+    ).toMatchObject({
       upstreamDeltaMicroUsdc: -10,
       markupDeltaMicroUsdc: -1,
       totalDeltaMicroUsdc: -11,
-      upstreamMicroUsdc: 1_000,
-      markupMicroUsdc: 50,
-      totalMicroUsdc: 1_050,
+      after: {
+        upstreamMicroUsdc: 1_000,
+        markupMicroUsdc: 50,
+        totalMicroUsdc: 1_050,
+      },
     });
-    expect(exactUsagePriceDelta(1_000 as MicroUsdc, 1_010 as MicroUsdc)).toMatchObject({
-      upstreamDeltaMicroUsdc: 10,
-      markupDeltaMicroUsdc: 1,
-      totalDeltaMicroUsdc: 11,
-    });
+    expect(exactCumulativeUsageTransition(1_000 as MicroUsdc, 10 as SignedMicroUsdc)).toMatchObject(
+      {
+        upstreamDeltaMicroUsdc: 10,
+        markupDeltaMicroUsdc: 1,
+        totalDeltaMicroUsdc: 11,
+      },
+    );
+  });
+
+  it("is invariant to partitioning, including two through one hundred 10-micro records", () => {
+    for (let count = 2; count <= 100; count += 1) {
+      let cumulative = 0 as MicroUsdc;
+      let markupDeltaSum = 0;
+      let totalDeltaSum = 0;
+      for (let index = 0; index < count; index += 1) {
+        const transition = exactCumulativeUsageTransition(cumulative, 10 as SignedMicroUsdc);
+        cumulative = transition.after.upstreamMicroUsdc;
+        markupDeltaSum += transition.markupDeltaMicroUsdc;
+        totalDeltaSum += transition.totalDeltaMicroUsdc;
+      }
+      const aggregate = exactUsagePrice((count * 10) as MicroUsdc);
+      expect(markupDeltaSum).toBe(aggregate.markupMicroUsdc);
+      expect(totalDeltaSum).toBe(aggregate.totalMicroUsdc);
+    }
   });
 
   it("rejects unsafe, fractional, negative, and overflowing monetary inputs", () => {
@@ -54,5 +77,8 @@ describe("exact usage pricing", () => {
       Number.MAX_SAFE_INTEGER,
     );
     expect(() => exactUsagePrice(8_578_285_004_515_230 as MicroUsdc)).toThrow(RangeError);
+    expect(() => exactCumulativeUsageTransition(0 as MicroUsdc, -1 as SignedMicroUsdc)).toThrow(
+      RangeError,
+    );
   });
 });

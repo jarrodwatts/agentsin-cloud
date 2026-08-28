@@ -35,22 +35,29 @@ same-input replay returns the original accrual without consulting E2B or creatin
 ## Fixed-point pricing
 
 All values are safe integer micro-USDC. Floating point money and unsafe integers are rejected.
-Markup is fixed at 500 basis points. It is calculated as one twentieth of upstream cost and rounded
-half-up to the nearest micro-USDC. For example, an upstream cost of 1,010 micro-USDC has a markup of
-51 and a total of 1,061. The half-micro boundary therefore rounds toward the platform by one
-micro-USDC, and that policy is recorded on each accrual.
+Markup is fixed at 500 basis points. Each workspace (the v1 billing account) has one PostgreSQL
+pricing cursor containing its cumulative verified upstream spend. Markup is one twentieth of that
+cumulative amount, rounded half-up to the nearest micro-USDC. An accrual posts only the signed
+difference between the cursor's exact total before and after the evidence transition. This makes
+the result invariant to evidence partitioning and parallel threads: two 10-micro records produce a
+cumulative upstream amount of 20, markup of 1, and total of 21. The cursor never resets when a
+settlement is created or finalized.
 
-Provider corrections never edit history. The service reprices the corrected full upstream amount,
-then appends the signed delta from the previous upstream, markup, and total. A downward correction
-therefore produces a negative ledger delta; an upward correction produces a positive delta. This
-avoids rounding a correction independently from the total it corrects.
+Provider corrections never edit history. A correction contributes the signed difference between
+the revised evidence amount and its preceding revision to the same workspace cursor. A downward
+correction therefore produces a negative upstream delta and may produce negative markup and total
+deltas; an upward correction produces positive deltas. The cursor is locked and advanced in the
+same transaction as evidence and ledger insertion, so concurrent threads cannot observe or write
+the same pricing sequence.
 
 ## Receipt boundary
 
 Each accepted revision atomically appends its evidence row and one ledger accrual. The immutable
-receipt input binds tenant, thread, sandbox, evidence revision and digest, prior and current prices,
-all deltas, the 5% policy, and its recorded time. A domain-separated SHA-256 digest covers that
-payload. Database triggers reject updates and deletes.
+receipt input binds tenant, thread, sandbox, evidence revision and digest, workspace pricing scope
+and version, cursor sequence, cumulative values before and after, signed deltas, the 5% policy, and
+its recorded time. A domain-separated SHA-256 digest covers that payload. Database triggers reject
+updates and deletes. H5 receives the signed total delta and its debit/credit direction directly;
+settlement batches must not recalculate or round it.
 
 H5 owns receipt signing, settlement batching, wallet authorization, on-chain transfer, and daily
 reconciliation. H4 does not submit a Turnkey or Monad operation and does not mark any accrual as

@@ -37,32 +37,39 @@ export const exactUsagePrice = (upstreamMicroUsdc: MicroUsdc): UsagePrice => {
   };
 };
 
-export interface UsagePriceDelta extends UsagePrice {
-  readonly previous: UsagePrice;
+export interface CumulativeUsagePriceTransition {
+  readonly before: UsagePrice;
+  readonly after: UsagePrice;
   readonly upstreamDeltaMicroUsdc: SignedMicroUsdc;
   readonly markupDeltaMicroUsdc: SignedMicroUsdc;
   readonly totalDeltaMicroUsdc: SignedMicroUsdc;
 }
 
-export const exactUsagePriceDelta = (
-  previousUpstreamMicroUsdc: MicroUsdc,
-  upstreamMicroUsdc: MicroUsdc,
-): UsagePriceDelta => {
-  const previous = exactUsagePrice(previousUpstreamMicroUsdc);
-  const current = exactUsagePrice(upstreamMicroUsdc);
+/**
+ * Advances the one workspace pricing cursor. The 5% fee is rounded only on cumulative verified
+ * spend; callers persist the resulting signed delta and never re-round settlement batches.
+ */
+export const exactCumulativeUsageTransition = (
+  cumulativeUpstreamBeforeMicroUsdc: MicroUsdc,
+  upstreamDeltaMicroUsdc: SignedMicroUsdc,
+): CumulativeUsagePriceTransition => {
+  if (!Number.isSafeInteger(upstreamDeltaMicroUsdc)) {
+    throw new RangeError("upstreamDeltaMicroUsdc must be a safe signed integer");
+  }
+  const before = exactUsagePrice(cumulativeUpstreamBeforeMicroUsdc);
+  const cumulativeAfter =
+    BigInt(cumulativeUpstreamBeforeMicroUsdc) + BigInt(upstreamDeltaMicroUsdc);
+  const after = exactUsagePrice(microUsdc(cumulativeAfter, "cumulativeUpstreamAfterMicroUsdc"));
   return {
-    ...current,
-    previous,
-    upstreamDeltaMicroUsdc: signedMicroUsdc(
-      BigInt(current.upstreamMicroUsdc) - BigInt(previous.upstreamMicroUsdc),
-      "upstreamDeltaMicroUsdc",
-    ),
+    before,
+    after,
+    upstreamDeltaMicroUsdc,
     markupDeltaMicroUsdc: signedMicroUsdc(
-      BigInt(current.markupMicroUsdc) - BigInt(previous.markupMicroUsdc),
+      BigInt(after.markupMicroUsdc) - BigInt(before.markupMicroUsdc),
       "markupDeltaMicroUsdc",
     ),
     totalDeltaMicroUsdc: signedMicroUsdc(
-      BigInt(current.totalMicroUsdc) - BigInt(previous.totalMicroUsdc),
+      BigInt(after.totalMicroUsdc) - BigInt(before.totalMicroUsdc),
       "totalDeltaMicroUsdc",
     ),
   };
