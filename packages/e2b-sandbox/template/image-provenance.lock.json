@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "publishable": false,
+  "bootstrapSourceImage": "node:24.13.1-bookworm@sha256:00e9195ebd49985a6da8921f419978d85dfe354589755192dc090425ce4da2f7",
+  "debianSnapshot": null,
+  "resolvedAptPackagesSha256": null,
+  "nodePtyLinuxNativeArtifactsSha256": null,
+  "releaseGate": "Replace the bootstrap build with a fully built OCI digest, or lock an immutable Debian snapshot, its complete resolved package closure, and the Linux node-pty native artifact digest. Set publishable only after a clean rebuild reproduces every digest."
+}

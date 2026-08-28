@@ -4,11 +4,17 @@ set -euo pipefail
 command -v bwrap >/dev/null
 command -v curl >/dev/null
 command -v git >/dev/null
+command -v mcookie >/dev/null
 command -v node >/dev/null
+command -v python3 >/dev/null
 command -v setpriv >/dev/null
 command -v sha256sum >/dev/null
+command -v xauth >/dev/null
 test -x /usr/share/novnc/utils/novnc_proxy
+test -x /opt/agentsin/start-sandbox.sh
 test -x /opt/agentsin/start-worker.sh
+test -x /opt/agentsin/start-desktop.sh
+test -x /opt/agentsin/desktop-session.sh
 test -x /opt/agentsin/worker/entrypoint.mjs
 test -x /opt/agentsin/worker/ProviderRuntimeChild.mjs
 test "$(id -u agentsin-agent)" = "11001"
@@ -18,6 +24,12 @@ test "$(id -g agentsin-inspector)" = "11002"
 test "$(stat -c '%u:%g' /workspace)" = "11001:11001"
 getfacl --absolute-names --omit-header /workspace | grep -qx 'user:agentsin-inspector:rwx'
 getfacl --absolute-names --omit-header /workspace | grep -qx 'default:user:agentsin-inspector:rwx'
+test "$(stat -c '%u:%g' /run/agentsin)" = "0:0"
+test "$(stat -c '%a' /run/agentsin)" = "711"
+test "$(stat -c '%a' /run/agentsin/bootstrap)" = "700"
+test "$(stat -c '%a' /run/agentsin/mtls)" = "700"
+test "$(stat -c '%a' /run/agentsin/provider-credentials)" = "711"
+! setpriv --reuid=11001 --regid=11001 --clear-groups -- /bin/ls /run/agentsin >/dev/null 2>&1
 
 cd /opt/agentsin/worker
 sha256sum --check --strict SHA256SUMS
@@ -46,3 +58,74 @@ test "${worker_status}" -ne 0
 test "${worker_status}" -ne 124
 grep -q 'startup failed closed' /tmp/agentsin-worker-verify.log
 rm -f /tmp/agentsin-worker-verify.log
+
+/opt/agentsin/start-sandbox.sh >/tmp/agentsin-supervisor-verify.log 2>&1 &
+readonly supervisor_pid=$!
+cleanup_supervisor() {
+  kill "${supervisor_pid}" 2>/dev/null || true
+  wait "${supervisor_pid}" 2>/dev/null || true
+}
+trap cleanup_supervisor EXIT INT TERM
+
+for _ in $(seq 1 200); do
+  if [[ -s /run/agentsin/desktop/Xauthority ]] &&
+    [[ -s /run/agentsin/desktop/vnc.passwd ]] &&
+    python3 - <<'PY'
+import socket
+with socket.create_connection(("127.0.0.1", 5900), timeout=0.1):
+    pass
+PY
+  then
+    break
+  fi
+  if ! kill -0 "${supervisor_pid}" 2>/dev/null; then
+    cat /tmp/agentsin-supervisor-verify.log >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+
+test "$(stat -c '%u:%g' /run/agentsin/desktop)" = "11002:11002"
+test "$(stat -c '%a' /run/agentsin/desktop)" = "700"
+test "$(stat -c '%u:%g' /run/agentsin/desktop/Xauthority)" = "11002:11002"
+test "$(stat -c '%a' /run/agentsin/desktop/Xauthority)" = "600"
+test "$(stat -c '%u:%g' /run/agentsin/desktop/vnc.passwd)" = "11002:11002"
+test "$(stat -c '%a' /run/agentsin/desktop/vnc.passwd)" = "600"
+! setpriv --reuid=11001 --regid=11001 --clear-groups -- /usr/bin/test -r /run/agentsin/desktop/Xauthority
+! setpriv --reuid=11001 --regid=11001 --clear-groups -- /usr/bin/test -r /run/agentsin/desktop/vnc.passwd
+! setpriv --reuid=11001 --regid=11001 --clear-groups -- \
+  env DISPLAY=:0 XAUTHORITY=/dev/null xdpyinfo -display :0 >/dev/null 2>&1
+
+for _ in $(seq 1 100); do
+  if ps -eo comm= | awk '$1 == "xfce4-session" { found = 1 } END { exit !found }'; then
+    break
+  fi
+  sleep 0.05
+done
+
+ps -eo uid=,comm= | awk '$2 == "Xvfb" { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
+ps -eo uid=,comm= | awk '$2 == "x11vnc" { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
+ps -eo uid=,args= | awk '$0 ~ /novnc_proxy/ { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
+ps -eo uid=,args= | awk '$0 ~ /xfce4-session/ { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
+
+python3 - <<'PY'
+import socket
+
+with socket.create_connection(("127.0.0.1", 5900), timeout=1) as client:
+    protocol = client.recv(12)
+    if not protocol.startswith(b"RFB "):
+        raise SystemExit("VNC protocol handshake is unavailable")
+    client.sendall(protocol)
+    count = client.recv(1)
+    if len(count) != 1 or count[0] < 1:
+        raise SystemExit("VNC security negotiation failed closed")
+    security_types = client.recv(count[0])
+    if 1 in security_types or 2 not in security_types:
+        raise SystemExit("VNC allows an unauthenticated security type")
+PY
+
+cleanup_supervisor
+trap - EXIT INT TERM
+test ! -e /run/agentsin/desktop
+rm -f /tmp/agentsin-supervisor-verify.log
+node /opt/agentsin/verify-provenance.cjs

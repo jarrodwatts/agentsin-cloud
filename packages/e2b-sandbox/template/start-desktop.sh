@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DISPLAY="${DISPLAY:-:0}"
+readonly desktop_root="/run/agentsin/desktop"
+readonly desktop_session="/opt/agentsin/desktop-session.sh"
+readonly vnc_password_file="${desktop_root}/vnc.passwd"
 
-Xvfb "$DISPLAY" -ac -screen 0 1440x1024x24 -nolisten tcp &
-for _ in $(seq 1 50); do
-  xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
-  sleep 0.1
-done
-startxfce4 &
-sleep 2
-x11vnc -bg -display "$DISPLAY" -forever -shared -rfbport 5900 -nopw -noxdamage -repeat
-/usr/share/novnc/utils/novnc_proxy \
-  --vnc localhost:5900 \
-  --listen 6080 \
-  --web /usr/share/novnc \
-  --heartbeat 30 &
+test "$(id -u)" = "0"
+test -x "${desktop_session}"
+test "$(stat -c '%u:%g' "${desktop_root}")" = "11002:11002"
+test "$(stat -c '%a' "${desktop_root}")" = "700"
+test "$(stat -c '%u:%g' "${vnc_password_file}")" = "11002:11002"
+test "$(stat -c '%a' "${vnc_password_file}")" = "600"
 
-wait
+exec /usr/bin/setpriv \
+  --reuid=11002 \
+  --regid=11002 \
+  --clear-groups \
+  --no-new-privs \
+  -- /usr/bin/env -i \
+  HOME=/home/agentsin-inspector \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  "${desktop_session}"

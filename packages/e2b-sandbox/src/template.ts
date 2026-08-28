@@ -1,7 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 
 export const E2B_BASE_TEMPLATE_NAME = "agentsin-cloud-base";
-export const E2B_BASE_TEMPLATE_VERSION = "v2";
+export const E2B_BASE_TEMPLATE_VERSION = "v3";
 export const E2B_DESKTOP_PORT = 6080;
 export const E2B_ACTIVE_TIMEOUT_MS = 15 * 60 * 1_000;
 export const E2B_TEMPLATE_REF_PREFIX = "e2b://template/";
@@ -17,9 +17,11 @@ export const E2B_BASE_TEMPLATE_PACKAGES = Object.freeze([
   "iproute2",
   "novnc",
   "openssh-client",
+  "procps",
   "python3",
   "util-linux",
   "websockify",
+  "xauth",
   "x11-utils",
   "x11vnc",
   "xfce4",
@@ -27,13 +29,19 @@ export const E2B_BASE_TEMPLATE_PACKAGES = Object.freeze([
   "xvfb",
 ]);
 export const E2B_DESKTOP_START_SCRIPT_SHA256 =
-  "8b2e7f046d90cf94f06aa3eebba66bf5a1ed1df79bb6629d99b1b6fa3f9045c8";
+  "ea4c9b8b6decc5d09fb8d19453b082ee4997444383b73373cd3bb6ec60853a0e";
+export const E2B_SANDBOX_START_SCRIPT_SHA256 =
+  "ddd6edfaf6979a36e7ce3990b610be2361423fab175d5ff628dd1e35cbcf1701";
+export const E2B_DESKTOP_SESSION_SCRIPT_SHA256 =
+  "b1c3e533bc05134ff8383a62590d7077a2abf374d3e5ffa3876280bd48061f1f";
 export const E2B_WORKER_START_SCRIPT_SHA256 =
-  "c64b4de03f277451ed78650d677b73fa1551a4e68fe804ad33ede441af031d88";
+  "d52379c6f80322e55abb60bf10d8755b4839e1bac71dbd54253f37bd1c098318";
 export const E2B_TEMPLATE_DEFINITION_SHA256 =
-  "0facf01aa288af76ea7e368be0c15f2820b141ecc56ffc13f069eaaf022cf251";
+  "b4627079757c32cfefb85cdda01482bbcaebd5d5881582b1443f2d6a7afb61ac";
 export const E2B_IMAGE_VERIFICATION_SCRIPT_SHA256 =
-  "2475284870d9df0ee0f35259f313b2927730d553793735a63a44a6fa807502b4";
+  "431d2d997f6765463e871a3600409d50a7339ac933917da1e9a24d558f23306d";
+export const E2B_PROVENANCE_VERIFICATION_SCRIPT_SHA256 =
+  "972bff1da520b90ebfd43fbb2f08961772f64b595a01efc06eb5c3e1013ac1e5";
 export const E2B_WORKER_PACKAGE_SHA256 =
   "be6d610268058601dfc908a5f2b01c67fcbc8c44abedc9a1fee79aa3ac4ff15e";
 export const E2B_WORKER_PACKAGE_LOCK_SHA256 =
@@ -42,16 +50,31 @@ export const E2B_WORKER_ENTRYPOINT_SHA256 =
   "bb00ca28b78cae9c1cb9733fb1013ce541c33904433232fe4b0e6d7f2675f75b";
 export const E2B_PROVIDER_RUNTIME_CHILD_SHA256 =
   "68e33a9dae988d5301166d326aba4d1b7aadcc574b4a93c4a9c8170093decff6";
+export const E2B_IMAGE_PROVENANCE_LOCK_SHA256 =
+  "c0ec9f45efa931e3f19a60d40c1ad18168f99668976bf1de6546629c44008a54";
+export const E2B_IMAGE_PROVENANCE = Object.freeze({
+  publishable: false,
+  debianSnapshot: null,
+  resolvedAptPackagesSha256: null,
+  nodePtyLinuxNativeArtifactsSha256: null,
+  releaseGate:
+    "A fully built OCI digest, or an immutable Debian snapshot plus resolved package closure and Linux node-pty native artifact digest, is required",
+});
 
 /** Inputs that define the base build. A successful E2B build ID is pinned separately per revision. */
 export const E2B_BASE_TEMPLATE_MANIFEST = Object.freeze({
-  schemaVersion: 2,
+  schemaVersion: 3,
   sourceImage: E2B_BASE_SOURCE_IMAGE,
   packages: E2B_BASE_TEMPLATE_PACKAGES,
+  imageProvenanceLockSha256: E2B_IMAGE_PROVENANCE_LOCK_SHA256,
+  imageProvenance: E2B_IMAGE_PROVENANCE,
   templateDefinitionSha256: E2B_TEMPLATE_DEFINITION_SHA256,
+  sandboxStartScriptSha256: E2B_SANDBOX_START_SCRIPT_SHA256,
   desktopStartScriptSha256: E2B_DESKTOP_START_SCRIPT_SHA256,
+  desktopSessionScriptSha256: E2B_DESKTOP_SESSION_SCRIPT_SHA256,
   workerStartScriptSha256: E2B_WORKER_START_SCRIPT_SHA256,
   imageVerificationScriptSha256: E2B_IMAGE_VERIFICATION_SCRIPT_SHA256,
+  provenanceVerificationScriptSha256: E2B_PROVENANCE_VERIFICATION_SCRIPT_SHA256,
   workerPackageSha256: E2B_WORKER_PACKAGE_SHA256,
   workerPackageLockSha256: E2B_WORKER_PACKAGE_LOCK_SHA256,
   workerEntrypointSha256: E2B_WORKER_ENTRYPOINT_SHA256,
@@ -63,7 +86,8 @@ export const E2B_BASE_TEMPLATE_MANIFEST = Object.freeze({
   agentIdentity: { user: "agentsin-agent", uid: 11_001, gid: 11_001 },
   inspectorIdentity: { user: "agentsin-inspector", uid: 11_002, gid: 11_002 },
   workerEntrypoint: "/opt/agentsin/worker/entrypoint.mjs",
-  workerStartCommand: "/opt/agentsin/start-worker.sh <sealed-bootstrap-reference>",
+  sandboxStartCommand: "/opt/agentsin/start-sandbox.sh",
+  workerStartCommand: "/opt/agentsin/start-worker.sh /run/agentsin/bootstrap/sealed.json",
   providerRuntimeModule: "/opt/agentsin/provider/provider-service.mjs",
   verificationCommand: "/opt/agentsin/verify-image.sh",
 });
@@ -71,6 +95,18 @@ export const E2B_BASE_TEMPLATE_MANIFEST = Object.freeze({
 export const E2B_BASE_TEMPLATE_SOURCE_HASH = NodeCrypto.createHash("sha256")
   .update(JSON.stringify(E2B_BASE_TEMPLATE_MANIFEST))
   .digest("hex");
+
+/** Publishing remains disabled until every mutable package/native input has a resolved digest. */
+export const assertE2bImageProvenancePublishable = () => {
+  if (
+    !E2B_IMAGE_PROVENANCE.publishable ||
+    E2B_IMAGE_PROVENANCE.debianSnapshot === null ||
+    E2B_IMAGE_PROVENANCE.resolvedAptPackagesSha256 === null ||
+    E2B_IMAGE_PROVENANCE.nodePtyLinuxNativeArtifactsSha256 === null
+  ) {
+    throw new Error(`E2B image provenance is not publishable: ${E2B_IMAGE_PROVENANCE.releaseGate}`);
+  }
+};
 
 export const assertE2bWorkerArtifactHashes = (input: {
   readonly workerEntrypointSha256: string;

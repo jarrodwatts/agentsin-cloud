@@ -10,6 +10,7 @@ import {
   E2B_BASE_TEMPLATE_MANIFEST,
   E2B_BASE_TEMPLATE_NAME,
   E2B_BASE_TEMPLATE_SOURCE_HASH,
+  assertE2bImageProvenancePublishable,
   assertE2bWorkerArtifactHashes,
   verifyAndAssignImmutableE2bBuildTag,
 } from "../src/template.ts";
@@ -21,6 +22,7 @@ const sha256File = async (path: string) =>
     .digest("hex");
 
 const repositoryRoot = NodePath.resolve(import.meta.dirname, "../../..");
+assertE2bImageProvenancePublishable();
 assertE2bWorkerArtifactHashes({
   workerEntrypointSha256: await sha256File(
     NodePath.join(repositoryRoot, "apps/worker/dist/entrypoint.mjs"),

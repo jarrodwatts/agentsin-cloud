@@ -3,7 +3,11 @@ import * as NodePath from "node:path";
 
 import { Template, waitForPort } from "e2b";
 
-import { E2B_BASE_SOURCE_IMAGE, E2B_BASE_TEMPLATE_PACKAGES } from "../src/template.ts";
+import {
+  E2B_BASE_SOURCE_IMAGE,
+  E2B_BASE_TEMPLATE_PACKAGES,
+  E2B_IMAGE_PROVENANCE_LOCK_SHA256,
+} from "../src/template.ts";
 
 export const agentsInCloudBaseTemplate = Template({
   fileContextPath: NodePath.resolve(import.meta.dirname, "../../.."),
@@ -21,9 +25,16 @@ export const agentsInCloudBaseTemplate = Template({
     "setfacl -m u:agentsin-inspector:rwx,m:rwx /workspace",
     "setfacl -d -m u::rwx,u:agentsin-inspector:rwx,g::---,m::rwx,o::--- /workspace",
     "install -d -o root -g root -m 0755 /opt/agentsin /opt/agentsin/worker /opt/agentsin/provider",
-    "install -d -o root -g root -m 0700 /run/agentsin /run/agentsin/bootstrap /run/agentsin/mtls /run/agentsin/provider-credentials",
+    "install -d -o root -g root -m 0711 /run/agentsin /run/agentsin/provider-credentials",
+    "install -d -o root -g root -m 0700 /run/agentsin/bootstrap /run/agentsin/mtls",
   ])
+  .copy("packages/e2b-sandbox/template/start-sandbox.sh", "/opt/agentsin/start-sandbox.sh", {
+    mode: 0o555,
+  })
   .copy("packages/e2b-sandbox/template/start-desktop.sh", "/opt/agentsin/start-desktop.sh", {
+    mode: 0o555,
+  })
+  .copy("packages/e2b-sandbox/template/desktop-session.sh", "/opt/agentsin/desktop-session.sh", {
     mode: 0o555,
   })
   .copy("packages/e2b-sandbox/template/start-worker.sh", "/opt/agentsin/start-worker.sh", {
@@ -32,6 +43,11 @@ export const agentsInCloudBaseTemplate = Template({
   .copy("packages/e2b-sandbox/template/verify-image.sh", "/opt/agentsin/verify-image.sh", {
     mode: 0o555,
   })
+  .copy(
+    "packages/e2b-sandbox/template/verify-provenance.cjs",
+    "/opt/agentsin/verify-provenance.cjs",
+    { mode: 0o444 },
+  )
   .copy("apps/worker/dist/entrypoint.mjs", "/opt/agentsin/worker/entrypoint.mjs", {
     mode: 0o555,
   })
@@ -49,10 +65,18 @@ export const agentsInCloudBaseTemplate = Template({
     "/opt/agentsin/worker/package-lock.json",
     { mode: 0o444 },
   )
+  .copy(
+    "packages/e2b-sandbox/template/image-provenance.lock.json",
+    "/opt/agentsin/image-provenance.lock.json",
+    { mode: 0o444 },
+  )
   .setWorkdir("/opt/agentsin/worker")
   .runCmd("npm ci --omit=dev --ignore-scripts=false --no-audit --no-fund")
+  .runCmd(
+    `printf '%s  %s\\n' '${E2B_IMAGE_PROVENANCE_LOCK_SHA256}' '/opt/agentsin/image-provenance.lock.json' | sha256sum --check --strict -`,
+  )
   .runCmd("find /opt/agentsin -xdev -not -type l -exec chown root:root {} +")
   .runCmd("find /opt/agentsin -xdev -type d -exec chmod go-w {} +")
   .runCmd("/opt/agentsin/verify-image.sh")
   .setWorkdir("/workspace")
-  .setStartCmd("/opt/agentsin/start-desktop.sh", waitForPort(6080));
+  .setStartCmd("/opt/agentsin/start-sandbox.sh", waitForPort(6080));

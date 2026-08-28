@@ -8,13 +8,10 @@ readonly provider_digest_file="${provider_root}/provider-service.sha256"
 readonly runtime_child="${worker_root}/ProviderRuntimeChild.mjs"
 readonly bootstrap_ref="${1:-}"
 
-case "${bootstrap_ref}" in
-  /run/agentsin/bootstrap/*) ;;
-  *)
-    echo "A sealed bootstrap reference under /run/agentsin/bootstrap is required." >&2
-    exit 64
-    ;;
-esac
+if [[ "${bootstrap_ref}" != "/run/agentsin/bootstrap/sealed.json" ]]; then
+  echo "The fixed sealed bootstrap reference is required." >&2
+  exit 64
+fi
 
 test -f "${bootstrap_ref}"
 test -f "${provider_module}"
