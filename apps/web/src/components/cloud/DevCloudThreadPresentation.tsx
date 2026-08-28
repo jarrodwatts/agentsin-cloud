@@ -20,7 +20,10 @@ export function DevCloudThreadHeaderIdentity(props: {
         </span>
         <h2 className="min-w-0 truncate font-medium text-foreground">{props.presentation.title}</h2>
       </div>
-      <span className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border/70 bg-muted/45 px-2.5 py-1 text-[11px] text-muted-foreground sm:inline-flex">
+      <span
+        className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border/70 bg-muted/45 px-2.5 py-1 text-[11px] text-muted-foreground xl:inline-flex"
+        data-dev-cloud-header-secondary-identity="true"
+      >
         <BotIcon aria-hidden className="size-3" />
         {props.presentation.providerLabel} · {props.presentation.environmentLabel}
       </span>

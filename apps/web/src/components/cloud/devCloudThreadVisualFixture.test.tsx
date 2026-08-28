@@ -197,6 +197,10 @@ describe("active cloud-thread visual fixture", () => {
     expect(markup).toContain("Codex");
     expect(markup).toContain("GPT-5.6 Codex");
     expect(markup).toContain("E2B Cloud");
+    expect(markup).toContain('data-dev-cloud-header-secondary-identity="true"');
+    expect(markup).toContain("hidden shrink-0");
+    expect(markup).toContain("xl:inline-flex");
+    expect(markup).not.toContain("sm:inline-flex");
     expect(markup).not.toContain("Summarize Current Branch");
     expect(markup).not.toContain("Claude Fable 5");
     expect(markup).not.toContain("Local checkout");
