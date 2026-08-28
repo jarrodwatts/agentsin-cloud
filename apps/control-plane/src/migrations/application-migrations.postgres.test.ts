@@ -234,6 +234,59 @@ it.effect("replays every application migration without weakening route binding",
   }),
 );
 
+it.effect("replays after a canonical finalized settlement without touching its signed receipt", () =>
+  withPostgres(async (pool) => {
+    const { migrations } = await prepareMigratedDatabase(pool);
+    await seedLegacySettlementDependencies(pool);
+    const txHash = `0x${"d".repeat(64)}`;
+    await insertLegacySettlement(pool, {
+      id: "canonical-finalized-replay",
+      state: "finalized",
+      providerActivityRef: "canonical-finalized-replay-activity",
+      txHash,
+    });
+    await pool.query(
+      `INSERT INTO cloud_usage_settlement_receipt (
+         workspace_id, settlement_id, thread_id, payload, payload_sha256,
+         signature_algorithm, signature_key_id, signature, signed_at, tx_hash, created_at
+       ) VALUES ($1,$2,$3,$4::jsonb,$5,'ed25519',$6,$7,$8,$9,$8)`,
+      [
+        "88888888-8888-4888-8888-888888888888",
+        "canonical-finalized-replay",
+        "legacy-settlement-thread",
+        JSON.stringify({ txHash }),
+        "d".repeat(64),
+        "canonical-replay-key",
+        "canonical-replay-signature",
+        "2026-08-28T00:15:00.000Z",
+        txHash,
+      ],
+    );
+    const readCanonicalSettlement = () =>
+      pool.query(
+        `SELECT attempt.xmin::text AS attempt_xmin,
+                attempt.state, attempt.tx_hash, attempt.finalized_at,
+                receipt.xmin::text AS receipt_xmin,
+                receipt.payload, receipt.payload_sha256, receipt.signature,
+                receipt.signed_at, receipt.tx_hash AS receipt_tx_hash
+           FROM cloud_usage_settlement_attempt attempt
+           JOIN cloud_usage_settlement_receipt receipt
+             ON receipt.workspace_id = attempt.workspace_id
+            AND receipt.settlement_id = attempt.settlement_id
+          WHERE attempt.workspace_id = $1 AND attempt.settlement_id = $2`,
+        [
+          "88888888-8888-4888-8888-888888888888",
+          "canonical-finalized-replay",
+        ],
+      );
+    const beforeReplay = (await readCanonicalSettlement()).rows;
+
+    await applyMigrations(pool, migrations);
+
+    expect((await readCanonicalSettlement()).rows).toEqual(beforeReplay);
+  }),
+);
+
 it.effect("fails closed for a weakened same-name route uniqueness constraint", () =>
   withPostgres(async (pool) => {
     const { routeBindingMigration } = await prepareMigratedDatabase(pool);

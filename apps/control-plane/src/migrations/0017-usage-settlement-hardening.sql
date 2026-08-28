@@ -33,7 +33,9 @@ BEGIN
 END
 $$;
 
-UPDATE cloud_usage_settlement_attempt SET tx_hash = lower(tx_hash) WHERE tx_hash IS NOT NULL;
+UPDATE cloud_usage_settlement_attempt
+   SET tx_hash = lower(tx_hash)
+ WHERE tx_hash IS NOT NULL AND tx_hash <> lower(tx_hash);
 
 ALTER TABLE cloud_usage_settlement_attempt
   DROP CONSTRAINT IF EXISTS cloud_usage_settlement_attempt_state_check,
