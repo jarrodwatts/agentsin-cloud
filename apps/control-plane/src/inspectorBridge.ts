@@ -4,6 +4,13 @@
 import * as NodeCrypto from "node:crypto";
 
 import { ThreadId } from "@t3tools/contracts";
+import type { AuthSessionId } from "@t3tools/contracts";
+import type {
+  DesktopControlBinding,
+  DesktopControlClientFrame,
+  DesktopControlClientId,
+  DesktopInputPermit,
+} from "@t3tools/contracts/desktop-lease";
 import {
   INSPECTOR_MAX_ARTIFACT_TRANSFER_BYTES,
   INSPECTOR_MAX_ARTIFACT_BYTES_PER_SESSION,
@@ -36,6 +43,11 @@ import { isTrustedCloudRpcOrigin, type CloudRpcSocket } from "./cloudRpc.ts";
 import type { ControlPlaneAuth } from "./http.ts";
 import type { ActiveWorkerRoute, WorkerRouteRegistry } from "./workerRelay.ts";
 import type { WorkspaceRepositoryService } from "./workspaces.ts";
+import type {
+  DesktopControlPrincipal,
+  DesktopLeaseService,
+  DesktopLeaseServiceError,
+} from "./desktopLeaseService.ts";
 
 export class InspectorBridgeError extends Schema.TaggedErrorClass<InspectorBridgeError>()(
   "InspectorBridgeError",
@@ -61,6 +73,8 @@ export class InspectorBridgeError extends Schema.TaggedErrorClass<InspectorBridg
 export interface InspectorPrincipal {
   readonly workspaceId: WorkspaceId;
   readonly userId: string;
+  readonly authSessionId: AuthSessionId;
+  readonly clientId: DesktopControlClientId;
   readonly threadId: ThreadId;
   readonly attempt: CloudThreadLifecycleAttempt;
 }
@@ -108,18 +122,20 @@ export const DEFAULT_INSPECTOR_BRIDGE_LIMITS: InspectorBridgeLimits = {
 };
 
 export interface InspectorInputAuthorizer {
-  readonly authorize: (input: {
+  readonly authorizeAndDispatch: (input: {
     readonly principal: InspectorPrincipal;
     readonly sessionId: InspectorSessionId;
+    readonly binding: DesktopControlBinding;
     readonly operation: Extract<
       InspectorOperation,
       { readonly type: "browser.input" | "desktop.input" }
     >;
+    readonly dispatch: (permit: DesktopInputPermit) => boolean;
   }) => Effect.Effect<void, InspectorBridgeError>;
 }
 
 const denyInteractiveInput: InspectorInputAuthorizer = {
-  authorize: () =>
+  authorizeAndDispatch: () =>
     Effect.fail(
       new InspectorBridgeError({
         code: "forbidden",
@@ -273,6 +289,17 @@ const bindingFor = (
   routeGeneration: route.lease.routeGeneration,
 });
 
+const desktopBindingFor = (binding: InspectorRouteBinding): DesktopControlBinding => ({
+  workspaceId: binding.workspaceId,
+  threadId: binding.threadId,
+  attemptId: binding.attemptId,
+  environmentId: binding.environmentId,
+  environmentRevisionId: binding.environmentRevisionId,
+  sandboxId: binding.sandboxId,
+  workerId: binding.workerId,
+  routeGeneration: binding.routeGeneration,
+});
+
 const routeMatchesAttempt = (route: ActiveWorkerRoute, attempt: CloudThreadLifecycleAttempt) =>
   attempt.isCurrent &&
   attempt.state === "ready" &&
@@ -347,10 +374,19 @@ export interface MakeInspectorBridgeOptions {
   readonly routes: WorkerRouteRegistry;
   readonly artifacts: ArtifactStorageService;
   readonly inputAuthorizer?: InspectorInputAuthorizer;
+  readonly desktopControl?: DesktopLeaseService;
   readonly limits?: Partial<InspectorBridgeLimits>;
   readonly nextSessionId?: () => InspectorSessionId;
   readonly nowMs?: () => number;
+  readonly nextClientId?: () => DesktopControlClientId;
 }
+
+const isDesktopControlFrame = (frame: InspectorClientFrame): frame is DesktopControlClientFrame =>
+  frame.type === "desktop.control.get" ||
+  frame.type === "desktop.control.acquire" ||
+  frame.type === "desktop.control.heartbeat" ||
+  frame.type === "desktop.control.release" ||
+  frame.type === "desktop.control.resume";
 
 export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
   const limits = { ...DEFAULT_INSPECTOR_BRIDGE_LIMITS, ...options.limits };
@@ -369,7 +405,48 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
       throw new RangeError(`${name} is outside the supported range`);
     }
   }
-  const inputAuthorizer = options.inputAuthorizer ?? denyInteractiveInput;
+  const mapDesktopControlError = (cause: DesktopLeaseServiceError) =>
+    failure(
+      cause.code === "forbidden" || cause.code === "expired"
+        ? "forbidden"
+        : cause.code === "notFound"
+          ? "notFound"
+          : cause.code === "conflict" || cause.code === "staleBinding"
+            ? "staleRoute"
+            : cause.code === "routeUnavailable"
+              ? "unavailable"
+              : "internal",
+      cause.code === "forbidden" || cause.code === "expired"
+        ? 403
+        : cause.code === "notFound"
+          ? 404
+          : cause.code === "conflict" || cause.code === "staleBinding"
+            ? 409
+            : cause.code === "routeUnavailable"
+              ? 503
+              : 500,
+      cause.retryable,
+      cause.operation,
+      cause,
+    );
+  const inputAuthorizer =
+    options.inputAuthorizer ??
+    (options.desktopControl === undefined
+      ? denyInteractiveInput
+      : {
+          authorizeAndDispatch: (input) =>
+            options
+              .desktopControl!.authorizeAndDispatchInput(
+                {
+                  userId: input.principal.userId,
+                  authSessionId: input.principal.authSessionId,
+                  clientId: input.principal.clientId,
+                  binding: input.binding,
+                },
+                input.dispatch,
+              )
+              .pipe(Effect.mapError(mapDesktopControlError)),
+        });
   const sessions = new Map<InspectorSessionId, InspectorSessionRecord>();
   const workspaceSessions = new Map<WorkspaceId, number>();
   const workspaceRequestWindows = new Map<WorkspaceId, RequestWindow>();
@@ -379,6 +456,8 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
   const nowMs = options.nowMs ?? Date.now;
   const nextSessionId =
     options.nextSessionId ?? (() => NodeCrypto.randomUUID() as InspectorSessionId);
+  const nextClientId =
+    options.nextClientId ?? (() => NodeCrypto.randomUUID() as DesktopControlClientId);
 
   const currentRoute = (principal: InspectorPrincipal) =>
     Effect.tryPromise({
@@ -415,7 +494,7 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
       catch: (cause) => failure("internal", 500, true, "authenticate", cause),
     }).pipe(
       Effect.flatMap((session) =>
-        session === null
+        session === null || session.session?.id === undefined
           ? Effect.fail(failure("unauthorized", 401, false, "authenticate"))
           : options.workspaces.ensureForUser(session.user).pipe(
               Effect.mapError((cause) =>
@@ -449,6 +528,8 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
                     return Effect.succeed({
                       workspaceId: attempt.workspaceId,
                       userId: session.user.id,
+                      authSessionId: session.session!.id as AuthSessionId,
+                      clientId: nextClientId(),
                       threadId: requested.threadId,
                       attempt,
                     } satisfies InspectorPrincipal);
@@ -1079,9 +1160,32 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
     let inboundBytes = 0;
     let processing = Promise.resolve();
 
+    const markDesktopDisconnected = () => {
+      if (
+        options.desktopControl === undefined ||
+        record === undefined ||
+        record.connection?.socket !== socket
+      ) {
+        return;
+      }
+      const task = Effect.runPromise(
+        options.desktopControl
+          .disconnect({
+            userId: principal.userId,
+            authSessionId: principal.authSessionId,
+            clientId: principal.clientId,
+            binding: desktopBindingFor(record.binding),
+          })
+          .pipe(Effect.catch(() => Effect.void)),
+      );
+      backgroundTasks.add(task);
+      void task.finally(() => backgroundTasks.delete(task));
+    };
+
     const close = (code: number, reason: string) => {
       if (closed) return;
       closed = true;
+      markDesktopDisconnected();
       socket.close(code, reason);
       if (record !== undefined) disconnectClient(record, socket);
       else {
@@ -1127,6 +1231,46 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
         });
       }, limits.heartbeatIntervalMs);
       target.heartbeat.unref?.();
+    };
+
+    const desktopPrincipalFor = (target: InspectorSessionRecord): DesktopControlPrincipal => ({
+      userId: principal.userId,
+      authSessionId: principal.authSessionId,
+      clientId: principal.clientId,
+      binding: desktopBindingFor(target.binding),
+    });
+
+    const processDesktopControl = async (
+      target: InspectorSessionRecord,
+      frame: DesktopControlClientFrame,
+    ) => {
+      if (options.desktopControl === undefined) {
+        throw failure("forbidden", 403, false, "desktop-control-unavailable");
+      }
+      const actor = desktopPrincipalFor(target);
+      const result = await Effect.runPromise(
+        (frame.type === "desktop.control.get"
+          ? options.desktopControl.current(actor)
+          : frame.type === "desktop.control.acquire"
+            ? options.desktopControl.acquire(actor, frame.idempotencyKey)
+            : frame.type === "desktop.control.heartbeat"
+              ? options.desktopControl.heartbeat(actor, frame)
+              : frame.type === "desktop.control.release"
+                ? options.desktopControl.release(actor, frame)
+                : options.desktopControl.resume(actor, frame)
+        ).pipe(Effect.mapError(mapDesktopControlError)),
+      );
+      if (
+        !target.connection?.writer.send({
+          protocolVersion: 1,
+          type: "desktop.control.state",
+          requestId: frame.requestId,
+          state: result.state,
+          ...(result.resumeToken === undefined ? {} : { resumeToken: result.resumeToken }),
+        })
+      ) {
+        throw failure("slowConsumer", 429, true, "desktop-control-response");
+      }
     };
 
     const onMessage = (payload: string | Uint8Array, binary: boolean) => {
@@ -1249,6 +1393,10 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
             record.pendingHeartbeat = undefined;
             return;
           }
+          if (isDesktopControlFrame(frame)) {
+            await processDesktopControl(record, frame);
+            return;
+          }
           if (frame.type === "inspector.open" || frame.sessionId !== record.sessionId) {
             close(4400, "invalid_inspector_frame");
             return;
@@ -1263,20 +1411,39 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
               close(4409, "stale_worker_route");
               return;
             }
+            if (!admitRequest(record, frame.operation)) {
+              close(4429, "inspector_request_limit");
+              return;
+            }
             if (
               frame.operation.type === "browser.input" ||
               frame.operation.type === "desktop.input"
             ) {
-              await Effect.runPromise(
-                inputAuthorizer.authorize({
-                  principal,
-                  sessionId: record.sessionId,
-                  operation: frame.operation,
-                }),
-              );
-            }
-            if (!admitRequest(record, frame.operation)) {
-              close(4429, "inspector_request_limit");
+              try {
+                await Effect.runPromise(
+                  inputAuthorizer.authorizeAndDispatch({
+                    principal,
+                    sessionId: record.sessionId,
+                    binding: desktopBindingFor(record.binding),
+                    operation: frame.operation,
+                    dispatch: (permit) =>
+                      sendWorker(record!, {
+                        type: "inspector.command",
+                        command: {
+                          type: "inspector.request",
+                          binding: record!.binding,
+                          sessionId: record!.sessionId,
+                          operation: frame.operation,
+                          desktopPermit: permit,
+                        },
+                      }),
+                  }),
+                );
+              } catch (cause) {
+                record.requestOperations.delete(frame.operation.requestId);
+                record.inflightRequests.delete(frame.operation.requestId);
+                throw cause;
+              }
               return;
             }
             if (
@@ -1352,6 +1519,7 @@ export const makeInspectorBridge = (options: MakeInspectorBridgeOptions) => {
     const removeClose = socket.onClose(() => {
       if (closed) return;
       closed = true;
+      markDesktopDisconnected();
       if (record !== undefined) disconnectClient(record, socket);
       else {
         removeMessage();

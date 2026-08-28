@@ -35,6 +35,7 @@ import {
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import { ProviderRuntimeEvent } from "./providerRuntime.ts";
 import { InspectorWorkerCommand, InspectorWorkerFrame } from "./inspector.ts";
+import { DesktopAuthorityCommand } from "./desktopLease.ts";
 
 const makeWorkerId = <Brand extends string>(brand: Brand) =>
   TrimmedNonEmptyString.check(Schema.isMaxLength(128)).pipe(Schema.brand(brand));
@@ -362,6 +363,7 @@ export const WorkerRelayInbound = Schema.Union([
   WorkerRelayReplayComplete,
   WorkerRelayShutdown,
   WorkerProviderCredentialCommand,
+  DesktopAuthorityCommand,
   Schema.Struct({
     type: Schema.Literal("inspector.command"),
     command: InspectorWorkerCommand,

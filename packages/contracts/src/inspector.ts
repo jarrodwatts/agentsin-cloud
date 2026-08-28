@@ -17,6 +17,11 @@ import {
 } from "./baseSchemas.ts";
 import { EnvironmentRevisionId, SandboxId, WorkspaceId } from "./cloud.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import {
+  DesktopControlClientFrame,
+  DesktopControlServerFrame,
+  DesktopInputPermit,
+} from "./desktopLease.ts";
 
 const boundedId = <Brand extends string>(brand: Brand) =>
   Schema.String.check(
@@ -294,6 +299,7 @@ export const InspectorClientFrame = Schema.Union([
     sessionId: InspectorSessionId,
     nonce: boundedId("InspectorHeartbeatNonce"),
   }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  DesktopControlClientFrame,
 ]);
 export type InspectorClientFrame = typeof InspectorClientFrame.Type;
 
@@ -309,7 +315,16 @@ export const InspectorWorkerCommand = Schema.Union([
     binding: InspectorRouteBinding,
     sessionId: InspectorSessionId,
     operation: InspectorOperation,
-  }),
+    desktopPermit: Schema.optionalKey(DesktopInputPermit),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.operation.type === "browser.input" || input.operation.type === "desktop.input") ===
+          (input.desktopPermit !== undefined) ||
+        "interactive visual input requires a desktop-control permit and other operations forbid it",
+      { identifier: "InspectorDesktopInputPermit" },
+    ),
+  ),
   Schema.Struct({
     type: Schema.Literal("inspector.cancel"),
     binding: InspectorRouteBinding,
@@ -551,5 +566,6 @@ export const InspectorServerFrame = Schema.Union([
     nonce: boundedId("InspectorHeartbeatNonce"),
     sentAt: IsoDateTime,
   }),
+  DesktopControlServerFrame,
 ]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type InspectorServerFrame = typeof InspectorServerFrame.Type;

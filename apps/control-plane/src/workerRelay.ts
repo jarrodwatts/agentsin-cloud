@@ -6,6 +6,7 @@ import * as NodeCrypto from "node:crypto";
 
 import type { CloudThreadCommand } from "@t3tools/contracts/cloud";
 import type { InspectorWorkerFrame } from "@t3tools/contracts/inspector";
+import type { DesktopAuthorityCommand } from "@t3tools/contracts/desktop-lease";
 import {
   WorkerRelayInbound,
   WorkerRelayOutbound,
@@ -427,6 +428,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
       identity: ActiveWorkerLease,
       transport: {
         readonly sendCredentialCommand: typeof sendCredentialCommand;
+        readonly sendDesktopAuthority: (command: DesktopAuthorityCommand) => boolean;
       },
     ) => Effect.Effect<void, WorkerRelayServerError>
   >();
@@ -906,6 +908,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
       const reconnectTransport = {
         sendCredentialCommand: (input: Parameters<typeof sendCredentialCommandWithRoute>[0]) =>
           sendCredentialCommandWithRoute(input, route),
+        sendDesktopAuthority: (command: DesktopAuthorityCommand) => route.send(command),
       };
       for (const listener of reconnectListeners) {
         yield* listener(lease, reconnectTransport).pipe(
@@ -1312,6 +1315,7 @@ export const makeWorkerRelay = (options: MakeWorkerRelayOptions) => {
       identity: ActiveWorkerLease,
       transport: {
         readonly sendCredentialCommand: typeof sendCredentialCommand;
+        readonly sendDesktopAuthority: (command: DesktopAuthorityCommand) => boolean;
       },
     ) => Effect.Effect<void, WorkerRelayServerError>,
   ) => {

@@ -1,4 +1,5 @@
 import type { ThreadId } from "@t3tools/contracts";
+import type { DesktopControlClientId, DesktopInputPermit } from "@t3tools/contracts/desktop-lease";
 import {
   InspectorClientFrame,
   type InspectorServerFrame,
@@ -21,6 +22,7 @@ import {
   makeInspectorBridge,
   type InspectorBridgeLimits,
 } from "./inspectorBridge.ts";
+import type { DesktopControlPrincipal, DesktopLeaseService } from "./desktopLeaseService.ts";
 import { makeInMemoryWorkerRouteRegistry, type ActiveWorkerRoute } from "./workerRelay.ts";
 
 const workspaceId = "workspace-1" as WorkspaceId;
@@ -95,10 +97,11 @@ class FakeSocket implements CloudRpcSocket {
   private readonly messages = new Set<(payload: string | Uint8Array, binary: boolean) => void>();
   private readonly closeListeners = new Set<() => void>();
   holdSends = false;
+  dropSends = false;
   private readonly sendCompletions: Array<(error?: Error) => void> = [];
 
   send(payload: string, complete: (error?: Error) => void) {
-    this.sent.push(decodeServer(payload) as InspectorServerFrame);
+    if (!this.dropSends) this.sent.push(decodeServer(payload) as InspectorServerFrame);
     if (this.holdSends) this.sendCompletions.push(complete);
     else complete();
   }
@@ -130,6 +133,8 @@ const makeHarness = (input?: {
   readonly limits?: Partial<InspectorBridgeLimits>;
   readonly currentAttempt?: () => CloudThreadLifecycleAttempt | undefined;
   readonly nowMs?: () => number;
+  readonly desktopControl?: DesktopLeaseService;
+  readonly nextClientId?: () => DesktopControlClientId;
 }) => {
   const routes = makeInMemoryWorkerRouteRegistry();
   const workerCommands: Array<WorkerRelayInbound> = [];
@@ -180,7 +185,10 @@ const makeHarness = (input?: {
     auth: {
       handler: async () => new Response(),
       api: {
-        getSession: async () => ({ user: { id: "user-1", name: "User" } }),
+        getSession: async () => ({
+          user: { id: "user-1", name: "User" },
+          session: { id: "auth-session-1" },
+        }),
         generateOneTimeToken: async () => ({ token: "token" }),
       },
     },
@@ -205,6 +213,8 @@ const makeHarness = (input?: {
       ...input?.limits,
     },
     nextSessionId: () => "session-1" as never,
+    ...(input?.desktopControl === undefined ? {} : { desktopControl: input.desktopControl }),
+    ...(input?.nextClientId === undefined ? {} : { nextClientId: input.nextClientId }),
     ...(input?.nowMs === undefined ? {} : { nowMs: input.nowMs }),
   });
   return { bridge, routes, active, workerCommands, uploads, downloads };
@@ -332,6 +342,274 @@ it.effect("rejects stale routes and denies interactive input until C7 grants a l
         (frame) => frame.type === "inspector.command" && frame.command.type === "inspector.request",
       ),
     ).toBe(false);
+    harness.bridge.dispose();
+  }),
+);
+
+it.effect(
+  "derives desktop holder identity, returns control state, and attaches the exact input permit",
+  () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly operation: string; readonly principal: unknown }> = [];
+      let disconnected = 0;
+      const desktopBinding = {
+        workspaceId,
+        threadId,
+        attemptId: "attempt-1",
+        environmentId: attempt.environmentId,
+        environmentRevisionId: attempt.environmentRevisionId,
+        sandboxId: attempt.sandboxId!,
+        workerId: String(attempt.workerId!),
+        routeGeneration: 1,
+      };
+      const permit: DesktopInputPermit = {
+        leaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as never,
+        generation: 1,
+        authorityRevision: 1,
+        binding: desktopBinding,
+        expiresAt: "2026-08-27T12:01:00.000Z",
+      };
+      const state = {
+        controller: "user" as const,
+        lease: {
+          leaseId: permit.leaseId,
+          generation: permit.generation,
+          binding: permit.binding,
+          expiresAt: permit.expiresAt,
+        },
+        heldByCurrentClient: true,
+        observedAt: now,
+      };
+      const desktopControl: DesktopLeaseService = {
+        current: (principal) => {
+          calls.push({ operation: "current", principal });
+          return Effect.succeed({ state });
+        },
+        acquire: (principal) => {
+          calls.push({ operation: "acquire", principal });
+          return Effect.succeed({ state, resumeToken: "x".repeat(43) as never });
+        },
+        heartbeat: () => Effect.succeed({ state }),
+        release: () => Effect.succeed({ state: { controller: "agent", observedAt: now } }),
+        resume: () => Effect.succeed({ state, resumeToken: "x".repeat(43) as never }),
+        disconnect: () => Effect.sync(() => void (disconnected += 1)),
+        authorizeAndDispatchInput: (principal, dispatch) => {
+          calls.push({ operation: "input", principal });
+          return dispatch(permit) ? Effect.void : Effect.die("dispatch failed");
+        },
+        authorizeAgentInput: () => Effect.void,
+        synchronizeRoute: () => Effect.void,
+        revokeBinding: () => Effect.void,
+        revokeCurrent: () => Effect.void,
+        sweepExpired: Effect.succeed(0),
+        purgeRetention: Effect.succeed(0),
+      };
+      const harness = makeHarness({
+        desktopControl,
+        nextClientId: () => "server-client-1" as DesktopControlClientId,
+      });
+      const principal = yield* authorize(harness.bridge);
+      const socket = new FakeSocket();
+      harness.bridge.openAuthorizedSocket(socket, principal);
+      socket.emit(openFrame());
+      yield* harness.bridge.drain;
+      socket.emit({
+        protocolVersion: 1,
+        type: "desktop.control.acquire",
+        requestId: "desktop-acquire" as never,
+        idempotencyKey: "desktop-acquire" as never,
+      });
+      yield* harness.bridge.drain;
+      expect(socket.sent.at(-1)).toMatchObject({
+        type: "desktop.control.state",
+        state: { controller: "user", heldByCurrentClient: true },
+      });
+      expect(calls.at(-1)).toMatchObject({
+        operation: "acquire",
+        principal: {
+          userId: "user-1",
+          authSessionId: "auth-session-1",
+          clientId: "server-client-1",
+          binding: { workspaceId },
+        },
+      });
+
+      socket.emit({
+        protocolVersion: 1,
+        type: "inspector.request",
+        sessionId: "session-1" as never,
+        operation: {
+          type: "desktop.input",
+          requestId: "desktop-input" as never,
+          input: { type: "text", text: "hello" },
+        },
+      });
+      yield* harness.bridge.drain;
+      expect(harness.workerCommands.at(-1)).toMatchObject({
+        type: "inspector.command",
+        command: { type: "inspector.request", desktopPermit: permit },
+      });
+      socket.disconnect();
+      yield* harness.bridge.drain;
+      expect(disconnected).toBe(1);
+      harness.bridge.dispose();
+    }),
+);
+
+it.effect("recovers a lost resume response through a new server-generated socket identity", () =>
+  Effect.gen(function* () {
+    const clientIds = ["server-client-lost", "server-client-recovered"] as const;
+    let nextClient = 0;
+    const calls: Array<{
+      readonly principal: DesktopControlPrincipal;
+      readonly idempotencyKey: string;
+      readonly resumeToken: string;
+    }> = [];
+    const desktopBinding = {
+      workspaceId,
+      threadId,
+      attemptId: "attempt-1",
+      environmentId: attempt.environmentId,
+      environmentRevisionId: attempt.environmentRevisionId,
+      sandboxId: attempt.sandboxId!,
+      workerId: String(attempt.workerId!),
+      routeGeneration: 1,
+    };
+    const leaseId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" as never;
+    const originalProof = "o".repeat(43) as never;
+    const recoveryProof = "r".repeat(43) as never;
+    const nextProof = "n".repeat(43) as never;
+    const disconnectedState = {
+      controller: "disconnected" as const,
+      lease: {
+        leaseId,
+        generation: 2 as never,
+        binding: desktopBinding,
+        expiresAt: "2026-08-27T12:01:00.000Z",
+      },
+      resumableByCurrentSession: true,
+      observedAt: now,
+    };
+    const desktopControl: DesktopLeaseService = {
+      current: () => Effect.succeed({ state: disconnectedState }),
+      acquire: () => Effect.die("not used"),
+      heartbeat: () => Effect.die("not used"),
+      release: () => Effect.die("not used"),
+      resume: (principal, frame) =>
+        Effect.sync(() => {
+          calls.push({
+            principal,
+            idempotencyKey: frame.idempotencyKey,
+            resumeToken: frame.resumeToken,
+          });
+          if (frame.idempotencyKey === "resume-reclaim") {
+            return {
+              state: {
+                controller: "user" as const,
+                lease: { ...disconnectedState.lease, generation: 3 as never },
+                heldByCurrentClient: true,
+                observedAt: now,
+              },
+              resumeToken: nextProof,
+            };
+          }
+          return calls.length === 1
+            ? {
+                state: {
+                  controller: "user" as const,
+                  lease: disconnectedState.lease,
+                  heldByCurrentClient: true,
+                  observedAt: now,
+                },
+                resumeToken: recoveryProof,
+              }
+            : { state: disconnectedState, resumeToken: recoveryProof };
+        }),
+      disconnect: () => Effect.void,
+      authorizeAndDispatchInput: () => Effect.die("not used"),
+      authorizeAgentInput: () => Effect.void,
+      synchronizeRoute: () => Effect.void,
+      revokeBinding: () => Effect.void,
+      revokeCurrent: () => Effect.void,
+      sweepExpired: Effect.succeed(0),
+      purgeRetention: Effect.succeed(0),
+    };
+    const harness = makeHarness({
+      desktopControl,
+      nextClientId: () => clientIds[nextClient++]! as DesktopControlClientId,
+    });
+
+    const firstPrincipal = yield* authorize(harness.bridge);
+    const lostSocket = new FakeSocket();
+    harness.bridge.openAuthorizedSocket(lostSocket, firstPrincipal);
+    lostSocket.emit(openFrame());
+    yield* harness.bridge.drain;
+    yield* harness.bridge.inspectorFrames.handleFrame(harness.active.lease, readyFrame());
+    lostSocket.dropSends = true;
+    lostSocket.emit({
+      protocolVersion: 1,
+      type: "desktop.control.resume",
+      requestId: "resume-lost-request" as never,
+      leaseId,
+      generation: 1 as never,
+      resumeToken: originalProof,
+      idempotencyKey: "resume-lost" as never,
+    });
+    yield* harness.bridge.drain;
+    lostSocket.disconnect();
+    yield* harness.bridge.drain;
+
+    const recoveredPrincipal = yield* authorize(harness.bridge);
+    expect(recoveredPrincipal.clientId).not.toBe(firstPrincipal.clientId);
+    const recoveredSocket = new FakeSocket();
+    harness.bridge.openAuthorizedSocket(recoveredSocket, recoveredPrincipal);
+    recoveredSocket.emit(openFrame("session-1"));
+    yield* harness.bridge.drain;
+    const exactRetry = {
+      protocolVersion: 1 as const,
+      type: "desktop.control.resume" as const,
+      requestId: "resume-retry-request" as never,
+      leaseId,
+      generation: 1 as never,
+      resumeToken: originalProof,
+      idempotencyKey: "resume-lost" as never,
+    };
+    recoveredSocket.emit(exactRetry);
+    yield* harness.bridge.drain;
+    expect(recoveredSocket.sent.at(-1)).toMatchObject({
+      type: "desktop.control.state",
+      state: { controller: "disconnected", lease: { generation: 2 } },
+      resumeToken: recoveryProof,
+    });
+    recoveredSocket.emit({ ...exactRetry, requestId: "resume-duplicate-request" as never });
+    yield* harness.bridge.drain;
+    expect(recoveredSocket.sent.at(-1)).toMatchObject({
+      state: { lease: { generation: 2 } },
+      resumeToken: recoveryProof,
+    });
+    recoveredSocket.emit({
+      ...exactRetry,
+      requestId: "resume-reclaim-request" as never,
+      generation: 2 as never,
+      resumeToken: recoveryProof,
+      idempotencyKey: "resume-reclaim" as never,
+    });
+    yield* harness.bridge.drain;
+    expect(recoveredSocket.sent.at(-1)).toMatchObject({
+      state: { controller: "user", lease: { generation: 3 }, heldByCurrentClient: true },
+      resumeToken: nextProof,
+    });
+    expect(calls.map((call) => call.principal.clientId)).toEqual([
+      "server-client-lost",
+      "server-client-recovered",
+      "server-client-recovered",
+      "server-client-recovered",
+    ]);
+    expect(calls.slice(0, 3).map((call) => call.idempotencyKey)).toEqual([
+      "resume-lost",
+      "resume-lost",
+      "resume-lost",
+    ]);
     harness.bridge.dispose();
   }),
 );

@@ -54,6 +54,11 @@ import { isForbiddenBootstrapKey, redactLogFields } from "./redaction.ts";
 import type { GitHubGitExecutor } from "./GitHubGitExecutor.ts";
 import { executeGitHubWorkerCommand } from "./githubCommandHandler.ts";
 import { InspectorRuntimeError, type WorkerInspectorRuntime } from "./InspectorRuntime.ts";
+import {
+  AgentComputerInputGateError,
+  makeAgentComputerInputGate,
+  type AgentComputerInputGate,
+} from "./AgentComputerInputGate.ts";
 
 export interface CloudWorkerOptions {
   readonly maxPendingEventProposals: number;
@@ -74,10 +79,12 @@ export interface CloudWorkerDependencies {
     readonly makeExecutor: (bootstrap: WorkerBootstrap) => GitHubGitExecutor;
   };
   readonly inspector?: WorkerInspectorRuntime;
+  readonly computerInputGate?: AgentComputerInputGate;
   readonly inspectorFactory?: {
     readonly make: (input: {
       readonly bootstrap: WorkerBootstrap;
       readonly materialization: WorkerSecretMaterialization;
+      readonly computerInputGate: AgentComputerInputGate;
     }) => Effect.Effect<WorkerInspectorRuntime, InspectorRuntimeError>;
   };
   readonly onCloudEvent?: (event: CloudThreadEvent) => Effect.Effect<void>;
@@ -241,6 +248,7 @@ export const runCloudWorker = (
         });
       }
       let inspector = dependencies.inspector;
+      const computerInputGate = dependencies.computerInputGate ?? makeAgentComputerInputGate();
       const scrubMaterialization = scrubOnce(materialization);
 
       const relayRef = yield* Ref.make<WorkerRelayConnection | undefined>(undefined);
@@ -574,19 +582,39 @@ export const runCloudWorker = (
         if (inspector === undefined) {
           return Effect.void;
         }
-        return inspector.handle(command, {
-          emit: (frame) =>
-            send({ type: "inspector.frame", frame }).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new InspectorRuntimeError({
-                    code: "internal",
-                    retryable: true,
-                    operation: "relay-send",
-                    cause,
-                  }),
+        return Effect.gen(function* () {
+          if (
+            command.type === "inspector.request" &&
+            (command.operation.type === "browser.input" ||
+              command.operation.type === "desktop.input")
+          ) {
+            const now = yield* dependencies.clock.now;
+            yield* computerInputGate
+              .authorizeUserInput(command.desktopPermit!, command.desktopPermit!.binding, now)
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new WorkerProtocolError({
+                      reason: `desktop input authority rejected: ${cause.code}`,
+                      retryable: false,
+                    }),
+                ),
+              );
+          }
+          yield* inspector!.handle(command, {
+            emit: (frame) =>
+              send({ type: "inspector.frame", frame }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new InspectorRuntimeError({
+                      code: "internal",
+                      retryable: true,
+                      operation: "relay-send",
+                      cause,
+                    }),
+                ),
               ),
-            ),
+          });
         });
       };
 
@@ -777,16 +805,18 @@ export const runCloudWorker = (
         ),
       );
       if (inspector === undefined && dependencies.inspectorFactory !== undefined) {
-        inspector = yield* dependencies.inspectorFactory.make({ bootstrap, materialization }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new WorkerProviderError({
-                operation: "configure-inspector",
-                crashed: false,
-                cause,
-              }),
-          ),
-        );
+        inspector = yield* dependencies.inspectorFactory
+          .make({ bootstrap, materialization, computerInputGate })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new WorkerProviderError({
+                  operation: "configure-inspector",
+                  crashed: false,
+                  cause,
+                }),
+            ),
+          );
       }
 
       const runConnection: Effect.Effect<
@@ -828,6 +858,31 @@ export const runCloudWorker = (
                 break;
               case "inspector.command":
                 yield* processInspectorCommand(message.command);
+                break;
+              case "desktop.authority":
+                if (
+                  message.binding.workspaceId !== bootstrap.workspaceId ||
+                  message.binding.threadId !== bootstrap.threadId ||
+                  message.binding.environmentId !== bootstrap.environmentId ||
+                  message.binding.environmentRevisionId !== bootstrap.environmentRevisionId ||
+                  message.binding.attemptId !== bootstrap.reservationId ||
+                  message.binding.sandboxId !== bootstrap.sandboxId ||
+                  message.binding.workerId !== bootstrap.workerId
+                ) {
+                  return yield* new WorkerProtocolError({
+                    reason: "desktop authority does not match the sealed worker identity",
+                    retryable: false,
+                  });
+                }
+                yield* computerInputGate.update(message).pipe(
+                  Effect.mapError(
+                    (cause: AgentComputerInputGateError) =>
+                      new WorkerProtocolError({
+                        reason: `desktop authority update rejected: ${cause.code}`,
+                        retryable: false,
+                      }),
+                  ),
+                );
                 break;
               case "thread.events.confirmed":
                 yield* observeConfirmation(message);

@@ -12,6 +12,7 @@ import {
   type InspectorRouteBinding,
   type InspectorWorkerCommand,
 } from "@t3tools/contracts/inspector";
+import type { DesktopInputPermit } from "@t3tools/contracts/desktop-lease";
 import { expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -673,6 +674,82 @@ it.effect("fails closed when no browser or desktop adapter is injected", () =>
     }),
   ),
 );
+
+it.effect("rechecks the desktop generation inside the queued task immediately before input", () => {
+  let allowed = true;
+  let performed = 0;
+  const visuals: InspectorVisualBackend = {
+    capabilities: {
+      browserFrames: false,
+      browserInput: false,
+      desktopFrames: true,
+      desktopInput: true,
+    },
+    perform: () =>
+      Effect.sync(() => {
+        performed += 1;
+        return { type: "ack" as const };
+      }),
+    close: Effect.void,
+  };
+  const permit: DesktopInputPermit = {
+    leaseId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as never,
+    generation: 1,
+    authorityRevision: 1,
+    binding: {
+      workspaceId: binding.workspaceId,
+      threadId: binding.threadId,
+      attemptId: binding.attemptId,
+      environmentId: binding.environmentId,
+      environmentRevisionId: binding.environmentRevisionId,
+      sandboxId: binding.sandboxId,
+      workerId: binding.workerId,
+      routeGeneration: binding.routeGeneration,
+    },
+    expiresAt: "2026-08-27T12:01:00.000Z",
+  };
+  return withRuntime(
+    ({ handle, drain, frames }) =>
+      Effect.gen(function* () {
+        yield* handle(open());
+        yield* handle({
+          type: "inspector.request",
+          binding,
+          sessionId: "session-1" as never,
+          operation: decodeOperation({
+            type: "desktop.input",
+            requestId: "desktop-input-1",
+            input: { type: "text", text: "hello" },
+          }),
+          desktopPermit: permit,
+        });
+        // The request is deliberately forked by InspectorRuntime. A release or
+        // replacement that lands before the task runs must fence the backend.
+        allowed = false;
+        yield* drain;
+        expect(performed).toBe(0);
+        expect(
+          frames.some(
+            (frame) => frame.type === "inspector.error" && frame.requestId === "desktop-input-1",
+          ),
+        ).toBe(true);
+      }),
+    undefined,
+    {
+      visuals,
+      authorizeVisualInput: () =>
+        allowed
+          ? Effect.void
+          : Effect.fail(
+              new InspectorRuntimeError({
+                code: "invalid-operation",
+                retryable: false,
+                operation: "desktop-generation-fenced",
+              }),
+            ),
+    },
+  );
+});
 
 it.effect("redacts injected environment values even when PTY chunks split a secret", () =>
   withRuntime(

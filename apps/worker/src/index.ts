@@ -12,6 +12,11 @@ export {
   type CloudWorkerDependencies,
   type CloudWorkerOptions,
 } from "./CloudWorker.ts";
+export {
+  AgentComputerInputGateError,
+  makeAgentComputerInputGate,
+  type AgentComputerInputGate,
+} from "./AgentComputerInputGate.ts";
 export { executeGitHubWorkerCommand } from "./githubCommandHandler.ts";
 export {
   InspectorRuntimeError,

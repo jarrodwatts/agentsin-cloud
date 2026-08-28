@@ -222,6 +222,8 @@ it.effect("multiplexes the authenticated inspector path without trusting workspa
             ? Effect.succeed({
                 workspaceId,
                 userId: "user-1",
+                authSessionId: "session-1" as never,
+                clientId: "client-1" as never,
                 threadId,
                 attempt: { attemptId: "attempt-1" } as never,
               })

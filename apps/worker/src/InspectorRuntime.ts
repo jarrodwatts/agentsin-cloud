@@ -13,6 +13,7 @@ import type {
   InspectorTerminalId,
   InspectorWorkerCommand,
 } from "@t3tools/contracts/inspector";
+import type { DesktopInputPermit } from "@t3tools/contracts/desktop-lease";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import {
   INSPECTOR_MAX_ARTIFACT_TRANSFER_BYTES,
@@ -268,6 +269,15 @@ export interface NodeInspectorRuntimeOptions {
   readonly requestDeadlineMs?: number;
   readonly nowMs?: () => number;
   readonly testHooks?: ContainedWorkspaceTestHooks;
+  /** Final worker-side fence, evaluated inside the queued request immediately before visual input. */
+  readonly authorizeVisualInput?: (input: {
+    readonly binding: InspectorRouteBinding;
+    readonly permit: DesktopInputPermit;
+    readonly operation: Extract<
+      InspectorOperation,
+      { readonly type: "browser.input" | "desktop.input" }
+    >;
+  }) => Effect.Effect<void, InspectorRuntimeError>;
 }
 
 type InspectorSequencedWorkerFrame = Exclude<
@@ -558,6 +568,7 @@ export const makeNodeInspectorRuntime = (
       session: InspectorSessionState,
       operation: InspectorOperation,
       sink: WorkerInspectorFrameSink,
+      desktopPermit?: DesktopInputPermit,
     ): Effect.Effect<void, InspectorRuntimeError> =>
       Effect.gen(function* () {
         switch (operation.type) {
@@ -897,6 +908,20 @@ export const makeNodeInspectorRuntime = (
             break;
           }
           default: {
+            if (operation.type === "browser.input" || operation.type === "desktop.input") {
+              if (desktopPermit === undefined || options.authorizeVisualInput === undefined) {
+                return yield* new InspectorRuntimeError({
+                  code: "invalid-operation",
+                  retryable: false,
+                  operation: "authorize-visual-input",
+                });
+              }
+              yield* options.authorizeVisualInput({
+                binding: session.binding,
+                permit: desktopPermit,
+                operation,
+              });
+            }
             const result = yield* visuals.perform(operation);
             if (result.type === "artifact") {
               yield* emitArtifact(
@@ -963,6 +988,7 @@ export const makeNodeInspectorRuntime = (
       session: InspectorSessionState,
       operation: InspectorOperation,
       sink: WorkerInspectorFrameSink,
+      desktopPermit?: DesktopInputPermit,
     ) =>
       Effect.gen(function* () {
         const nowValue = nowMs();
@@ -1019,7 +1045,7 @@ export const makeNodeInspectorRuntime = (
           retryable: false,
           operation: `${operation.type}-deadline`,
         });
-        const operationTask = handleOperation(session, operation, sink).pipe(
+        const operationTask = handleOperation(session, operation, sink, desktopPermit).pipe(
           Effect.timeoutOrElse({
             duration: `${requestDeadlineMs} millis`,
             orElse: () => Effect.fail(timedOut),
@@ -1153,7 +1179,7 @@ export const makeNodeInspectorRuntime = (
             yield* closeSession(command.sessionId);
             return;
           }
-          yield* launchRequest(session, command.operation, sink);
+          yield* launchRequest(session, command.operation, sink, command.desktopPermit);
         }),
       drain: Effect.gen(function* () {
         const fibers = [...sessions.values()].flatMap((session) => [...session.requests.values()]);

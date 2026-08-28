@@ -28,6 +28,8 @@ import {
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
 import { makeInspectorBridge, type InspectorInputAuthorizer } from "./inspectorBridge.ts";
 import { currentOnrampProductionPolicyLayer, OnrampProductionPolicy } from "./onrampPolicy.ts";
+import { makePostgresDesktopLeaseRepository } from "./desktopLeaseRepository.ts";
+import { makeDesktopLeaseService, type DesktopLeaseService } from "./desktopLeaseService.ts";
 import {
   layer as threadEventStoreLayer,
   ThreadEventStore,
@@ -410,6 +412,7 @@ export interface ControlPlaneApplicationDependencies {
     readonly lifecycle: CloudThreadLifecycleStore;
     readonly artifacts: import("./artifactStorage.ts").ArtifactStorageService;
     readonly inputAuthorizer?: InspectorInputAuthorizer;
+    readonly desktopControl?: DesktopLeaseService;
   };
 }
 
@@ -475,6 +478,9 @@ export const makeApplication = ({
           lifecycle: inspector.lifecycle,
           routes: worker.relay.routes,
           artifacts: inspector.artifacts,
+          ...(inspector.desktopControl === undefined
+            ? {}
+            : { desktopControl: inspector.desktopControl }),
           ...(inspector.inputAuthorizer === undefined
             ? {}
             : { inputAuthorizer: inspector.inputAuthorizer }),
@@ -570,6 +576,71 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       ),
     );
     const lifecycle = makePostgresCloudThreadLifecycleStore(database.pool);
+    const desktopControl = makeDesktopLeaseService({
+      repository: makePostgresDesktopLeaseRepository(database.pool),
+      routes: worker.relay.routes,
+      tokenSecret: config.betterAuthSecret,
+    });
+    const unsubscribeDesktopReconnect = worker.relay.onAuthenticatedReconnect(
+      (identity, reconnectTransport) =>
+        desktopControl
+          .synchronizeRoute({
+            lease: identity,
+            send: (frame) =>
+              frame.type === "desktop.authority" && reconnectTransport.sendDesktopAuthority(frame),
+            close: () => undefined,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new WorkerRelayServerError({
+                  code: "internal",
+                  operation: "synchronize-desktop-authority",
+                  cause,
+                }),
+            ),
+          ),
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(unsubscribeDesktopReconnect));
+    const unsubscribeDesktopRouteLoss = worker.relay.onBeforeRouteLoss((input) =>
+      desktopControl
+        .revokeCurrent({
+          workspaceId: input.workspaceId,
+          threadId: input.threadId,
+          ...(input.sandboxId === undefined ? {} : { sandboxId: input.sandboxId }),
+          reason: input.reason,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new WorkerRelayServerError({
+                code: "internal",
+                operation: "revoke-desktop-authority-before-route-loss",
+                cause,
+              }),
+          ),
+        ),
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(unsubscribeDesktopRouteLoss));
+    yield* Effect.forkScoped(
+      Effect.sleep("5 seconds").pipe(
+        Effect.andThen(desktopControl.sweepExpired),
+        Effect.catch((cause) => Effect.logError("Desktop lease expiry sweep failed", cause)),
+        Effect.forever,
+      ),
+    );
+    yield* Effect.forkScoped(
+      desktopControl.purgeRetention.pipe(
+        Effect.catch((cause) => Effect.logError("Desktop lease retention purge failed", cause)),
+        Effect.andThen(
+          Effect.sleep("24 hours").pipe(
+            Effect.andThen(desktopControl.purgeRetention),
+            Effect.catch((cause) => Effect.logError("Desktop lease retention purge failed", cause)),
+            Effect.forever,
+          ),
+        ),
+      ),
+    );
     const credentialTargets = makeLifecycleProviderCredentialTargetAuthorizer({
       lifecycle,
       relay: worker.relay,
@@ -672,8 +743,9 @@ export const makeProgram = (production: HostedProductionDependencies) =>
       githubWorkflow,
       providerCredentialRuntime: { service: providerCredentials, logins: credentialLogins },
       inspector: {
-        lifecycle: makePostgresCloudThreadLifecycleStore(database.pool),
+        lifecycle,
         artifacts: artifactStorage,
+        desktopControl,
       },
     });
     worker.relay.setInspectorFrameHandler(inspector?.inspectorFrames);

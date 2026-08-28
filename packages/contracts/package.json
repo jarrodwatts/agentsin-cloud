@@ -31,6 +31,10 @@
       "types": "./src/inspector.ts",
       "import": "./src/inspector.ts"
     },
+    "./desktop-lease": {
+      "types": "./src/desktopLease.ts",
+      "import": "./src/desktopLease.ts"
+    },
     "./settings": {
       "types": "./src/settings.ts",
       "import": "./src/settings.ts"

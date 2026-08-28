@@ -4,6 +4,7 @@ import * as NodePath from "node:path";
 
 import type { WorkerBootstrap } from "@t3tools/contracts/worker";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 
 import {
@@ -15,6 +16,10 @@ import { runCloudWorker, type CloudWorkerDependencies } from "./CloudWorker.ts";
 import { WorkerBootstrapError, type CloudWorkerError } from "./errors.ts";
 import { makeGitHubGitExecutor } from "./GitHubGitExecutor.ts";
 import { InspectorRuntimeError, makeNodeInspectorRuntime } from "./InspectorRuntime.ts";
+import {
+  makeAgentComputerInputGate,
+  type AgentComputerInputGate,
+} from "./AgentComputerInputGate.ts";
 import { makeLinuxBubblewrapPtySandbox } from "./InspectorPtySandbox.ts";
 import type { InspectorPtySandbox } from "./InspectorPtySandbox.ts";
 import { makeNodeWorkerMtlsCredentialStore } from "./MtlsCredentials.ts";
@@ -68,9 +73,11 @@ export const makeHostedInspectorFactory = (options: {
   make: ({
     bootstrap,
     materialization,
+    computerInputGate = makeAgentComputerInputGate(),
   }: {
     readonly bootstrap: WorkerBootstrap;
     readonly materialization: WorkerSecretMaterialization;
+    readonly computerInputGate?: AgentComputerInputGate;
   }) =>
     Effect.gen(function* () {
       const hostPlatform = yield* HostProcessPlatform;
@@ -126,6 +133,33 @@ export const makeHostedInspectorFactory = (options: {
         ...(options.inspectorUid === undefined
           ? {}
           : { additionalUntrustedUids: [options.inspectorUid] }),
+        authorizeVisualInput: ({ binding, permit, operation }) =>
+          computerInputGate
+            .authorizeUserInput(
+              permit,
+              {
+                workspaceId: binding.workspaceId,
+                threadId: binding.threadId,
+                attemptId: binding.attemptId,
+                environmentId: binding.environmentId,
+                environmentRevisionId: binding.environmentRevisionId,
+                sandboxId: binding.sandboxId,
+                workerId: binding.workerId,
+                routeGeneration: binding.routeGeneration,
+              },
+              DateTime.formatIso(DateTime.nowUnsafe()),
+            )
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new InspectorRuntimeError({
+                    code: "invalid-operation",
+                    retryable: false,
+                    operation: `authorize-${operation.type}`,
+                    cause,
+                  }),
+              ),
+            ),
         loadPty: async () => pty,
       });
     }),
