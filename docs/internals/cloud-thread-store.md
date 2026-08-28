@@ -39,3 +39,8 @@ projections beside the append-only event stream. Valkey may cache presence,
 leases, and routing, but it is never authoritative for these records. Unknown
 payloads must decode as lossless JSON before persistence; unsupported values
 fail as `invalidRecord` rather than being stringified away.
+
+Idle activity and E2B pause/resume transitions are also PostgreSQL-owned. See
+[cloud-thread-runtime.md](./cloud-thread-runtime.md). Client disconnect is not
+activity, and an uncertain provider response never becomes a successful pause
+or resume projection.

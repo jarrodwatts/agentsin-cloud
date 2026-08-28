@@ -40,6 +40,11 @@ PostgreSQL, or a worker bootstrap.
    tokens, revokes every sandbox certificate, fences the durable lease, and
    closes the matching in-memory socket.
 
+Idle pause persists that fence before asking E2B to pause. Resume issues a fresh
+worker ID and bootstrap, then waits for the authenticated reconnect and durable
+replay milestone before the runtime returns to `running`. See
+[cloud-thread-runtime.md](./cloud-thread-runtime.md).
+
 ## Routing and recovery
 
 PostgreSQL owns the worker lease, heartbeat sequence, last-seen timestamp, and

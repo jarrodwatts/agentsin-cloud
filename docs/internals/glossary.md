@@ -10,6 +10,7 @@ This is a living glossary for T3 Code. It explains what common terms mean in thi
 - [Thread timeline](#thread-timeline)
 - [Orchestration](#orchestration)
 - [Provider runtime](#provider-runtime)
+- [Hosted cloud runtime](#hosted-cloud-runtime)
 - [Checkpointing](#checkpointing)
 
 ## Concepts
@@ -120,6 +121,20 @@ A point-in-time view of state. The word is used in multiple layers, including or
 
 The per-driver list of current model slugs that decides which models land in the model picker's legacy section. Bundled at `apps/server/src/provider/model-manifest.json` and refreshed at runtime from the same file on `main`, so classification updates ship as commits instead of releases. See the [provider architecture][16] model manifest section.
 
+### Hosted cloud runtime
+
+#### Runtime generation
+
+A permanent fence for one cloud thread's current E2B worker. Pause revokes the current worker;
+resume increments the generation and creates a fresh worker bootstrap. Agent or preview activity
+from an older generation is rejected. See [cloud-thread-runtime.md][25].
+
+#### Idle activity lease
+
+A short PostgreSQL-backed claim that an authenticated agent or preview service is active. The
+control plane assigns its timestamps. Unexpired desktop control leases also block idle pause, while
+opening or closing a client by itself does not. See [cloud-thread-runtime.md][25].
+
 ### Checkpointing
 
 Checkpointing captures workspace state over time so the app can diff turns and restore earlier points. The main pieces are [CheckpointStore.ts][19], [CheckpointDiffQuery.ts][20], and [CheckpointReactor.ts][6].
@@ -183,3 +198,4 @@ The file patch and changed-file summary for one turn. It is usually computed in 
 [22]: ../../apps/server/src/checkpointing/Utils.ts
 [23]: ../../apps/server/src/checkpointing/Diffs.ts
 [24]: ./overview.md
+[25]: ./cloud-thread-runtime.md
