@@ -24,11 +24,10 @@ jobs:
           event_base_repository="$(/usr/bin/jq --exit-status --raw-output '.pull_request.base.repo.full_name' "$GITHUB_EVENT_PATH")"
           event_base_ref="$(/usr/bin/jq --exit-status --raw-output '.pull_request.base.ref' "$GITHUB_EVENT_PATH")"
           event_default_branch="$(/usr/bin/jq --exit-status --raw-output '.repository.default_branch' "$GITHUB_EVENT_PATH")"
-          event_base_sha="$(/usr/bin/jq --exit-status --raw-output '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
           [[ "$event_repository" == "$GITHUB_REPOSITORY" ]]
           [[ "$event_base_repository" == "$GITHUB_REPOSITORY" ]]
           [[ "$event_base_ref" == "$event_default_branch" ]]
-          [[ "$event_base_sha" == "$GITHUB_SHA" ]]
+          [[ "$GITHUB_REF" == "refs/heads/${event_default_branch}" ]]
           [[ -z "$(/usr/bin/find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
           object_directory="$(/usr/bin/mktemp -d "$RUNNER_TEMP/agentsin-protected-base-objects.XXXXXX")"
@@ -50,6 +49,17 @@ jobs:
           "${git_command[@]}" init --quiet "$object_directory"
           "${git_command[@]}" -C "$object_directory" remote add origin \
             "https://github.com/${GITHUB_REPOSITORY}.git"
+          remote_default="$("${git_command[@]}" -C "$object_directory" ls-remote \
+            --exit-code \
+            --refs \
+            origin \
+            "$GITHUB_REF")"
+          [[ "$remote_default" != *$'\n'* ]]
+          remote_default_sha="${remote_default%%$'\t'*}"
+          remote_default_ref="${remote_default#*$'\t'}"
+          [[ "$remote_default_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$remote_default_sha" == "$GITHUB_SHA" ]]
+          [[ "$remote_default_ref" == "$GITHUB_REF" ]]
           "${git_command[@]}" -C "$object_directory" fetch \
             --quiet \
             --no-tags \
