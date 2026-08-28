@@ -6,7 +6,7 @@ import {
   TurnId,
   type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   deriveActiveWorkStartedAt,
@@ -2262,6 +2262,80 @@ describe("rerun workflows", () => {
 });
 
 describe("session activity performance", () => {
+  function makeOrderedToolActivities(length: number, idPrefix: string) {
+    return Array.from({ length }, (_, index) =>
+      makeActivity({
+        id: `${idPrefix}-${index}`,
+        createdAt: new Date(1_700_000_000_000 + index).toISOString(),
+        kind: "tool.completed",
+        summary: "Ran command",
+        sequence: index,
+        payload: {
+          itemType: "command_execution",
+          title: "Ran command",
+          data: {
+            toolCallId: `${idPrefix}-${index}`,
+            item: { command: ["git", "status"] },
+          },
+        },
+      }),
+    );
+  }
+
+  function countArraySortCalls(run: () => void) {
+    const sort = vi.spyOn(Array.prototype, "sort");
+    const toSorted = vi.spyOn(Array.prototype, "toSorted");
+    try {
+      run();
+      return {
+        sort: sort.mock.calls.length,
+        toSorted: toSorted.mock.calls.length,
+      };
+    } finally {
+      sort.mockRestore();
+      toSorted.mockRestore();
+    }
+  }
+
+  function countInputReads(
+    length: number,
+    derive: (activities: ReadonlyArray<OrchestrationThreadActivity>) => unknown,
+  ): number {
+    let reads = 0;
+    const activities = makeOrderedToolActivities(length, `complexity-${length}`).map(
+      (activity) =>
+        new Proxy(activity, {
+          get(target, property, receiver) {
+            reads += 1;
+            return Reflect.get(target, property, receiver);
+          },
+        }),
+    );
+    const observedActivities = new Proxy(activities, {
+      get(target, property, receiver) {
+        if (
+          property === "length" ||
+          (typeof property === "string" && /^(?:0|[1-9]\d*)$/u.test(property))
+        ) {
+          reads += 1;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    derive(observedActivities);
+    return reads;
+  }
+
+  function assertLinearReadGrowth(smaller: number, larger: number, inputScale: number) {
+    const fixedOverheadAllowance = 64;
+    if (larger > smaller * inputScale + fixedOverheadAllowance) {
+      throw new Error(
+        `input reads grew superlinearly: ${smaller} -> ${larger} for ${inputScale}x input`,
+      );
+    }
+  }
+
   it("reuses entries for unchanged activities", () => {
     const activities = ["status", "diff", "log"].map((command, index) =>
       makeActivity({
@@ -2281,43 +2355,42 @@ describe("session activity performance", () => {
     expect(appendedEntries[1]).toBe(initialEntries[1]);
   });
 
-  it("updates 20,000 ordered tool activities within 100 ms", () => {
-    const activities = Array.from({ length: 20_000 }, (_, index) =>
-      makeActivity({
-        id: `benchmark-tool-${index}`,
-        createdAt: new Date(1_700_000_000_000 + index).toISOString(),
-        kind: "tool.completed",
-        summary: "Ran command",
-        sequence: index,
-        payload: {
-          itemType: "command_execution",
-          title: "Ran command",
-          data: {
-            toolCallId: `benchmark-tool-${index}`,
-            item: { command: ["git", "status"] },
-          },
-        },
-      }),
-    );
-    deriveWorkLogEntries(activities);
-    const updatedActivities = [
-      ...activities,
-      makeActivity({
-        id: "benchmark-tool-appended",
-        createdAt: new Date(1_700_000_000_000 + activities.length).toISOString(),
-        kind: "tool.completed",
-        summary: "Ran command",
-        sequence: activities.length,
-        payload: {
-          itemType: "command_execution",
-          title: "Ran command",
-          data: { toolCallId: "benchmark-tool-appended", item: { command: ["git", "diff"] } },
-        },
-      }),
-    ];
+  it("does not sort activity streams that are already ordered", () => {
+    const activities = makeOrderedToolActivities(2_000, "ordered-tool");
 
-    const startedAt = performance.now();
-    expect(deriveWorkLogEntries(updatedActivities)).toHaveLength(20_001);
-    expect(performance.now() - startedAt).toBeLessThan(100);
+    expect(countArraySortCalls(() => deriveWorkLogEntries(activities))).toEqual({
+      sort: 0,
+      toSorted: 0,
+    });
+
+    // Prove the guard observes both common ways a future refactor could
+    // accidentally restore an unconditional O(n log n) sort.
+    expect(
+      countArraySortCalls(() => {
+        [...activities].sort(() => 0);
+        activities.toSorted(() => 0);
+      }),
+    ).toEqual({ sort: 1, toSorted: 1 });
+  });
+
+  it("keeps ordered activity processing linear in input reads", () => {
+    const smaller = countInputReads(256, deriveWorkLogEntries);
+    const larger = countInputReads(512, deriveWorkLogEntries);
+    expect(() => assertLinearReadGrowth(smaller, larger, 2)).not.toThrow();
+
+    // Self-check the complexity probe against deliberately quadratic work so
+    // this regression cannot silently become a test that accepts everything.
+    const quadraticDerive = (activities: ReadonlyArray<OrchestrationThreadActivity>) => {
+      for (const left of activities) {
+        for (const right of activities) {
+          void (left.sequence === right.sequence);
+        }
+      }
+    };
+    const quadraticSmaller = countInputReads(64, quadraticDerive);
+    const quadraticLarger = countInputReads(128, quadraticDerive);
+    expect(() => assertLinearReadGrowth(quadraticSmaller, quadraticLarger, 2)).toThrow(
+      "input reads grew superlinearly",
+    );
   });
 });
