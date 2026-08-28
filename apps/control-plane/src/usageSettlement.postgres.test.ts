@@ -196,6 +196,11 @@ const accrue = (
   value: VerifiedE2bUsageEvidence,
   idempotencyKey: string,
   now = "2026-08-28T00:06:00.000Z",
+  scope: {
+    readonly threadId?: ThreadId;
+    readonly environmentId?: EnvironmentId;
+    readonly sandboxId?: SandboxId;
+  } = {},
 ) => {
   const source: VerifiedE2bUsageSource = {
     read: (request) => Effect.succeed(records.get(request.evidenceId)!),
@@ -209,9 +214,9 @@ const accrue = (
   });
   const request: UsageMeteringRequest = {
     workspaceId,
-    environmentId,
-    threadId,
-    sandboxId,
+    environmentId: scope.environmentId ?? environmentId,
+    threadId: scope.threadId ?? threadId,
+    sandboxId: scope.sandboxId ?? sandboxId,
     evidenceId: value.evidenceId,
     intervalStart: value.intervalStart,
     intervalEnd: value.intervalEnd,
@@ -995,7 +1000,20 @@ it.effect(
             "2026-08-28T00:16:02.000Z",
           ),
         );
-        expect(authorized.workspaceRecoveryFenceId).toBe(activeWorkspaceFence.rows[0]!.fence_id);
+        expect(
+          (yield* Effect.promise(() =>
+            pool.query<{ readonly fence_id: string }>(
+              `SELECT fence.workspace_fence_id AS fence_id
+                 FROM cloud_usage_billing_recovery_authorization recovery
+                 JOIN cloud_usage_billing_fence fence
+                   ON fence.workspace_id = recovery.workspace_id
+                  AND fence.thread_id = recovery.thread_id
+                  AND fence.fence_id = recovery.fence_id
+                WHERE recovery.workspace_id = $1 AND recovery.settlement_id = $2`,
+              [workspaceId, settlementId],
+            ),
+          )).rows,
+        ).toEqual([{ fence_id: activeWorkspaceFence.rows[0]!.fence_id }]);
         const submissionPending = yield* Effect.promise(() =>
           repository.setSubmissionPending(
             authorized,
@@ -1015,10 +1033,7 @@ it.effect(
             "2026-08-28T00:15:02.000Z",
           ),
         );
-        expect(applied).toMatchObject({
-          state: "transfer-applied",
-          workspaceRecoveryFenceId: activeWorkspaceFence.rows[0]!.fence_id,
-        });
+        expect(applied).toMatchObject({ state: "transfer-applied" });
 
         const siblingSettlementId = "settlement-sibling-independent" as SettlementId;
         yield* Effect.promise(() =>
@@ -1086,6 +1101,185 @@ it.effect(
         ).toEqual([{ fence_id: "sibling-independent-fence" }]);
       }),
     ),
+);
+
+it.effect("keeps concurrent workspace obligations independent until each cause is recovered", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const siblingThreadId = "settlement-thread-concurrent" as ThreadId;
+      const siblingEnvironmentId = "settlement-environment-concurrent" as EnvironmentId;
+      const siblingSandboxId = "settlement-sandbox-concurrent" as SandboxId;
+      yield* Effect.promise(() =>
+        pool.query(
+          `INSERT INTO cloud_thread (workspace_id, thread_id, environment_id)
+             VALUES ($1,$2,$3)`,
+          [workspaceId, siblingThreadId, siblingEnvironmentId],
+        ),
+      );
+      yield* Effect.promise(() =>
+        pool.query(
+          `INSERT INTO cloud_e2b_sandbox_identity (
+               workspace_id, reservation_id, thread_id, environment_id, project_id, revision_id,
+               repository_identity, workspace_directory, sandbox_id, provider_handle, state,
+               provider_template_id, provider_build_id, requested_at, activated_at, updated_at
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$12,$13,$13,$13)`,
+          [
+            workspaceId,
+            "settlement-reservation-concurrent",
+            siblingThreadId,
+            siblingEnvironmentId,
+            projectId,
+            "settlement-revision-concurrent",
+            { canonicalKey: "github.com/jarrodwatts/agentsin-cloud" },
+            "/workspace/agentsin-cloud",
+            siblingSandboxId,
+            "e2b-settlement-sandbox-concurrent",
+            "agentsin-cloud-settlement",
+            "22222222-2222-4222-8222-222222222222",
+            "2026-08-28T00:00:00.000Z",
+          ],
+        ),
+      );
+      const first = evidence("concurrent-workspace-low", 1, 4_500, "4");
+      const second = evidence("concurrent-workspace-policy", 1, 4_750, "5");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "concurrent-low-v1");
+      yield* accrue(
+        pool,
+        new Map([[second.evidenceId, second]]),
+        second,
+        "concurrent-policy-v1",
+        "2026-08-28T00:06:00.000Z",
+        {
+          threadId: siblingThreadId,
+          environmentId: siblingEnvironmentId,
+          sandboxId: siblingSandboxId,
+        },
+      );
+      const repository = makePostgresUsageSettlementRepository(pool);
+      const attempts = yield* Effect.promise(() =>
+        repository.claimReady({
+          processorId: "settler-concurrent-workspace",
+          now: "2026-08-28T00:15:00.000Z",
+          leaseExpiresAt: "2026-08-28T00:16:00.000Z",
+          limit: 2,
+          workspaceId,
+        }),
+      );
+      expect(attempts).toHaveLength(2);
+      const lowAttempt = attempts.find((attempt) => attempt.threadId === threadId)!;
+      const policyAttempt = attempts.find((attempt) => attempt.threadId === siblingThreadId)!;
+      const [lowPending, policyPending] = yield* Effect.promise(() =>
+        Promise.all([
+          repository.setSubmissionPending(
+            lowAttempt,
+            "settler-concurrent-workspace",
+            "2026-08-28T00:15:00.000Z",
+          ),
+          repository.setSubmissionPending(
+            policyAttempt,
+            "settler-concurrent-workspace",
+            "2026-08-28T00:15:00.000Z",
+          ),
+        ]),
+      );
+      yield* Effect.promise(() =>
+        Promise.all([
+          repository.markLowBalancePausePending(
+            lowPending,
+            "settler-concurrent-workspace",
+            undefined,
+            "provider-insufficient-balance",
+            "2026-08-28T00:15:01.000Z",
+          ),
+          repository.closeProviderAttemptNotApplied(
+            policyPending,
+            "settler-concurrent-workspace",
+            undefined,
+            "wallet-policy-denied",
+            "2026-08-28T00:15:01.000Z",
+            "2026-08-28T00:15:06.000Z",
+          ),
+        ]),
+      );
+      const runtime = makeRuntime();
+      const chain = makeChain();
+      const service = settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-concurrent-workspace",
+        "2026-08-28T00:15:02.000Z",
+      );
+      expect((yield* service.recoverPending()).billingPaused).toBe(4);
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query<{ readonly reason: string; readonly settlement_id: string }>(
+            `SELECT reason, settlement_id FROM cloud_usage_workspace_billing_fence
+                WHERE workspace_id = $1 AND state = 'active' ORDER BY reason`,
+            [workspaceId],
+          ),
+        )).rows,
+      ).toEqual([
+        { reason: "insufficient-balance", settlement_id: lowAttempt.settlementId },
+        { reason: "provider-definitive-failure", settlement_id: policyAttempt.settlementId },
+      ]);
+
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-concurrent-low-recovered",
+        txHash: `0x${"4".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:03.000Z",
+      });
+      const recoveredLow = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-concurrent-low-recovery",
+        "2026-08-28T00:15:03.000Z",
+      ).retryLowBalance(workspaceId, lowAttempt.settlementId);
+      expect(recoveredLow.state).toBe("finalized");
+      expect(chain.submits()).toBe(1);
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query<{ readonly reason: string; readonly settlement_id: string }>(
+            `SELECT reason, settlement_id FROM cloud_usage_workspace_billing_fence
+                WHERE workspace_id = $1 AND state = 'active'`,
+            [workspaceId],
+          ),
+        )).rows,
+      ).toEqual([
+        {
+          reason: "provider-definitive-failure",
+          settlement_id: policyAttempt.settlementId,
+        },
+      ]);
+      const ordinaryRecovery = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-concurrent-ordinary-recovery",
+        "2026-08-28T00:15:10.000Z",
+      ).recoverPending();
+      expect(ordinaryRecovery.claimed).toBe(0);
+      expect(chain.submits()).toBe(1);
+      expect(
+        yield* Effect.promise(() => repository.get(workspaceId, policyAttempt.settlementId)),
+      ).toMatchObject({ state: "retry-waiting" });
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query(
+            `SELECT 1 FROM cloud_usage_billing_fence
+                WHERE workspace_id = $1 AND settlement_id = $2
+                  AND reason = 'provider-definitive-failure' AND state = 'paused'`,
+            [workspaceId, policyAttempt.settlementId],
+          ),
+        )).rowCount,
+      ).toBe(1);
+    }),
+  ),
 );
 
 it.effect("keeps a failed low-balance pause durable and retries only the pause boundary", () =>
@@ -1241,13 +1435,18 @@ it.effect("keeps workspace and later provider obligations separate", () =>
       const activeAfterLow = yield* Effect.promise(() =>
         pool.query<{ readonly fence_id: string; readonly reason: string; readonly state: string }>(
           `SELECT fence_id, reason, state FROM cloud_usage_billing_fence
-            WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'`,
+            WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'
+            ORDER BY reason`,
           [workspaceId, threadId],
         ),
       );
-      expect(activeAfterLow.rows).toHaveLength(1);
+      expect(activeAfterLow.rows).toHaveLength(2);
       expect(activeAfterLow.rows[0]).toMatchObject({
         reason: "insufficient-balance",
+        state: "paused",
+      });
+      expect(activeAfterLow.rows[1]).toMatchObject({
+        reason: "provider-definitive-failure",
         state: "paused",
       });
 
@@ -1295,6 +1494,72 @@ it.effect("keeps workspace and later provider obligations separate", () =>
         "insufficient-balance",
         "provider-definitive-failure",
       ]);
+
+      const repository = makePostgresUsageSettlementRepository(pool);
+      const authorized = yield* Effect.promise(() =>
+        repository.claimProviderFailureRetry(
+          workspaceId,
+          settlementId,
+          "settler-cross-crash",
+          "2026-08-28T00:16:00.000Z",
+          "2026-08-28T00:17:00.000Z",
+        ),
+      );
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query<{ readonly reason: string }>(
+            `SELECT reason FROM cloud_usage_billing_recovery_authorization
+              WHERE workspace_id = $1 AND settlement_id = $2 ORDER BY reason`,
+            [workspaceId, settlementId],
+          ),
+        )).rows,
+      ).toEqual([{ reason: "insufficient-balance" }, { reason: "provider-definitive-failure" }]);
+      const pending = yield* Effect.promise(() =>
+        repository.setSubmissionPending(
+          authorized,
+          "settler-cross-crash",
+          "2026-08-28T00:16:00.000Z",
+        ),
+      );
+      const applied = yield* Effect.promise(() =>
+        repository.recordTransfer(
+          pending,
+          "settler-cross-crash",
+          {
+            providerActivityRef: "turnkey-cross-crash-applied",
+            txHash: `0x${"3".repeat(64)}` as EvmTransactionHash,
+            submittedAt: "2026-08-28T00:16:00.000Z",
+          },
+          "2026-08-28T00:16:00.000Z",
+        ),
+      );
+      expect(applied.state).toBe("transfer-applied");
+      const submitsBeforeCrashRecovery = chain.submits();
+      expect(
+        (yield* settlementService(
+          pool,
+          chain,
+          signer(),
+          runtime.runtime,
+          "settler-cross-after-crash",
+          "2026-08-28T00:17:00.000Z",
+        ).recoverPending()).finalized,
+      ).toBe(1);
+      expect(chain.submits()).toBe(submitsBeforeCrashRecovery);
+      expect(yield* Effect.promise(() => repository.get(workspaceId, settlementId))).toMatchObject({
+        state: "finalized",
+        receipt: expect.any(Object),
+      });
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query(
+            `SELECT 1 FROM cloud_usage_billing_fence
+              WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'
+                AND (settlement_id = $3 OR recovery_settlement_id = $3)`,
+            [workspaceId, threadId, settlementId],
+          ),
+        )).rowCount,
+      ).toBe(0);
     }),
   ),
 );

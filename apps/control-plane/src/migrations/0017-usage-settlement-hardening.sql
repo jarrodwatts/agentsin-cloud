@@ -7,9 +7,7 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE cloud_usage_settlement_attempt
   ADD COLUMN IF NOT EXISTS authorization_generation integer NOT NULL DEFAULT 1,
   ADD COLUMN IF NOT EXISTS provider_attempt_generation integer NOT NULL DEFAULT 1,
-  ADD COLUMN IF NOT EXISTS next_submit_not_before timestamptz,
-  ADD COLUMN IF NOT EXISTS workspace_recovery_fence_id text,
-  ADD COLUMN IF NOT EXISTS workspace_recovery_authorized_at timestamptz;
+  ADD COLUMN IF NOT EXISTS next_submit_not_before timestamptz;
 
 DO $$
 BEGIN
@@ -211,14 +209,21 @@ CREATE TABLE IF NOT EXISTS cloud_usage_workspace_billing_fence (
   UNIQUE (workspace_id, episode),
   FOREIGN KEY (workspace_id, source_thread_id)
     REFERENCES cloud_thread (workspace_id, thread_id) ON DELETE RESTRICT,
+  FOREIGN KEY (workspace_id, settlement_id, source_thread_id)
+    REFERENCES cloud_usage_settlement_attempt (workspace_id, settlement_id, thread_id)
+    ON DELETE RESTRICT,
   CHECK (
     (state = 'active' AND cleared_at IS NULL) OR
     (state = 'cleared' AND cleared_at IS NOT NULL)
   )
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_workspace_billing_fence_one_active
-  ON cloud_usage_workspace_billing_fence (workspace_id) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_workspace_billing_fence_active_bound_obligation
+  ON cloud_usage_workspace_billing_fence (workspace_id, source_thread_id, settlement_id, reason)
+  WHERE state = 'active' AND settlement_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_workspace_billing_fence_active_unbound_obligation
+  ON cloud_usage_workspace_billing_fence (workspace_id, source_thread_id, reason)
+  WHERE state = 'active' AND settlement_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS cloud_usage_billing_fence (
   workspace_id uuid NOT NULL,
@@ -268,12 +273,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_workspace
   WHERE state <> 'cleared' AND workspace_fence_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_settlement_obligation
   ON cloud_usage_billing_fence (
-    workspace_id, thread_id, COALESCE(settlement_id, recovery_settlement_id)
+    workspace_id, thread_id, COALESCE(settlement_id, recovery_settlement_id), reason
   )
   WHERE state <> 'cleared' AND workspace_fence_id IS NULL
     AND COALESCE(settlement_id, recovery_settlement_id) IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_unbound_obligation
-  ON cloud_usage_billing_fence (workspace_id, thread_id)
+  ON cloud_usage_billing_fence (workspace_id, thread_id, reason)
   WHERE state <> 'cleared' AND workspace_fence_id IS NULL
     AND settlement_id IS NULL AND recovery_settlement_id IS NULL;
 
@@ -281,17 +286,34 @@ DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
-     WHERE conrelid = 'cloud_usage_settlement_attempt'::regclass
-       AND conname = 'cloud_usage_settlement_attempt_workspace_recovery_fence_fk'
+     WHERE conrelid = 'cloud_usage_billing_fence'::regclass
+       AND conname = 'cloud_usage_billing_fence_identity_reason_unique'
   ) THEN
-    ALTER TABLE cloud_usage_settlement_attempt
-      ADD CONSTRAINT cloud_usage_settlement_attempt_workspace_recovery_fence_fk
-      FOREIGN KEY (workspace_id, workspace_recovery_fence_id)
-      REFERENCES cloud_usage_workspace_billing_fence (workspace_id, fence_id)
-      ON DELETE RESTRICT;
+    ALTER TABLE cloud_usage_billing_fence
+      ADD CONSTRAINT cloud_usage_billing_fence_identity_reason_unique
+      UNIQUE (workspace_id, thread_id, fence_id, reason);
   END IF;
 END
 $$;
+
+CREATE TABLE IF NOT EXISTS cloud_usage_billing_recovery_authorization (
+  workspace_id uuid NOT NULL,
+  settlement_id text NOT NULL,
+  thread_id text NOT NULL,
+  fence_id text NOT NULL,
+  reason text NOT NULL CHECK (reason IN (
+    'insufficient-balance', 'authorization-unavailable', 'provider-definitive-failure',
+    'provider-outcome-uncertain'
+  )),
+  authorized_at timestamptz NOT NULL,
+  PRIMARY KEY (workspace_id, settlement_id, thread_id, fence_id),
+  FOREIGN KEY (workspace_id, settlement_id, thread_id)
+    REFERENCES cloud_usage_settlement_attempt (workspace_id, settlement_id, thread_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (workspace_id, thread_id, fence_id, reason)
+    REFERENCES cloud_usage_billing_fence (workspace_id, thread_id, fence_id, reason)
+    ON DELETE RESTRICT
+);
 
 CREATE TABLE IF NOT EXISTS cloud_usage_billing_fence_event (
   workspace_id uuid NOT NULL,
@@ -451,16 +473,6 @@ BEGIN
   ELSIF NEW.authorization_generation <> OLD.authorization_generation THEN
     RAISE EXCEPTION 'settlement authorization generation requires a new binding';
   END IF;
-  IF OLD.workspace_recovery_fence_id IS NOT NULL AND ROW(
-    NEW.workspace_recovery_fence_id, NEW.workspace_recovery_authorized_at
-  ) IS DISTINCT FROM ROW(
-    OLD.workspace_recovery_fence_id, OLD.workspace_recovery_authorized_at
-  ) THEN
-    RAISE EXCEPTION 'settlement workspace recovery authorization is immutable once persisted';
-  END IF;
-  IF (NEW.workspace_recovery_fence_id IS NULL) <> (NEW.workspace_recovery_authorized_at IS NULL) THEN
-    RAISE EXCEPTION 'settlement workspace recovery authorization must be complete';
-  END IF;
   RETURN NEW;
 END;
 $$;
@@ -493,9 +505,11 @@ BEGIN
     RAISE EXCEPTION 'cleared usage billing fence is immutable';
   END IF;
   IF ROW(
-    OLD.workspace_id, OLD.thread_id, OLD.fence_id, OLD.episode, OLD.settlement_id, OLD.created_at
+    OLD.workspace_id, OLD.thread_id, OLD.fence_id, OLD.episode, OLD.settlement_id,
+    OLD.reason, OLD.created_at
   ) IS DISTINCT FROM ROW(
-    NEW.workspace_id, NEW.thread_id, NEW.fence_id, NEW.episode, NEW.settlement_id, NEW.created_at
+    NEW.workspace_id, NEW.thread_id, NEW.fence_id, NEW.episode, NEW.settlement_id,
+    NEW.reason, NEW.created_at
   ) THEN
     RAISE EXCEPTION 'usage billing fence identity is immutable';
   END IF;
@@ -586,6 +600,12 @@ DROP TRIGGER IF EXISTS cloud_usage_billing_fence_event_immutable
   ON cloud_usage_billing_fence_event;
 CREATE TRIGGER cloud_usage_billing_fence_event_immutable
   BEFORE UPDATE OR DELETE ON cloud_usage_billing_fence_event
+  FOR EACH ROW EXECUTE FUNCTION agentsin_cloud_reject_usage_mutation();
+
+DROP TRIGGER IF EXISTS cloud_usage_billing_recovery_authorization_immutable
+  ON cloud_usage_billing_recovery_authorization;
+CREATE TRIGGER cloud_usage_billing_recovery_authorization_immutable
+  BEFORE UPDATE OR DELETE ON cloud_usage_billing_recovery_authorization
   FOR EACH ROW EXECUTE FUNCTION agentsin_cloud_reject_usage_mutation();
 
 DO $$
