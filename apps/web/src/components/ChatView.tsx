@@ -174,8 +174,10 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
 import { CloudDesktopInspector, cloudDesktopTabStatus } from "./cloud/CloudDesktopInspector";
+import type { CloudDesktopVisualFixture } from "./cloud/devCloudThreadVisualFixture";
 import {
   type CloudDesktopConnection,
+  type CloudDesktopSession,
   useCloudDesktopInspector,
 } from "./cloud/useCloudDesktopInspector";
 import { CloudThreadStatusBar, CloudThreadTimelineFrame } from "./cloud/CloudThreadTimeline";
@@ -586,6 +588,13 @@ export type CloudDesktopCapability =
       /** The control plane still derives workspace and user identity from Better Auth. */
       readonly enabled: true;
       readonly connection: CloudDesktopConnection;
+      readonly visualFixture?: never;
+    }
+  | {
+      /** Development-only visual QA state; production routes never construct this branch. */
+      readonly enabled: true;
+      readonly visualFixture: CloudDesktopVisualFixture;
+      readonly connection?: never;
     };
 
 const DEFAULT_CLOUD_DESKTOP_CAPABILITY: CloudDesktopCapability = { enabled: false };
@@ -1307,6 +1316,14 @@ function ChatViewContent(props: ChatViewProps) {
   // This is intentionally an explicit capability input. Relay-managed is a
   // connection mode, not proof that a cloud desktop lease or stream exists.
   const cloudDesktopAvailable = cloudDesktopCapability.enabled;
+  const cloudDesktopVisualFixture =
+    cloudDesktopCapability.enabled && "visualFixture" in cloudDesktopCapability
+      ? cloudDesktopCapability.visualFixture
+      : null;
+  const cloudDesktopConnection =
+    cloudDesktopCapability.enabled && "connection" in cloudDesktopCapability
+      ? (cloudDesktopCapability.connection ?? null)
+      : null;
   const cloudThreadEvents = cloudThreadCapability.enabled
     ? cloudThreadCapability.view.events
     : null;
@@ -1766,11 +1783,42 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
-  const cloudDesktopSession = useCloudDesktopInspector({
-    active: cloudDesktopCapability.enabled && activeRightPanelSurface?.kind === "cloud-desktop",
-    connection: cloudDesktopCapability.enabled ? cloudDesktopCapability.connection : null,
+  const liveCloudDesktopSession = useCloudDesktopInspector({
+    active:
+      cloudDesktopCapability.enabled &&
+      cloudDesktopVisualFixture === null &&
+      activeRightPanelSurface?.kind === "cloud-desktop",
+    connection: cloudDesktopConnection,
     threadId,
   });
+  const [visualFixtureController, setVisualFixtureController] = useState<"agent" | "user">("agent");
+  useEffect(() => {
+    if (cloudDesktopVisualFixture === null || activeThreadRef === null) return;
+    const store = useRightPanelStore.getState();
+    const wasAlreadyOpen = store.byThreadKey[activeThreadKey ?? ""]?.surfaces.some(
+      (surface) => surface.kind === "cloud-desktop",
+    );
+    store.open(activeThreadRef, "cloud-desktop");
+    return () => {
+      if (!wasAlreadyOpen) {
+        useRightPanelStore.getState().closeSurface(activeThreadRef, "cloud-desktop");
+      }
+    };
+  }, [activeThreadKey, activeThreadRef, cloudDesktopVisualFixture]);
+  const cloudDesktopSession: CloudDesktopSession =
+    cloudDesktopVisualFixture === null
+      ? liveCloudDesktopSession
+      : {
+          snapshot:
+            visualFixtureController === "user"
+              ? cloudDesktopVisualFixture.userControlled
+              : cloudDesktopVisualFixture.agentControlled,
+          takeControl: () => setVisualFixtureController("user"),
+          resumeControl: () => setVisualFixtureController("user"),
+          releaseControl: () => setVisualFixtureController("agent"),
+          retry: () => undefined,
+          sendInput: () => visualFixtureController === "user",
+        };
   const activeCloudDesktopTabStatus = cloudDesktopCapability.enabled
     ? cloudDesktopTabStatus(cloudDesktopSession.snapshot)
     : undefined;
