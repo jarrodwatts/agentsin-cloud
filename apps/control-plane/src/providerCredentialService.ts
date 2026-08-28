@@ -10,6 +10,7 @@ import type {
 import type {
   AgentConnectionMaterializeResult,
   AgentConnectionProfile,
+  AgentConnectionRefreshResult,
   AgentConnectionValidateResult,
   AgentLoginId,
   AgentMaterializationId,
@@ -137,6 +138,10 @@ export interface ProviderCredentialService {
     readonly authorization: ProviderCredentialAuthorizationContext;
     readonly profileId: AgentProfileId;
   }) => Effect.Effect<AgentConnectionValidateResult, ProviderCredentialServiceError>;
+  readonly refresh: (input: {
+    readonly authorization: ProviderCredentialAuthorizationContext;
+    readonly profileId: AgentProfileId;
+  }) => Effect.Effect<AgentConnectionRefreshResult, ProviderCredentialServiceError>;
   readonly materialize: (input: {
     readonly authorization: ProviderCredentialAuthorizationContext;
     readonly threadId: ThreadId;
@@ -374,6 +379,23 @@ export const makeProviderCredentialService = (dependencies: {
           status,
           checkedAt: now,
           ...(status === "invalid" ? { reason: "invalid-envelope-metadata" } : {}),
+        };
+      }),
+    refresh: (input) =>
+      Effect.gen(function* () {
+        const now = yield* dependencies.now;
+        const profile = yield* loadProfile(input.authorization.workspaceId, input.profileId);
+        if (
+          profile.state !== "active" ||
+          (profile.expiresAt !== undefined && profile.expiresAt <= now) ||
+          !isProviderCredentialEnvelopeMetadataValid(profile.envelope)
+        ) {
+          return yield* fail("profileUnavailable", "refresh-profile");
+        }
+        return {
+          workspaceId: profile.workspaceId,
+          profile: profileMetadata(profile),
+          refreshedAt: now,
         };
       }),
     materialize: (input) =>

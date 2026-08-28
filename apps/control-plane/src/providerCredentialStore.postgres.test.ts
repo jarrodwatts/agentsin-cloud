@@ -241,11 +241,13 @@ it.effect(
           resolveStored = resolve;
         });
         const observedPool = observeQueries(pool, (queryText, rowCount) => {
-          if (queryText.includes("SET state = 'authorized'") && rowCount === 1) resolveStored?.();
+          if (queryText.includes("WITH candidate AS MATERIALIZED") && rowCount === 1)
+            resolveStored?.();
         });
         const plaintext = Buffer.from("provider-login-plaintext-never-stored");
         const runner: ProviderCredentialLoginRunner = {
           validateConfiguration: Effect.void,
+          loginMethod: () => "deviceCode",
           run: (input) =>
             input
               .onEvent({
@@ -309,6 +311,72 @@ it.effect(
     ),
 );
 
+it.effect("atomically expires a provider result completed at its PostgreSQL deadline", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      let resolveCompleted: (() => void) | undefined;
+      const completed = new Promise<void>((resolve) => {
+        resolveCompleted = resolve;
+      });
+      const observedPool = observeQueries(pool, (queryText, rowCount) => {
+        if (queryText.includes("WITH candidate AS MATERIALIZED") && rowCount === 1)
+          resolveCompleted?.();
+      });
+      const plaintext = Buffer.from("provider-login-completed-at-expiry");
+      const runner: ProviderCredentialLoginRunner = {
+        validateConfiguration: Effect.void,
+        loginMethod: () => "deviceCode",
+        run: () =>
+          Effect.succeed({
+            outcome: "authorized" as const,
+            credential: Secret.make<Uint8Array>(plaintext),
+            occurredAt: "2026-08-27T12:15:00.000Z",
+          }),
+        cancel: () => Effect.void,
+        shutdown: Effect.void,
+      };
+      const coordinator = makeProviderLoginCoordinator({
+        pool: observedPool,
+        targets: authorizer,
+        runner,
+        now: Effect.succeed(now),
+        keyEncryption: keyEncryption(),
+      });
+      const login = yield* coordinator.begin({
+        principal: {
+          workspaceId: workspaceA,
+          authSessionId: "session-a" as AuthSessionId,
+          userId: "user-a",
+        },
+        threadId: "thread-a" as ThreadId,
+        providerInstanceId: provider.instanceId,
+      });
+      yield* Effect.promise(() => completed);
+
+      expect(plaintext.every((byte) => byte === 0)).toBe(true);
+      const row = yield* Effect.promise(() =>
+        pool.query<{
+          readonly state: string;
+          readonly key_version: string | null;
+          readonly wrapped_dek: Buffer | null;
+          readonly ciphertext: Buffer | null;
+        }>(
+          `SELECT state, key_version, wrapped_dek, ciphertext
+             FROM provider_credential_login_session
+            WHERE workspace_id = $1 AND login_id = $2`,
+          [workspaceA, login.loginId],
+        ),
+      );
+      expect(row.rows[0]).toEqual({
+        state: "expired",
+        key_version: null,
+        wrapped_dek: null,
+        ciphertext: null,
+      });
+    }),
+  ),
+);
+
 it.effect("fences a late authorized result after cancellation and wipes its plaintext", () =>
   withPostgres((pool) =>
     Effect.gen(function* () {
@@ -318,10 +386,11 @@ it.effect("fences a late authorized result after cancellation and wipes its plai
         resolveAttemptedCas = resolve;
       });
       const observedPool = observeQueries(pool, (queryText) => {
-        if (queryText.includes("SET state = 'authorized'")) resolveAttemptedCas?.();
+        if (queryText.includes("WITH candidate AS MATERIALIZED")) resolveAttemptedCas?.();
       });
       const runner: ProviderCredentialLoginRunner = {
         validateConfiguration: Effect.void,
+        loginMethod: () => "deviceCode",
         run: () => Deferred.await(completion),
         cancel: () => Effect.void,
         shutdown: Effect.void,
@@ -375,6 +444,7 @@ it.effect("fences expired logins before runner cleanup and durably retries clean
       let cancellationAttempts = 0;
       const runner: ProviderCredentialLoginRunner = {
         validateConfiguration: Effect.void,
+        loginMethod: () => "deviceCode",
         run: () => Effect.die("expired login must not restart"),
         cancel: () => {
           cancellationAttempts += 1;
@@ -443,6 +513,7 @@ it.effect(
         let starts = 0;
         const runner: ProviderCredentialLoginRunner = {
           validateConfiguration: Effect.void,
+          loginMethod: () => "deviceCode",
           run: () => {
             starts += 1;
             return Effect.never;

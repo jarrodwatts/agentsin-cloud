@@ -15,6 +15,7 @@ import { expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Result from "effect/Result";
 
 import {
   nodeProviderCredentialCrypto,
@@ -1062,6 +1063,39 @@ it.effect("validates profile metadata without invoking KMS unwrap or decrypting 
     });
     expect(unwraps).toBe(0);
     expect(decrypts).toBe(0);
+  }),
+);
+
+it.effect("refreshes only reusable active profile metadata without decrypting credentials", () =>
+  Effect.gen(function* () {
+    let unwraps = 0;
+    const test = harness({
+      keyEncryption: {
+        ...keyEncryption,
+        unwrap: (...input) => {
+          unwraps += 1;
+          return keyEncryption.unwrap(...input);
+        },
+      },
+    });
+    yield* test.service.sealProfile({
+      authorization: auth,
+      loginId,
+      profileId,
+      label: "Work account",
+      idempotencyKey: "seal-refresh",
+    });
+    const refreshed = yield* test.service.refresh({ authorization: auth, profileId });
+    expect(refreshed).toMatchObject({
+      workspaceId: workspaceA,
+      refreshedAt: now,
+      profile: { profileId, state: "active" },
+    });
+    expect(unwraps).toBe(0);
+
+    yield* test.service.revoke({ authorization: auth, profileId });
+    const rejected = yield* Effect.result(test.service.refresh({ authorization: auth, profileId }));
+    expect(Result.isFailure(rejected)).toBe(true);
   }),
 );
 

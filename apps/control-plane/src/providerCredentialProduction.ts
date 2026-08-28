@@ -274,14 +274,38 @@ export const makeProviderLoginCoordinator = (input: {
           Effect.flatMap((envelope) =>
             database("complete-provider-login", () =>
               input.pool
-                .query(
-                  `UPDATE provider_credential_login_session
-                      SET state = 'authorized', cleanup_state = 'confirmed', cleanup_error = NULL,
-                          key_version = $3, wrapped_dek = $4, nonce = $5, auth_tag = $6,
-                          ciphertext = $7, updated_at = $8::timestamptz
-                    WHERE workspace_id = $1 AND login_id = $2 AND state = 'running'
-                      AND provider_instance_id = $9 AND provider_driver = $10
-                      AND generation = $11`,
+                .query<{ readonly state: "authorized" | "expired" }>(
+                  `WITH candidate AS MATERIALIZED (
+                     SELECT expires_at > $8::timestamptz AS before_expiry
+                       FROM provider_credential_login_session
+                      WHERE workspace_id = $1 AND login_id = $2 AND state = 'running'
+                        AND provider_instance_id = $9 AND provider_driver = $10
+                        AND generation = $11
+                      FOR UPDATE
+                   ), updated AS (
+                     UPDATE provider_credential_login_session AS session
+                        SET state = CASE WHEN candidate.before_expiry
+                                         THEN 'authorized' ELSE 'expired' END,
+                            cleanup_state = 'confirmed', cleanup_error = NULL,
+                            key_version = CASE WHEN candidate.before_expiry
+                                               THEN $3::text ELSE NULL END,
+                            wrapped_dek = CASE WHEN candidate.before_expiry
+                                               THEN $4::bytea ELSE NULL END,
+                            nonce = CASE WHEN candidate.before_expiry
+                                         THEN $5::bytea ELSE NULL END,
+                            auth_tag = CASE WHEN candidate.before_expiry
+                                            THEN $6::bytea ELSE NULL END,
+                            ciphertext = CASE WHEN candidate.before_expiry
+                                               THEN $7::bytea ELSE NULL END,
+                            updated_at = $8::timestamptz
+                       FROM candidate
+                      WHERE session.workspace_id = $1 AND session.login_id = $2
+                        AND session.state = 'running'
+                        AND session.provider_instance_id = $9
+                        AND session.provider_driver = $10
+                        AND session.generation = $11
+                     RETURNING session.state
+                   ) SELECT state FROM updated`,
                   [
                     workspaceId,
                     loginId,
@@ -418,6 +442,9 @@ export const makeProviderLoginCoordinator = (input: {
         });
         if (target.provider.instanceId !== providerInstanceId)
           return yield* fail("providerMismatch", "begin-login");
+        const loginMethod = input.runner.loginMethod(target.provider);
+        if (loginMethod === undefined)
+          return yield* fail("profileUnavailable", "unsupported-login-provider");
         const loginId = NodeCrypto.randomUUID() as AgentLoginId;
         const profileId = loginId as unknown as AgentProfileId;
         const now = yield* input.now;
@@ -543,7 +570,7 @@ export const makeProviderLoginCoordinator = (input: {
           profileId,
           workspaceId: principal.workspaceId,
           provider: target.provider,
-          method: "deviceCode" as const,
+          method: loginMethod,
           events: [],
           expiresAt,
           pollAfterMs: 1_000,

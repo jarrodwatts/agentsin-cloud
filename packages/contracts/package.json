@@ -27,6 +27,10 @@
       "types": "./src/credentialBinary.ts",
       "import": "./src/credentialBinary.ts"
     },
+    "./provider-profile-bundle": {
+      "types": "./src/providerProfileBundle.ts",
+      "import": "./src/providerProfileBundle.ts"
+    },
     "./inspector": {
       "types": "./src/inspector.ts",
       "import": "./src/inspector.ts"

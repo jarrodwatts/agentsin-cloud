@@ -9,6 +9,10 @@ import * as NodePath from "node:path";
 import * as NodeProcess from "node:process";
 
 import type { AgentMaterializationId } from "@t3tools/contracts/cloud";
+import {
+  decodeProviderProfileBundle,
+  type ProviderProfileBundle,
+} from "@t3tools/contracts/provider-profile-bundle";
 import type {
   WorkerProviderCredentialCommand,
   WorkerProviderCredentialResult,
@@ -16,8 +20,6 @@ import type {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-
-const MAX_PROFILE_BYTES = 1024 * 1024;
 
 const RESTRICTED_PROCESS_LAUNCHER = [
   'const cp=require("node:child_process");',
@@ -95,11 +97,6 @@ const nativeLeaseScheduler: WorkerCredentialLeaseScheduler = {
     return { cancel: () => clearTimeout(timer) };
   },
 };
-
-interface ProfileBundle {
-  readonly format: 1;
-  readonly files: ReadonlyArray<{ readonly path: string; readonly contents: Uint8Array }>;
-}
 
 const failure = (code: WorkerProviderCredentialError["code"], operation: string, cause?: unknown) =>
   new WorkerProviderCredentialError({ code, operation, ...(cause === undefined ? {} : { cause }) });
@@ -300,48 +297,6 @@ export const makeNodeWorkerCredentialIdentityRuntime = (
 
 export const nodeWorkerCredentialIdentityRuntime = makeNodeWorkerCredentialIdentityRuntime();
 
-const normalizeRelativePath = (value: string) => {
-  if (
-    value.length < 1 ||
-    value.length > 1024 ||
-    NodePath.isAbsolute(value) ||
-    value.includes("\0") ||
-    value.split(/[\\/]/u).some((part) => part === "" || part === "." || part === "..")
-  )
-    throw failure("invalidProfile", "relative-path");
-  return NodePath.posix.normalize(value.replaceAll("\\", "/"));
-};
-
-const PROFILE_BUNDLE_MAGIC = 0x41494350;
-
-const decodeBundle = (bytes: Uint8Array): ProfileBundle => {
-  if (bytes.byteLength < 6 || bytes.byteLength > MAX_PROFILE_BYTES)
-    throw failure("invalidProfile", "profile-size");
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (view.getUint32(0, false) !== PROFILE_BUNDLE_MAGIC) {
-    throw failure("invalidProfile", "profile-format");
-  }
-  const count = view.getUint16(4, false);
-  if (count < 1 || count > 32) throw failure("invalidProfile", "profile-files");
-  let offset = 6;
-  const files: Array<{ readonly path: string; readonly contents: Uint8Array }> = [];
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  for (let index = 0; index < count; index += 1) {
-    if (offset + 6 > bytes.byteLength) throw failure("invalidProfile", "profile-truncated");
-    const pathBytes = view.getUint16(offset, false);
-    const contentsBytes = view.getUint32(offset + 2, false);
-    offset += 6;
-    if (pathBytes < 1 || offset + pathBytes + contentsBytes > bytes.byteLength)
-      throw failure("invalidProfile", "profile-file");
-    const path = normalizeRelativePath(decoder.decode(bytes.subarray(offset, offset + pathBytes)));
-    offset += pathBytes;
-    files.push({ path, contents: bytes.subarray(offset, offset + contentsBytes) });
-    offset += contentsBytes;
-  }
-  if (offset !== bytes.byteLength) throw failure("invalidProfile", "profile-trailing-data");
-  return { format: 1, files };
-};
-
 interface PrivateRootIdentity {
   readonly path: string;
   readonly realPath: string;
@@ -492,7 +447,7 @@ const writeBundle = async (
   root: PrivateRootIdentity,
   profileRoot: string,
   operationId: AgentMaterializationId,
-  bundle: ProfileBundle,
+  bundle: ProviderProfileBundle,
   restrictedIdentity: { readonly uid: number; readonly gid: number },
   identityRuntime: WorkerCredentialIdentityRuntime,
 ) => {
@@ -700,7 +655,7 @@ export const makeWorkerProviderCredentialExecutor = (input: {
           )
             return yield* failure("invalidProfile", "missing-binary-payload");
           const bundle = yield* Effect.try({
-            try: () => decodeBundle(credentialPayload),
+            try: () => decodeProviderProfileBundle(credentialPayload),
             catch: (cause) =>
               isWorkerProviderCredentialError(cause)
                 ? cause
