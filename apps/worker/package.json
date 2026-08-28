@@ -2,6 +2,9 @@
   "name": "@agentsin-cloud/worker",
   "version": "0.0.1",
   "private": true,
+  "bin": {
+    "agentsin-cloud-worker": "./dist/entrypoint.mjs"
+  },
   "type": "module",
   "exports": {
     ".": {
@@ -14,6 +17,7 @@
     }
   },
   "scripts": {
+    "build": "vp pack src/entrypoint.ts --out-dir dist && vp pack src/ProviderRuntimeChild.ts --out-dir dist --no-clean && vp pack src/imageCanaryEntrypoint.ts --out-dir dist --no-clean && node --experimental-strip-types ./scripts/prepare-image-assets.ts && node ./dist/imageCanaryEntrypoint.mjs",
     "typecheck": "tsgo --noEmit",
     "test": "vp test run"
   },

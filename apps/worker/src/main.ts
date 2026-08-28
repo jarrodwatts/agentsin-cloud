@@ -43,6 +43,7 @@ export const WORKER_INSPECTOR_UID_ENV = "AGENTSIN_INSPECTOR_UID";
 export const WORKER_INSPECTOR_GID_ENV = "AGENTSIN_INSPECTOR_GID";
 export const WORKER_PROVIDER_RUNTIME_MODULE_ENV = "AGENTSIN_PROVIDER_RUNTIME_MODULE";
 export const WORKER_PROVIDER_RUNTIME_SHA256_ENV = "AGENTSIN_PROVIDER_RUNTIME_SHA256";
+export const WORKER_PROVIDER_RUNTIME_CHILD_MODULE_ENV = "AGENTSIN_PROVIDER_RUNTIME_CHILD_MODULE";
 export const WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV = "AGENTSIN_PROVIDER_RUNTIME_CHILD_SHA256";
 export const WORKER_NODE_INTERPRETER_PATH_ENV = "AGENTSIN_NODE_INTERPRETER_PATH";
 export const WORKER_NODE_INTERPRETER_SHA256_ENV = "AGENTSIN_NODE_INTERPRETER_SHA256";
@@ -255,6 +256,7 @@ export const runWorkerMain = (
       const inspectorGid = Number(env[WORKER_INSPECTOR_GID_ENV]);
       const providerRuntimeModule = env[WORKER_PROVIDER_RUNTIME_MODULE_ENV];
       const providerRuntimeSha256 = env[WORKER_PROVIDER_RUNTIME_SHA256_ENV];
+      const providerRuntimeChildModule = env[WORKER_PROVIDER_RUNTIME_CHILD_MODULE_ENV];
       const providerRuntimeChildSha256 = env[WORKER_PROVIDER_RUNTIME_CHILD_SHA256_ENV];
       const nodeInterpreterPath = env[WORKER_NODE_INTERPRETER_PATH_ENV];
       const nodeInterpreterSha256 = env[WORKER_NODE_INTERPRETER_SHA256_ENV];
@@ -276,6 +278,8 @@ export const runWorkerMain = (
         providerRuntimeModule === undefined ||
         !NodePath.isAbsolute(providerRuntimeModule) ||
         providerRuntimeSha256 === undefined ||
+        providerRuntimeChildModule === undefined ||
+        !NodePath.isAbsolute(providerRuntimeChildModule) ||
         providerRuntimeChildSha256 === undefined ||
         nodeInterpreterPath === undefined ||
         !NodePath.isAbsolute(nodeInterpreterPath) ||
@@ -313,6 +317,7 @@ export const runWorkerMain = (
         interpreterPath: nodeInterpreterPath,
         modulePath: providerRuntimeModule,
         moduleSha256: providerRuntimeSha256,
+        childPath: providerRuntimeChildModule,
         childSha256: providerRuntimeChildSha256,
         searchPath: agentPath,
         agentHomeDirectory: agentHome,

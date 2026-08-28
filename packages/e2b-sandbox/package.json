@@ -19,7 +19,7 @@
   "scripts": {
     "test": "vp test run",
     "typecheck": "tsgo --noEmit",
-    "template:build": "node --experimental-strip-types ./template/build.ts"
+    "template:build": "pnpm --filter @agentsin-cloud/worker build && node --experimental-strip-types ./template/build.ts"
   },
   "dependencies": {
     "@t3tools/contracts": "workspace:*",
