@@ -101,13 +101,16 @@ let observedSession: CloudDesktopSession | null = null;
 
 function FixtureSessionHarness({
   fixture,
+  compactLayout = false,
 }: {
   fixture: ReturnType<typeof resolveDevCloudThreadVisualFixture>;
+  compactLayout?: boolean;
 }) {
   observedSession = useDevCloudThreadVisualFixtureSession({
     environmentId: input.environmentId,
     threadId: input.threadId,
     fixture: fixture?.desktop ?? null,
+    compactLayout,
   });
   return null;
 }
@@ -285,7 +288,7 @@ describe("active cloud-thread visual fixture", () => {
     expect(userMarkup).toContain("Release Control");
   });
 
-  it("restores the exact prior panel state when the fixture is disabled", async () => {
+  it("auto-opens on wide layouts and restores the exact prior panel state", async () => {
     const fixture = resolveDevCloudThreadVisualFixture(input);
     if (fixture === null) throw new Error("fixture was not enabled");
     const previousPanelState: ThreadRightPanelState = {
@@ -331,6 +334,44 @@ describe("active cloud-thread visual fixture", () => {
       expect(
         selectSelectedRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
       ).toMatchObject({ kind: "diff" });
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
+  it("starts collapsed on compact layouts, supports manual opening, and restores cleanup", async () => {
+    const fixture = resolveDevCloudThreadVisualFixture(input);
+    if (fixture === null) throw new Error("fixture was not enabled");
+    const previousPanelState: ThreadRightPanelState = {
+      isOpen: false,
+      activeSurfaceId: "diff",
+      surfaces: [{ id: "diff", kind: "diff" }],
+    };
+    const threadKey = scopedThreadKey(threadRef);
+    useRightPanelStore.setState({ byThreadKey: { [threadKey]: previousPanelState } });
+    const document = installTestDom();
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(document.createElement("div") as unknown as Element);
+
+    try {
+      await act(() =>
+        root.render(<FixtureSessionHarness fixture={fixture} compactLayout={true} />),
+      );
+      expect(useRightPanelStore.getState().byThreadKey[threadKey]).toEqual(previousPanelState);
+      expect(
+        selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+      ).toBeNull();
+
+      await act(() => useRightPanelStore.getState().open(threadRef, "cloud-desktop"));
+      expect(
+        selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+      ).toMatchObject({ kind: "cloud-desktop" });
+
+      await act(() => root.render(<FixtureSessionHarness fixture={null} compactLayout={true} />));
+      expect(useRightPanelStore.getState().byThreadKey[threadKey]).toEqual(previousPanelState);
+      expect(
+        selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+      ).toBeNull();
     } finally {
       await act(() => root.unmount());
     }

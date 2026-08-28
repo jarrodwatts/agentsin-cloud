@@ -16,6 +16,7 @@ export function useDevCloudThreadVisualFixtureSession(input: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly fixture: CloudDesktopVisualFixture | null;
+  readonly compactLayout: boolean;
 }): CloudDesktopSession | null {
   const threadKey = scopedThreadKey(input);
   const fixture = import.meta.env.PROD || !import.meta.env.DEV ? null : input.fixture;
@@ -29,9 +30,7 @@ export function useDevCloudThreadVisualFixtureSession(input: {
   useEffect(() => {
     if (!fixtureActive) return;
 
-    const threadRef = scopeThreadRef(input.environmentId, input.threadId);
     const previousThreadState = useRightPanelStore.getState().byThreadKey[threadKey];
-    useRightPanelStore.getState().open(threadRef, "cloud-desktop");
 
     return () => {
       useRightPanelStore.setState((state) => {
@@ -49,6 +48,13 @@ export function useDevCloudThreadVisualFixtureSession(input: {
       });
     };
   }, [fixtureActive, input.environmentId, input.threadId, threadKey]);
+
+  useEffect(() => {
+    if (!fixtureActive || input.compactLayout) return;
+
+    const threadRef = scopeThreadRef(input.environmentId, input.threadId);
+    useRightPanelStore.getState().open(threadRef, "cloud-desktop");
+  }, [fixtureActive, input.compactLayout, input.environmentId, input.threadId]);
 
   const takeControl = useCallback(() => {
     setControl({ threadKey, controller: "user" });

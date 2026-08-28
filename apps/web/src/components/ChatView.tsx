@@ -1814,6 +1814,7 @@ function ChatViewContent(props: ChatViewProps) {
     environmentId,
     threadId,
     fixture: cloudDesktopVisualFixture,
+    compactLayout: shouldUseCompactRightPanel,
   });
   const cloudDesktopSession: CloudDesktopSession = visualFixtureSession ?? liveCloudDesktopSession;
   const activeCloudDesktopTabStatus = cloudDesktopCapability.enabled
