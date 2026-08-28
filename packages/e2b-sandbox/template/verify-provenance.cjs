@@ -1,7 +1,6 @@
 const crypto = require("node:crypto");
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 
 const lock = JSON.parse(fs.readFileSync("/opt/agentsin/image-provenance.lock.json", "utf8"));
@@ -43,7 +42,8 @@ if (packageDigest !== lock.resolvedAptPackagesSha256) {
 }
 
 const packageRoot = path.dirname(require.resolve("node-pty/package.json"));
-const architecture = os.arch();
+// oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone image verifier has no Effect runtime.
+const architecture = process.arch;
 const nativeCandidates = [
   "build/Release/pty.node",
   "build/Release/spawn-helper",
