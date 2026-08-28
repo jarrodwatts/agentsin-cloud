@@ -982,21 +982,87 @@ it.effect(
 
         runtime.setThreadFail(siblingThreadId, false);
         expect((yield* service.recoverPending()).billingPaused).toBe(1);
-        chain.setSubmit({
-          status: "applied",
-          providerActivityRef: "turnkey-workspace-funded",
-          txHash: `0x${"d".repeat(64)}` as EvmTransactionHash,
-          submittedAt: "2026-08-28T00:15:02.000Z",
+        const repository = makePostgresUsageSettlementRepository(pool);
+        const authorized = yield* Effect.promise(() =>
+          repository.claimLowBalance(
+            workspaceId,
+            settlementId,
+            "settler-workspace-crash",
+            "2026-08-28T00:15:02.000Z",
+            "2026-08-28T00:16:02.000Z",
+          ),
+        );
+        expect(authorized.workspaceRecoveryFenceId).toBe(activeWorkspaceFence.rows[0]!.fence_id);
+        const submissionPending = yield* Effect.promise(() =>
+          repository.setSubmissionPending(
+            authorized,
+            "settler-workspace-crash",
+            "2026-08-28T00:15:02.000Z",
+          ),
+        );
+        const applied = yield* Effect.promise(() =>
+          repository.recordTransfer(
+            submissionPending,
+            "settler-workspace-crash",
+            {
+              providerActivityRef: "turnkey-workspace-funded",
+              txHash: `0x${"d".repeat(64)}` as EvmTransactionHash,
+              submittedAt: "2026-08-28T00:15:02.000Z",
+            },
+            "2026-08-28T00:15:02.000Z",
+          ),
+        );
+        expect(applied).toMatchObject({
+          state: "transfer-applied",
+          workspaceRecoveryFenceId: activeWorkspaceFence.rows[0]!.fence_id,
         });
-        const funded = yield* settlementService(
+
+        const siblingSettlementId = "settlement-sibling-independent" as SettlementId;
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_usage_settlement_attempt (
+               workspace_id, settlement_id, thread_id, state, trigger_kind, wallet_id,
+               authorization_id, wallet_address, treasury_address, first_pricing_sequence,
+               last_pricing_sequence, accrual_count, upstream_delta_micro_usdc,
+               markup_delta_micro_usdc, total_delta_micro_usdc, request_fingerprint,
+               created_at, updated_at
+             ) VALUES ($1,$2,$3,'reconciliation-required','sandbox-paused',$4,$5,$6,$7,
+               2,2,1,100,5,105,$8,$9,$9)`,
+            [
+              workspaceId,
+              siblingSettlementId,
+              siblingThreadId,
+              walletId,
+              authorizationId,
+              walletAddress,
+              treasuryAddress,
+              NodeCrypto.createHash("sha256").update(siblingSettlementId).digest("hex"),
+              "2026-08-28T00:15:02.000Z",
+            ],
+          ),
+        );
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_usage_billing_fence (
+               workspace_id, thread_id, fence_id, episode, settlement_id, reason,
+               state, created_at, updated_at, paused_at
+             ) VALUES ($1,$2,'sibling-independent-fence',2,$3,
+               'provider-outcome-uncertain','paused',$4,$4,$4)`,
+            [workspaceId, siblingThreadId, siblingSettlementId, "2026-08-28T00:15:02.000Z"],
+          ),
+        );
+
+        const recovered = yield* settlementService(
           pool,
           chain,
           signer(),
           runtime.runtime,
-          "settler-workspace-funded",
-          "2026-08-28T00:15:03.000Z",
-        ).retryLowBalance(workspaceId, settlementId);
-        expect(funded.state).toBe("finalized");
+          "settler-workspace-recover-after-crash",
+          "2026-08-28T00:16:03.000Z",
+        ).recoverPending();
+        expect(recovered.finalized).toBe(1);
+        const funded = yield* Effect.promise(() => repository.get(workspaceId, settlementId));
+        expect(funded?.state).toBe("finalized");
         expect(
           (yield* Effect.promise(() =>
             pool.query(
@@ -1008,13 +1074,13 @@ it.effect(
         ).toBe(0);
         expect(
           (yield* Effect.promise(() =>
-            pool.query(
-              `SELECT 1 FROM cloud_usage_billing_fence
+            pool.query<{ readonly fence_id: string }>(
+              `SELECT fence_id FROM cloud_usage_billing_fence
                   WHERE workspace_id = $1 AND state <> 'cleared'`,
               [workspaceId],
             ),
-          )).rowCount,
-        ).toBe(0);
+          )).rows,
+        ).toEqual([{ fence_id: "sibling-independent-fence" }]);
       }),
     ),
 );

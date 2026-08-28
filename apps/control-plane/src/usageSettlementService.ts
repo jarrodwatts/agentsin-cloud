@@ -342,7 +342,6 @@ export const makeUsageSettlementService = (options: {
 
   const finalize = (
     attempt: UsageSettlementAttempt,
-    clearWorkspaceFence: boolean,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> =>
     Effect.gen(function* () {
       if (attempt.txHash === undefined || attempt.transferSubmittedAt === undefined) {
@@ -391,7 +390,6 @@ export const makeUsageSettlementService = (options: {
           options.processorId,
           receiptResult.success,
           options.now(),
-          clearWorkspaceFence,
         ),
       ).pipe(Effect.catch(() => holdFinalization("receipt-finalization-failed")));
     });
@@ -432,7 +430,6 @@ export const makeUsageSettlementService = (options: {
   const completeObservation = (
     attempt: UsageSettlementAttempt,
     observation: MonadSettlementObservation,
-    clearWorkspaceFence: boolean,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> => {
     switch (observation.status) {
       case "applied":
@@ -495,9 +492,7 @@ export const makeUsageSettlementService = (options: {
           ),
         ).pipe(
           Effect.flatMap((recorded) =>
-            recorded.state === "transfer-applied"
-              ? finalize(recorded, clearWorkspaceFence)
-              : Effect.succeed(recorded),
+            recorded.state === "transfer-applied" ? finalize(recorded) : Effect.succeed(recorded),
           ),
         );
       case "insufficientBalance":
@@ -572,7 +567,7 @@ export const makeUsageSettlementService = (options: {
     }
   };
 
-  const submitOnce = (attempt: UsageSettlementAttempt, clearWorkspaceFence: boolean) =>
+  const submitOnce = (attempt: UsageSettlementAttempt) =>
     options.settlement.submit(requestFor(attempt)).pipe(
       Effect.mapError((cause) =>
         serviceError(
@@ -596,32 +591,28 @@ export const makeUsageSettlementService = (options: {
           : closeNotApplied(attempt, undefined, "provider-submit-not-applied"),
       ),
       Effect.flatMap((submitted) =>
-        "state" in submitted
-          ? Effect.succeed(submitted)
-          : completeObservation(attempt, submitted, clearWorkspaceFence),
+        "state" in submitted ? Effect.succeed(submitted) : completeObservation(attempt, submitted),
       ),
     );
 
   const applyInspection = (
     attempt: UsageSettlementAttempt,
     observation: MonadSettlementObservation,
-    clearWorkspaceFence: boolean,
   ) =>
     observation.status === "notApplied" &&
     attempt.providerActivityRef === undefined &&
     observation.providerActivityRef === undefined
-      ? submitOnce(attempt, clearWorkspaceFence)
-      : completeObservation(attempt, observation, clearWorkspaceFence);
+      ? submitOnce(attempt)
+      : completeObservation(attempt, observation);
 
   const process = (
     initial: UsageSettlementAttempt,
-    clearWorkspaceFence = false,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> =>
     Effect.gen(function* () {
       if (initial.state === "finalized") return initial;
       if (initial.state === "low-balance-pause-pending") return yield* pauseForLowBalance(initial);
       if (initial.state === "transfer-applied") {
-        return yield* finalize(initial, clearWorkspaceFence);
+        return yield* finalize(initial);
       }
       const startsNewProviderGeneration =
         initial.state === "reserved" ||
@@ -656,9 +647,7 @@ export const makeUsageSettlementService = (options: {
           ),
         ),
       );
-      return "state" in inspected
-        ? inspected
-        : yield* applyInspection(pending, inspected, clearWorkspaceFence);
+      return "state" in inspected ? inspected : yield* applyInspection(pending, inspected);
     });
 
   const summarize = (
@@ -826,7 +815,7 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        return yield* process(attempt, true);
+        return yield* process(attempt);
       }),
     retryProviderFailure: (workspaceId, settlementId) =>
       Effect.gen(function* () {
@@ -843,7 +832,7 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        return yield* process(attempt, true);
+        return yield* process(attempt);
       }),
     retryAuthorization: (workspaceId, threadId) =>
       Effect.gen(function* () {
@@ -860,7 +849,7 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        if (existing !== undefined) return yield* process(existing, true);
+        if (existing !== undefined) return yield* process(existing);
         const attempts = yield* repositoryEffect("bind-authorization-recovery", () =>
           options.repository.claimReady({
             processorId: options.processorId,
@@ -877,7 +866,7 @@ export const makeUsageSettlementService = (options: {
         if (attempt === undefined) {
           return yield* serviceError("invalidRequest", "authorization-recovery-not-ready", false);
         }
-        return yield* process(attempt, true);
+        return yield* process(attempt);
       }),
   };
 };

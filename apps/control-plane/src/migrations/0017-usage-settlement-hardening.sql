@@ -7,7 +7,9 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE cloud_usage_settlement_attempt
   ADD COLUMN IF NOT EXISTS authorization_generation integer NOT NULL DEFAULT 1,
   ADD COLUMN IF NOT EXISTS provider_attempt_generation integer NOT NULL DEFAULT 1,
-  ADD COLUMN IF NOT EXISTS next_submit_not_before timestamptz;
+  ADD COLUMN IF NOT EXISTS next_submit_not_before timestamptz,
+  ADD COLUMN IF NOT EXISTS workspace_recovery_fence_id text,
+  ADD COLUMN IF NOT EXISTS workspace_recovery_authorized_at timestamptz;
 
 DO $$
 BEGIN
@@ -260,8 +262,36 @@ CREATE TABLE IF NOT EXISTS cloud_usage_billing_fence (
   )
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_per_thread
-  ON cloud_usage_billing_fence (workspace_id, thread_id) WHERE state <> 'cleared';
+DROP INDEX IF EXISTS cloud_usage_billing_fence_one_active_per_thread;
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_workspace_link
+  ON cloud_usage_billing_fence (workspace_id, thread_id, workspace_fence_id)
+  WHERE state <> 'cleared' AND workspace_fence_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_settlement_obligation
+  ON cloud_usage_billing_fence (
+    workspace_id, thread_id, COALESCE(settlement_id, recovery_settlement_id)
+  )
+  WHERE state <> 'cleared' AND workspace_fence_id IS NULL
+    AND COALESCE(settlement_id, recovery_settlement_id) IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_usage_billing_fence_one_active_unbound_obligation
+  ON cloud_usage_billing_fence (workspace_id, thread_id)
+  WHERE state <> 'cleared' AND workspace_fence_id IS NULL
+    AND settlement_id IS NULL AND recovery_settlement_id IS NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'cloud_usage_settlement_attempt'::regclass
+       AND conname = 'cloud_usage_settlement_attempt_workspace_recovery_fence_fk'
+  ) THEN
+    ALTER TABLE cloud_usage_settlement_attempt
+      ADD CONSTRAINT cloud_usage_settlement_attempt_workspace_recovery_fence_fk
+      FOREIGN KEY (workspace_id, workspace_recovery_fence_id)
+      REFERENCES cloud_usage_workspace_billing_fence (workspace_id, fence_id)
+      ON DELETE RESTRICT;
+  END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS cloud_usage_billing_fence_event (
   workspace_id uuid NOT NULL,
@@ -420,6 +450,16 @@ BEGIN
     END IF;
   ELSIF NEW.authorization_generation <> OLD.authorization_generation THEN
     RAISE EXCEPTION 'settlement authorization generation requires a new binding';
+  END IF;
+  IF OLD.workspace_recovery_fence_id IS NOT NULL AND ROW(
+    NEW.workspace_recovery_fence_id, NEW.workspace_recovery_authorized_at
+  ) IS DISTINCT FROM ROW(
+    OLD.workspace_recovery_fence_id, OLD.workspace_recovery_authorized_at
+  ) THEN
+    RAISE EXCEPTION 'settlement workspace recovery authorization is immutable once persisted';
+  END IF;
+  IF (NEW.workspace_recovery_fence_id IS NULL) <> (NEW.workspace_recovery_authorized_at IS NULL) THEN
+    RAISE EXCEPTION 'settlement workspace recovery authorization must be complete';
   END IF;
   RETURN NEW;
 END;
