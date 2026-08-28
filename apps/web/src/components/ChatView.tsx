@@ -170,7 +170,11 @@ import { PullRequestDetailPanel } from "./pullRequest/PullRequestDetailPanel";
 import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
-import { CloudDesktopInspector } from "./cloud/CloudDesktopInspector";
+import { CloudDesktopInspector, cloudDesktopTabStatus } from "./cloud/CloudDesktopInspector";
+import {
+  type CloudDesktopConnection,
+  useCloudDesktopInspector,
+} from "./cloud/useCloudDesktopInspector";
 import { CloudThreadStatusBar, CloudThreadTimelineFrame } from "./cloud/CloudThreadTimeline";
 import {
   cloudComposerBlockedReason,
@@ -573,10 +577,13 @@ function formatOutgoingPrompt(params: {
 const SCRIPT_TERMINAL_COLS = 120;
 const SCRIPT_TERMINAL_ROWS = 30;
 
-export interface CloudDesktopCapability {
-  /** Explicit provider capability; absent capability keeps the surface hidden. */
-  readonly enabled: boolean;
-}
+export type CloudDesktopCapability =
+  | { readonly enabled: false }
+  | {
+      /** The control plane still derives workspace and user identity from Better Auth. */
+      readonly enabled: true;
+      readonly connection: CloudDesktopConnection;
+    };
 
 const DEFAULT_CLOUD_DESKTOP_CAPABILITY: CloudDesktopCapability = { enabled: false };
 
@@ -1755,6 +1762,14 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  const cloudDesktopSession = useCloudDesktopInspector({
+    active: cloudDesktopCapability.enabled && activeRightPanelSurface?.kind === "cloud-desktop",
+    connection: cloudDesktopCapability.enabled ? cloudDesktopCapability.connection : null,
+    threadId,
+  });
+  const activeCloudDesktopTabStatus = cloudDesktopCapability.enabled
+    ? cloudDesktopTabStatus(cloudDesktopSession.snapshot)
+    : undefined;
   const [pullRequestTabStatuses, setPullRequestTabStatuses] = useState<
     Record<string, PullRequestTabStatus>
   >({});
@@ -6779,7 +6794,10 @@ function ChatViewContent(props: ChatViewProps) {
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "cloud-desktop" && cloudDesktopAvailable ? (
-      <CloudDesktopInspector />
+      <CloudDesktopInspector
+        snapshot={cloudDesktopSession.snapshot}
+        actions={cloudDesktopSession}
+      />
     ) : activeRightPanelSurface?.kind === "terminal" ? (
       <PersistentThreadTerminalPanel
         threadRef={activeThreadRef}
@@ -7353,6 +7371,9 @@ function ChatViewContent(props: ChatViewProps) {
           onAddAgents={addAgentsSurface}
           onAddCloudDesktop={addCloudDesktopSurface}
           cloudDesktopAvailable={cloudDesktopAvailable}
+          {...(activeCloudDesktopTabStatus === undefined
+            ? {}
+            : { cloudDesktopStatus: activeCloudDesktopTabStatus })}
           {...(rightPanelWidthStorageKey
             ? {
                 widthStorageKey: rightPanelWidthStorageKey,
@@ -7406,6 +7427,9 @@ function ChatViewContent(props: ChatViewProps) {
             onAddAgents={addAgentsSurface}
             onAddCloudDesktop={addCloudDesktopSurface}
             cloudDesktopAvailable={cloudDesktopAvailable}
+            {...(activeCloudDesktopTabStatus === undefined
+              ? {}
+              : { cloudDesktopStatus: activeCloudDesktopTabStatus })}
             {...(rightPanelWidthStorageKey
               ? {
                   widthStorageKey: rightPanelWidthStorageKey,

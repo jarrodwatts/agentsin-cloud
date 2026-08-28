@@ -145,6 +145,48 @@ describe("RightPanelTabs preview favicon", () => {
   });
 });
 
+describe("RightPanelTabs cloud desktop status", () => {
+  it("shows a compact live indicator and announces the status in the tab label", () => {
+    const html = renderToStaticMarkup(
+      <RightPanelTabs
+        mode="inline"
+        surfaces={[{ id: "cloud-desktop", kind: "cloud-desktop" }]}
+        activeSurfaceId="cloud-desktop"
+        pendingSurfaceIds={new Set()}
+        previewSessions={{}}
+        desktopByTabId={{}}
+        terminalLabelsById={new Map()}
+        onActivate={() => undefined}
+        onCloseSurface={() => undefined}
+        onCloseOtherSurfaces={() => undefined}
+        onCloseSurfacesToRight={() => undefined}
+        onCloseAllSurfaces={() => undefined}
+        onCopyFilePath={() => undefined}
+        onAddBrowser={() => undefined}
+        onAddTerminal={() => undefined}
+        onAddPullRequest={() => undefined}
+        onAddDiff={() => undefined}
+        onAddFiles={() => undefined}
+        onAddAgents={() => undefined}
+        cloudDesktopAvailable
+        cloudDesktopStatus="live"
+        liveAgentCount={0}
+        browserAvailable={false}
+        terminalAvailable={false}
+        diffAvailable={false}
+        filesAvailable={false}
+        pullRequestAvailable={false}
+        agentsAvailable={false}
+      >
+        <div>desktop content</div>
+      </RightPanelTabs>,
+    );
+
+    expect(html).toContain('data-cloud-desktop-tab-status="live"');
+    expect(html).toContain('<span class="sr-only">, live</span>');
+  });
+});
+
 describe("surface shortcuts", () => {
   const actions = [
     { shortcut: "B", available: true, label: "Browser" },

@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Real PostgreSQL coverage loads checked-in migrations into an isolated schema.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeHttp from "node:http";
 
 import type { AuthSessionId, ThreadId } from "@t3tools/contracts";
 import type {
@@ -10,18 +11,37 @@ import type {
   DesktopLeaseIdempotencyKey,
 } from "@t3tools/contracts/desktop-lease";
 import type { DesktopLeaseId, WorkspaceId } from "@t3tools/contracts/cloud";
+import {
+  InspectorClientFrame,
+  InspectorServerFrame,
+  type InspectorWorkerFrame,
+} from "@t3tools/contracts/inspector";
+import type { WorkerRelayInbound } from "@t3tools/contracts/worker";
 import { expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import { Pool } from "pg";
+import { WebSocket } from "ws";
 
 import { makeAgentComputerInputGate } from "../../worker/src/AgentComputerInputGate.ts";
+import type { ArtifactStorageService } from "./artifactStorage.ts";
+import type {
+  CloudThreadLifecycleAttempt,
+  CloudThreadLifecycleStore,
+} from "./cloudThreadLifecycleStore.ts";
+import { makeCloudRpc } from "./cloudRpc.ts";
+import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import {
   DesktopLeaseRepositoryError,
   makePostgresDesktopLeaseRepository,
 } from "./desktopLeaseRepository.ts";
 import { makeDesktopLeaseService, type DesktopControlPrincipal } from "./desktopLeaseService.ts";
+import type { ControlPlaneAuth } from "./http.ts";
+import { makeInspectorBridge } from "./inspectorBridge.ts";
+import type { ThreadEventStoreService } from "./threadEventStore.ts";
 import { makeInMemoryWorkerRouteRegistry, type ActiveWorkerRoute } from "./workerRelay.ts";
+import type { WorkspaceRepositoryService } from "./workspaces.ts";
 
 const postgresUrl = process.env.AGENTSIN_TEST_POSTGRES_URL;
 const workspaceA = "77777777-7777-4777-8777-777777777777" as WorkspaceId;
@@ -30,6 +50,8 @@ const threadId = "desktop-control-thread" as ThreadId;
 const now = "2026-08-27T12:00:00.000Z";
 const soon = "2026-08-27T12:00:30.000Z";
 const later = "2026-08-27T12:01:00.000Z";
+const encodeInspectorClient = Schema.encodeUnknownSync(Schema.fromJsonString(InspectorClientFrame));
+const decodeInspectorServer = Schema.decodeUnknownSync(Schema.fromJsonString(InspectorServerFrame));
 
 const binding = (workspaceId: WorkspaceId, routeGeneration = 1): DesktopControlBinding => ({
   workspaceId,
@@ -219,6 +241,82 @@ it.effect(
           acquireInput(workspaceB, "10000000-0000-4000-8000-000000000003", "take-a"),
         );
         expect(otherTenant.lease.binding.workspaceId).toBe(workspaceB);
+      }),
+    ),
+);
+
+it.effect(
+  "recovers an acquire idempotently for a replacement socket in the same auth session",
+  () =>
+    withPostgres((pool) =>
+      Effect.promise(async () => {
+        const repository = makePostgresDesktopLeaseRepository(pool);
+        const original = actor("user-a", "auth-acquire-recovery", "client-original");
+        const replacement = actor("user-a", "auth-acquire-recovery", "client-replacement");
+        const acquired = await repository.acquire(
+          acquireInput(
+            workspaceA,
+            "15000000-0000-4000-8000-000000000001",
+            "recover-acquire",
+            original,
+          ),
+        );
+        await repository.disconnect({
+          binding: binding(workspaceA),
+          actor: original,
+          idempotencyKey: "recover-acquire-disconnect" as DesktopLeaseIdempotencyKey,
+          now,
+          graceExpiresAt: soon,
+        });
+
+        const replayed = await repository.acquire(
+          acquireInput(
+            workspaceA,
+            "15000000-0000-4000-8000-000000000002",
+            "recover-acquire",
+            replacement,
+          ),
+        );
+        const duplicate = await repository.acquire(
+          acquireInput(
+            workspaceA,
+            "15000000-0000-4000-8000-000000000003",
+            "recover-acquire",
+            replacement,
+          ),
+        );
+        expect(replayed).toMatchObject({
+          disposition: "replayed",
+          lease: {
+            leaseId: acquired.lease.leaseId,
+            generation: acquired.lease.generation,
+            connectionState: "disconnected",
+            actor: { clientId: original.clientId },
+          },
+        });
+        expect(duplicate).toEqual(replayed);
+
+        await expect(
+          repository.acquire(
+            acquireInput(
+              workspaceA,
+              "15000000-0000-4000-8000-000000000004",
+              "recover-acquire",
+              actor("user-a", "auth-foreign", "client-foreign"),
+            ),
+          ),
+        ).rejects.toMatchObject({ code: "conflict" });
+        await expect(
+          repository.acquire({
+            ...acquireInput(
+              workspaceA,
+              "15000000-0000-4000-8000-000000000005",
+              "recover-acquire",
+              replacement,
+            ),
+            binding: binding(workspaceA, 2),
+          }),
+        ).rejects.toMatchObject({ code: "conflict" });
       }),
     ),
 );
@@ -528,5 +626,391 @@ it.effect("recovers a lost resume response on a new socket without replaying aut
       ).toMatchObject({ _tag: "Failure" });
       expect(authorityFrames).toHaveLength(3);
     }),
+  ),
+);
+
+it.effect("recovers a lost acquire response across an authenticated WebSocket replacement", () =>
+  withPostgres((pool) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const routeBinding = binding(workspaceA);
+        const routes = makeInMemoryWorkerRouteRegistry();
+        const gate = makeAgentComputerInputGate();
+        const authorityFrames: Array<DesktopAuthorityCommand> = [];
+        const workerCommands: Array<WorkerRelayInbound> = [];
+        const workerWaiters: Array<(frame: WorkerRelayInbound) => void> = [];
+        const nextWorkerCommand = () => {
+          const frame = workerCommands.shift();
+          if (frame !== undefined) return Promise.resolve(frame);
+          return new Promise<WorkerRelayInbound>((resolve) => workerWaiters.push(resolve));
+        };
+        routes.activate(
+          routeFor(routeBinding, (frame) => {
+            if (frame.type === "desktop.authority") authorityFrames.push(frame);
+            else {
+              const waiter = workerWaiters.shift();
+              if (waiter === undefined) workerCommands.push(frame);
+              else waiter(frame);
+            }
+            return true;
+          }),
+        );
+        const service = makeDesktopLeaseService({
+          repository: makePostgresDesktopLeaseRepository(pool),
+          routes,
+          tokenSecret: "real-postgres-desktop-token-secret-at-least-32-bytes",
+          now: () => Date.parse(now),
+          nextLeaseId: () => "70000000-0000-4000-8000-000000000001" as DesktopLeaseId,
+          ttlMs: 30_000,
+          disconnectGraceMs: 5_000,
+        });
+
+        let acquireCommitted!: () => void;
+        const acquireCommittedPromise = new Promise<void>((resolve) => {
+          acquireCommitted = resolve;
+        });
+        let releaseAcquireResponse!: () => void;
+        const acquireResponseBarrier = new Promise<void>((resolve) => {
+          releaseAcquireResponse = resolve;
+        });
+        let disconnected!: () => void;
+        const disconnectedPromise = new Promise<void>((resolve) => {
+          disconnected = resolve;
+        });
+        let acquireCalls = 0;
+        const desktopControl = {
+          ...service,
+          acquire: (desktopPrincipal, idempotencyKey) =>
+            Effect.gen(function* () {
+              const result = yield* service.acquire(desktopPrincipal, idempotencyKey);
+              acquireCalls += 1;
+              if (acquireCalls === 1) {
+                acquireCommitted();
+                yield* Effect.promise(() => acquireResponseBarrier);
+              }
+              return result;
+            }),
+          disconnect: (desktopPrincipal) =>
+            service.disconnect(desktopPrincipal).pipe(Effect.tap(() => Effect.sync(disconnected))),
+        } satisfies typeof service;
+
+        const attempt: CloudThreadLifecycleAttempt = {
+          workspaceId: workspaceA,
+          threadId,
+          attemptId: routeBinding.attemptId,
+          idempotencyKey: "wss-attempt",
+          requestFingerprint: "wss-attempt-fingerprint",
+          environmentId: routeBinding.environmentId,
+          environmentRevisionId: routeBinding.environmentRevisionId,
+          environmentRevisionHash: "revision-hash",
+          projectId: "project-1" as never,
+          providerInstanceId: "codex_personal" as never,
+          providerDriver: "codex" as never,
+          repositoryIdentity: {
+            canonicalKey: "github.com/jarrodwatts/agentsin-cloud",
+            locator: {
+              source: "git-remote",
+              remoteName: "origin",
+              remoteUrl: "https://github.com/jarrodwatts/agentsin-cloud.git",
+            },
+          },
+          workspaceDirectory: "/workspace/project",
+          state: "ready",
+          isCurrent: true,
+          sandboxId: routeBinding.sandboxId,
+          providerHandle: "e2b-handle-a",
+          workerId: routeBinding.workerId as never,
+          sealedBootstrapRef: "bootstrap-a",
+          createdAt: now,
+          updatedAt: now,
+        };
+        const auth: ControlPlaneAuth = {
+          handler: async () => new Response(),
+          api: {
+            getSession: async ({ headers }) => {
+              const token = headers.get("authorization");
+              return token === "Bearer auth-session-a"
+                ? {
+                    user: { id: "user-a", name: "User A" },
+                    session: { id: "auth-session-a" },
+                  }
+                : null;
+            },
+            generateOneTimeToken: async () => ({ token: "unused" }),
+          },
+        };
+        const workspaces = {
+          ensureForUser: () =>
+            Effect.succeed({
+              id: workspaceA,
+              ownerUserId: "user-a",
+              name: "Workspace A",
+              createdAt: now,
+            }),
+        } as unknown as WorkspaceRepositoryService;
+        const lifecycle = {
+          getCurrent: async (requestedWorkspace: WorkspaceId, requestedThread: ThreadId) =>
+            requestedWorkspace === workspaceA && requestedThread === threadId ? attempt : undefined,
+        } as CloudThreadLifecycleStore;
+        const artifacts = {
+          upload: () => Effect.die("unexpected artifact upload"),
+          download: () => Effect.die("unexpected artifact download"),
+        } as unknown as ArtifactStorageService;
+        const clientIds = ["socket-client-1", "socket-client-2"] as const;
+        let clientIndex = 0;
+        const bridge = makeInspectorBridge({
+          auth,
+          hostedOrigin: "https://control.example.com",
+          workspaces,
+          lifecycle,
+          routes,
+          artifacts,
+          desktopControl,
+          limits: { heartbeatIntervalMs: 60_000, reconnectGraceMs: 10_000 },
+          nextSessionId: () => "inspector-acquire-recovery" as never,
+          nextClientId: () => clientIds[clientIndex++]! as DesktopControlClientId,
+          nowMs: () => Date.parse(now),
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(bridge.dispose));
+
+        const eventStore = {
+          replayAfter: () => Effect.succeed({ events: [], nextSequence: 0, hasMore: false }),
+        } as unknown as ThreadEventStoreService;
+        const rpc = makeCloudRpc({
+          auth,
+          hostedOrigin: "https://control.example.com",
+          workspaces,
+          eventStore,
+        });
+        const server = yield* Effect.acquireRelease(
+          Effect.sync(() => NodeHttp.createServer((_request, response) => response.end())),
+          (server) =>
+            Effect.promise(
+              () =>
+                new Promise<void>((resolve) => {
+                  server.close(() => resolve());
+                }),
+            ),
+        );
+        const attachment = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            attachCloudRpcWebSocket({
+              server,
+              rpc,
+              inspector: bridge,
+              baseUrl: new URL("https://control.example.com"),
+              authenticationTimeoutMs: 1_000,
+            }),
+          ),
+          (activeAttachment) => Effect.sync(activeAttachment.detach),
+        );
+        void attachment;
+        yield* Effect.promise(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              server.once("error", reject);
+              server.listen(0, "127.0.0.1", () => resolve());
+            }),
+        );
+        const address = server.address();
+        if (address === null || typeof address === "string") return yield* Effect.die("no address");
+        const url = `ws://127.0.0.1:${address.port}/api/v1/inspector?threadId=${threadId}&attemptId=${routeBinding.attemptId}`;
+        const openSocket = () =>
+          new Promise<WebSocket>((resolve, reject) => {
+            const socket = new WebSocket(url, {
+              headers: {
+                authorization: "Bearer auth-session-a",
+                origin: "https://control.example.com",
+              },
+            });
+            socket.once("open", () => resolve(socket));
+            socket.once("error", reject);
+          });
+        const receiveFrame = (socket: WebSocket, type: InspectorServerFrame["type"]) =>
+          new Promise<InspectorServerFrame>((resolve, reject) => {
+            const onMessage = (payload: WebSocket.RawData) => {
+              try {
+                const frame = decodeInspectorServer(payload.toString());
+                if (frame.type !== type) return;
+                socket.off("message", onMessage);
+                socket.off("error", onError);
+                resolve(frame);
+              } catch (cause) {
+                onError(cause);
+              }
+            };
+            const onError = (cause: unknown) => {
+              socket.off("message", onMessage);
+              reject(cause);
+            };
+            socket.on("message", onMessage);
+            socket.once("error", onError);
+          });
+        const send = (socket: WebSocket, frame: InspectorClientFrame) =>
+          socket.send(encodeInspectorClient(frame));
+        const workerReady = (
+          sessionId: Extract<
+            WorkerRelayInbound,
+            { readonly type: "inspector.command" }
+          >["command"]["sessionId"],
+          sequence: number,
+        ): InspectorWorkerFrame => ({
+          type: "inspector.ready",
+          binding: {
+            protocolVersion: 1,
+            workspaceId: workspaceA,
+            threadId,
+            attemptId: routeBinding.attemptId as never,
+            environmentId: routeBinding.environmentId,
+            environmentRevisionId: routeBinding.environmentRevisionId,
+            providerInstanceId: "codex_personal" as never,
+            providerDriver: "codex" as never,
+            sandboxId: routeBinding.sandboxId,
+            workerId: routeBinding.workerId as never,
+            routeGeneration: routeBinding.routeGeneration,
+          },
+          sessionId,
+          sequence,
+          emittedAt: now,
+          capabilities: {
+            terminal: true,
+            files: true,
+            ports: true,
+            browserFrames: false,
+            browserInput: false,
+            desktopFrames: false,
+            desktopInput: false,
+            desktopBackend: "unsupported",
+          },
+        });
+
+        const firstSocket = yield* Effect.promise(openSocket);
+        const firstOpened = receiveFrame(firstSocket, "inspector.opened");
+        send(firstSocket, {
+          protocolVersion: 1,
+          type: "inspector.open",
+          threadId,
+          attemptId: routeBinding.attemptId as never,
+          resumeAfterSequence: -1,
+        });
+        const firstOpenCommand = yield* Effect.promise(nextWorkerCommand);
+        if (
+          firstOpenCommand.type !== "inspector.command" ||
+          firstOpenCommand.command.type !== "inspector.open"
+        ) {
+          return yield* Effect.die("expected inspector open command");
+        }
+        yield* bridge.inspectorFrames.handleFrame(
+          routes.get(workspaceA, routeBinding.sandboxId)!.lease,
+          workerReady(firstOpenCommand.command.sessionId, 0),
+        );
+        const opened = yield* Effect.promise(() => firstOpened);
+        if (opened.type !== "inspector.opened")
+          return yield* Effect.die("expected inspector opened");
+
+        const acquireFrame = {
+          protocolVersion: 1 as const,
+          type: "desktop.control.acquire" as const,
+          requestId: "lost-acquire-request" as never,
+          idempotencyKey: "lost-acquire-idempotency" as DesktopLeaseIdempotencyKey,
+        };
+        send(firstSocket, acquireFrame);
+        yield* Effect.promise(() => acquireCommittedPromise);
+        expect(authorityFrames).toHaveLength(1);
+        yield* gate.update(authorityFrames[0]!);
+        expect(gate.snapshot()).toMatchObject({ controller: "user", generation: 1 });
+        const firstClosed = new Promise<void>((resolve) =>
+          firstSocket.once("close", () => resolve()),
+        );
+        firstSocket.terminate();
+        yield* Effect.promise(() => firstClosed);
+        yield* Effect.promise(() => disconnectedPromise);
+        releaseAcquireResponse();
+        yield* bridge.drain;
+
+        const secondSocket = yield* Effect.promise(openSocket);
+        yield* Effect.addFinalizer(() => Effect.sync(() => secondSocket.terminate()));
+        const secondOpened = receiveFrame(secondSocket, "inspector.opened");
+        send(secondSocket, {
+          protocolVersion: 1,
+          type: "inspector.open",
+          threadId,
+          attemptId: routeBinding.attemptId as never,
+          sessionId: opened.sessionId,
+          resumeAfterSequence: opened.sequence,
+        });
+        const secondOpenCommand = yield* Effect.promise(nextWorkerCommand);
+        if (
+          secondOpenCommand.type !== "inspector.command" ||
+          secondOpenCommand.command.type !== "inspector.open"
+        ) {
+          return yield* Effect.die("expected resumed inspector open command");
+        }
+        yield* bridge.inspectorFrames.handleFrame(
+          routes.get(workspaceA, routeBinding.sandboxId)!.lease,
+          workerReady(secondOpenCommand.command.sessionId, 1),
+        );
+        yield* Effect.promise(() => secondOpened);
+
+        const recoveredResponse = receiveFrame(secondSocket, "desktop.control.state");
+        send(secondSocket, acquireFrame);
+        const recovered = yield* Effect.promise(() => recoveredResponse);
+        expect(authorityFrames).toHaveLength(1);
+        if (
+          recovered.type !== "desktop.control.state" ||
+          recovered.state.controller !== "disconnected" ||
+          recovered.resumeToken === undefined
+        ) {
+          return yield* Effect.die("expected disconnected acquire recovery proof");
+        }
+        expect(recovered.state.lease).toMatchObject({ generation: 1 });
+
+        const resumedResponse = receiveFrame(secondSocket, "desktop.control.state");
+        send(secondSocket, {
+          protocolVersion: 1,
+          type: "desktop.control.resume",
+          requestId: "lost-acquire-resume-request" as never,
+          leaseId: recovered.state.lease.leaseId,
+          generation: recovered.state.lease.generation,
+          resumeToken: recovered.resumeToken,
+          idempotencyKey: "lost-acquire-resume" as DesktopLeaseIdempotencyKey,
+        });
+        const resumed = yield* Effect.promise(() => resumedResponse);
+        expect(authorityFrames).toHaveLength(2);
+        yield* gate.update(authorityFrames[1]!);
+        if (resumed.type !== "desktop.control.state" || resumed.state.controller !== "user") {
+          return yield* Effect.die("expected resumed user authority");
+        }
+        expect(resumed.state).toMatchObject({ heldByCurrentClient: true });
+        expect(resumed.state.lease.generation).toBeGreaterThan(1);
+        expect(gate.snapshot()).toMatchObject({
+          controller: "user",
+          generation: resumed.state.lease.generation,
+        });
+        yield* gate.update(authorityFrames[0]!);
+        expect(gate.snapshot()).toMatchObject({ generation: resumed.state.lease.generation });
+
+        const staleInput = yield* Effect.exit(
+          service.authorizeAndDispatchInput(
+            principal(routeBinding, "auth-session-a", "socket-client-1"),
+            () => true,
+          ),
+        );
+        expect(staleInput).toMatchObject({ _tag: "Failure" });
+        const staleProof = yield* Effect.exit(
+          service.resume(principal(routeBinding, "auth-session-a", "socket-client-1"), {
+            protocolVersion: 1,
+            type: "desktop.control.resume",
+            requestId: "lost-acquire-stale-proof" as never,
+            leaseId: resumed.state.lease.leaseId,
+            generation: resumed.state.lease.generation,
+            resumeToken: recovered.resumeToken,
+            idempotencyKey: "lost-acquire-stale-proof" as DesktopLeaseIdempotencyKey,
+          }),
+        );
+        expect(staleProof).toMatchObject({ _tag: "Failure" });
+        expect(authorityFrames).toHaveLength(2);
+      }),
+    ),
   ),
 );

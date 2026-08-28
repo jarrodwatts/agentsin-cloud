@@ -533,7 +533,10 @@ export const makePostgresDesktopLeaseRepository = (pool: Pool): DesktopLeaseRepo
       const requestFingerprint = fingerprint({
         type: "acquire",
         binding: input.binding,
-        actor: input.actor,
+        actor: {
+          userId: input.actor.userId,
+          authSessionId: input.actor.authSessionId,
+        },
       });
       const replay = await eventIdempotency(
         client,

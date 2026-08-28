@@ -68,13 +68,25 @@ profiles, and environment values are never inspector frame fields. Clients retri
 from the Better Auth-protected inspector artifact endpoint, which derives the workspace from the
 session and requires the exact current thread attempt; no unauthenticated artifact route exists.
 
+The web renderer opens this transport only while the Desktop surface is visible. It keeps the last
+contiguous sequence cursor and the exact in-flight lease command in memory, so a socket reconnect
+can replay an acquire or resume whose response was lost without minting a second authority change.
+A recovered resume proof is then rotated through the required higher-generation handoff. Live
+desktop captures are fetched from the authenticated artifact endpoint; the UI never receives an R2
+object key. Input is enabled only when public lease state says the current server-generated socket
+holds the user lease. Other-user, disconnected, expired, unsupported, and reconnecting states are
+shown explicitly. Closing the surface sends a best-effort release, while the durable disconnect
+grace and expiry remain authoritative if the network has already failed.
+
 ## Current staging gaps
 
 C6 defines and secures the Browser, Desktop, and Port adapter boundaries but deliberately ships
 fail-closed unsupported adapters. Wiring an E2B-compatible browser capture, a real desktop codec,
-and public HTTP(S) port previews remains product integration work. Exclusive user input and
-Take Control remain C7. Inspector replay is intentionally bounded; when its live window is evicted,
-durable artifact/thread reconstruction must be supplied by the later client experience rather than
-fabricated by this transport. The C1 E2B template must provision an explicit checkout ACL when an
+and public HTTP(S) port previews remains product integration work. C7 and E3 provide the durable
+exclusive-control fence and its client experience, but do not pretend an unsupported E2B visual
+adapter exists. A hosted route must supply the renderer with the current lifecycle attempt and
+control-plane origin before the capability is exposed. Inspector replay is intentionally bounded;
+when its live window is evicted, the client fetches a fresh replaceable visual frame rather than
+fabricating missing history. The C1 E2B template must provision an explicit checkout ACL when an
 interactive inspector shell needs write access: the provider-owned checkout and inspector UID/GID
 are intentionally distinct, and C6 does not weaken ownership or make the checkout world-writable.

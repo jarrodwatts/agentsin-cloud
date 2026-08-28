@@ -413,7 +413,7 @@ export const makeDesktopLeaseService = (
           }),
         );
         yield* routeFor(result.lease.binding);
-        yield* sendAuthority(userAuthority(result.lease));
+        if (result.disposition === "applied") yield* sendAuthority(userAuthority(result.lease));
         const resumeToken = tokenFor(result.lease);
         return {
           state: publicState(result.lease, principal, isoNow()),

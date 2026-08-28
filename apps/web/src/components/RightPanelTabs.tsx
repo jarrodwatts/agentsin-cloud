@@ -42,6 +42,7 @@ import { PreviewPanelShell, type PreviewPanelMode } from "./preview/PreviewPanel
 import { FaviconImage } from "./preview/PreviewFaviconIcon";
 import { previewBridge } from "./preview/previewBridge";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
+import type { CloudDesktopTabStatus } from "./cloud/CloudDesktopInspector";
 
 const NOOP = () => undefined;
 
@@ -85,6 +86,7 @@ interface RightPanelTabsProps {
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
   cloudDesktopAvailable?: boolean;
+  cloudDesktopStatus?: CloudDesktopTabStatus;
   pullRequestStatuses?: Readonly<Record<string, PullRequestTabStatus>>;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
   liveAgentCount: number;
@@ -572,12 +574,14 @@ function SurfaceIcon({
   desktopByTabId,
   theme,
   pullRequestStatuses,
+  cloudDesktopStatus,
 }: {
   surface: RightPanelSurface;
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>;
   desktopByTabId: Readonly<Record<string, DesktopPreviewOverlay>>;
   theme: "light" | "dark";
   pullRequestStatuses: Readonly<Record<string, PullRequestTabStatus>> | undefined;
+  cloudDesktopStatus: CloudDesktopTabStatus | undefined;
 }) {
   switch (surface.kind) {
     case "preview": {
@@ -620,7 +624,26 @@ function SurfaceIcon({
     case "agents":
       return <Bot className="size-3 shrink-0" />;
     case "cloud-desktop":
-      return <MonitorUp className="size-3 shrink-0" />;
+      return (
+        <span className="relative shrink-0" data-cloud-desktop-tab-status={cloudDesktopStatus}>
+          <MonitorUp className="size-3" />
+          {cloudDesktopStatus === undefined ? null : (
+            <span
+              aria-hidden
+              className={cn(
+                "absolute -right-1 -bottom-1 size-1.5 rounded-full ring-1 ring-background",
+                cloudDesktopStatus === "live"
+                  ? "bg-emerald-400"
+                  : cloudDesktopStatus === "error"
+                    ? "bg-red-400"
+                    : cloudDesktopStatus === "unsupported"
+                      ? "bg-zinc-400"
+                      : "bg-amber-400",
+              )}
+            />
+          )}
+        </span>
+      );
   }
 }
 
@@ -876,6 +899,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       desktopByTabId={props.desktopByTabId}
                       theme={resolvedTheme}
                       pullRequestStatuses={props.pullRequestStatuses}
+                      cloudDesktopStatus={props.cloudDesktopStatus}
                     />
                     {pending ? (
                       <span
@@ -921,6 +945,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                           onClick={() => props.onActivate(surface)}
                         >
                           <span className="truncate">{title}</span>
+                          {surface.kind === "cloud-desktop" && props.cloudDesktopStatus ? (
+                            <span className="sr-only">, {props.cloudDesktopStatus}</span>
+                          ) : null}
                         </button>
                       }
                     />
