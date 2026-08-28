@@ -2246,7 +2246,8 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
       const fence = await client.query(
         `SELECT 1 FROM cloud_usage_billing_fence
           WHERE workspace_id = $1 AND thread_id = $2 AND settlement_id = $3
-            AND reason = 'provider-definitive-failure' AND state = 'paused'
+            AND reason IN ('provider-definitive-failure', 'provider-outcome-uncertain')
+            AND state = 'paused'
             AND (
               workspace_fence_id IS NULL OR NOT EXISTS (
                 SELECT 1 FROM cloud_usage_billing_fence sibling

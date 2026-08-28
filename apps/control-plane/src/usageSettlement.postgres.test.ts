@@ -825,9 +825,12 @@ it.effect(
           ),
         );
         yield* Effect.promise(() =>
+          pool.query('INSERT INTO "user" (id) VALUES ($1)', ["settlement-owner-other"]),
+        );
+        yield* Effect.promise(() =>
           pool.query("INSERT INTO workspace (id, owner_user_id, name) VALUES ($1,$2,$3)", [
             otherWorkspaceId,
-            "settlement-owner",
+            "settlement-owner-other",
             "Other settlement workspace",
           ]),
         );
@@ -1209,7 +1212,7 @@ it.effect("bounds definitive retries with a new auditable provider generation", 
   ),
 );
 
-it.effect("keeps one active hold while retry outcomes change reason", () =>
+it.effect("keeps workspace and later provider obligations separate", () =>
   withPostgres((pool) =>
     Effect.gen(function* () {
       const first = evidence("cross-reason", 1, 6_500, "0");
@@ -1259,22 +1262,31 @@ it.effect("keeps one active hold while retry outcomes change reason", () =>
       ).retryLowBalance(workspaceId, settlementId);
       expect(providerAgain.state).toBe("retry-waiting");
       const activeAfterProvider = yield* Effect.promise(() =>
-        pool.query<{ readonly fence_id: string; readonly reason: string }>(
-          `SELECT fence_id, reason FROM cloud_usage_billing_fence
+        pool.query<{
+          readonly fence_id: string;
+          readonly reason: string;
+          readonly workspace_fence_id: string | null;
+        }>(
+          `SELECT fence_id, reason, workspace_fence_id FROM cloud_usage_billing_fence
             WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'`,
           [workspaceId, threadId],
         ),
       );
-      expect(activeAfterProvider.rows).toEqual([
-        {
-          fence_id: activeAfterLow.rows[0]!.fence_id,
-          reason: "provider-definitive-failure",
-        },
-      ]);
+      expect(activeAfterProvider.rows).toHaveLength(2);
+      expect(activeAfterProvider.rows).toContainEqual({
+        fence_id: activeAfterLow.rows[0]!.fence_id,
+        reason: "insufficient-balance",
+        workspace_fence_id: expect.any(String),
+      });
+      expect(activeAfterProvider.rows).toContainEqual({
+        fence_id: expect.not.stringMatching(activeAfterLow.rows[0]!.fence_id),
+        reason: "provider-definitive-failure",
+        workspace_fence_id: null,
+      });
       const events = yield* Effect.promise(() =>
         pool.query<{ readonly reason: string }>(
           `SELECT reason FROM cloud_usage_billing_fence_event
-            WHERE workspace_id = $1 AND thread_id = $2 ORDER BY sequence`,
+            WHERE workspace_id = $1 AND thread_id = $2 ORDER BY recorded_at, fence_id, sequence`,
           [workspaceId, threadId],
         ),
       );
