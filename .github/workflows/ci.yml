@@ -16,8 +16,8 @@ concurrency:
 jobs:
   check:
     name: Check
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -64,8 +64,8 @@ jobs:
   # limit stays at the default 4 so peak load per runner is unchanged.
   test:
     name: Test
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -112,19 +112,26 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes bubblewrap
 
       - name: Prove worker and agent kernel isolation
-        run: >-
-          sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST=1
-          "$(command -v pnpm)" --filter @agentsin-cloud/worker exec vp test run
-          src/ProviderCredentialExecutor.root.test.ts
-          src/ProviderRuntimeSupervisor.root.test.ts
-          src/ContainedWorkspace.root.test.ts
-          src/InspectorPtySandbox.root.test.ts
-          src/main.root.test.ts
+        working-directory: apps/worker
+        env:
+          AGENTSIN_ROOT_SECURITY_TEST: "1"
+        run: |
+          # setup-vp guarantees this executable, while pnpm is an implementation
+          # detail that is not placed on PATH by every supported runner.
+          vp_bin="$(command -v vp)"
+          test -n "$vp_bin"
+          sudo env "PATH=$PATH" AGENTSIN_ROOT_SECURITY_TEST="$AGENTSIN_ROOT_SECURITY_TEST" \
+            "$vp_bin" test run \
+            src/ProviderCredentialExecutor.root.test.ts \
+            src/ProviderRuntimeSupervisor.root.test.ts \
+            src/ContainedWorkspace.root.test.ts \
+            src/InspectorPtySandbox.root.test.ts \
+            src/main.root.test.ts
 
   test_control_plane_coordination:
     name: Test Control Plane Coordination
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       valkey:
         image: valkey/valkey:8-alpine
@@ -190,8 +197,8 @@ jobs:
   # isolation that flag buys is preserved exactly.
   test_server:
     name: Test Server ${{ matrix.shard }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -257,8 +264,8 @@ jobs:
   # for checks that take under 3s, on the critical path of every PR.
   rust:
     name: Rust
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -285,7 +292,7 @@ jobs:
   # the diff cannot be resolved, the lint runs.
   mobile_native_changes:
     name: Mobile Native Changes
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -363,8 +370,8 @@ jobs:
     # Skip only on an explicit "no": a gate job that failed or errored leaves the
     # output empty, and that must run the lint rather than silently skip it.
     if: ${{ !cancelled() && needs.mobile_native_changes.outputs.changed != 'false' }}
-    runs-on: blacksmith-6vcpu-macos-26
-    timeout-minutes: 10
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -391,8 +398,8 @@ jobs:
 
   release_smoke:
     name: Release Smoke
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v6
