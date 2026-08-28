@@ -40,6 +40,7 @@ const migrate = async () => {
       "0009-github-worker-route-binding.sql",
       "0010-artifact-storage.sql",
       "0011-desktop-leases.sql",
+      "0012-user-wallets.sql",
     ];
     for (const filename of applicationMigrations) {
       const migration = await NodeFSP.readFile(

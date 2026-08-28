@@ -1,5 +1,5 @@
 const SENSITIVE_FIELD =
-  /(?:authorization|cookie|credential|dek|mnemonic|passphrase|password|private.?key|profile.?payload|secret|signing|token|wallet|wrapped.?key)/i;
+  /(?:assertion|authorization|cookie|credential|dek|email|mnemonic|passkey|passphrase|password|private.?key|profile.?payload|recovery.?(?:bundle|email)|secret|signing|stamp|token|wallet|wrapped.?key)/i;
 const BEARER_VALUE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const JWT_VALUE = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 const PRIVATE_KEY_VALUE = /\b(?:0x)?[0-9a-fA-F]{64}\b/g;

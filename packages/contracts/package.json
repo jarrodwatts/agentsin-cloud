@@ -19,6 +19,10 @@
       "types": "./src/onramp.ts",
       "import": "./src/onramp.ts"
     },
+    "./wallet": {
+      "types": "./src/wallet.ts",
+      "import": "./src/wallet.ts"
+    },
     "./worker": {
       "types": "./src/worker.ts",
       "import": "./src/worker.ts"
