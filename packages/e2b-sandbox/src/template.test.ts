@@ -13,6 +13,7 @@ import {
   E2B_DESKTOP_START_SCRIPT_SHA256,
   E2B_IMAGE_PROVENANCE_LOCK_SHA256,
   E2B_IMAGE_VERIFICATION_SCRIPT_SHA256,
+  E2B_PROCESS_IDENTITY_VERIFICATION_SCRIPT_SHA256,
   E2B_PROVENANCE_VERIFICATION_SCRIPT_SHA256,
   E2B_SANDBOX_START_SCRIPT_SHA256,
   E2B_TEMPLATE_DEFINITION_SHA256,
@@ -70,6 +71,9 @@ describe("immutable E2B worker image manifest", () => {
       E2B_IMAGE_VERIFICATION_SCRIPT_SHA256,
     );
     await expect(
+      sha256(new URL("../template/verify-process-identity.cjs", import.meta.url)),
+    ).resolves.toBe(E2B_PROCESS_IDENTITY_VERIFICATION_SCRIPT_SHA256);
+    await expect(
       sha256(new URL("../template/verify-provenance.cjs", import.meta.url)),
     ).resolves.toBe(E2B_PROVENANCE_VERIFICATION_SCRIPT_SHA256);
     await expect(sha256(new URL("../template/worker-package.json", import.meta.url))).resolves.toBe(
@@ -90,6 +94,9 @@ describe("immutable E2B worker image manifest", () => {
     );
     expect(dockerfile).toContain(
       "COPY packages/e2b-sandbox/template/start-worker.sh /opt/agentsin/start-worker.sh",
+    );
+    expect(dockerfile).toContain(
+      "COPY packages/e2b-sandbox/template/verify-process-identity.cjs /opt/agentsin/verify-process-identity.cjs",
     );
     expect(dockerfile).toContain("ENTRYPOINT /opt/agentsin/start-sandbox.sh");
 
@@ -122,6 +129,10 @@ describe("immutable E2B worker image manifest", () => {
       new URL("../template/verify-image.sh", import.meta.url),
       "utf8",
     );
+    const processVerifier = await NodeFSP.readFile(
+      new URL("../template/verify-process-identity.cjs", import.meta.url),
+      "utf8",
+    );
 
     expect(startDesktop).toContain("/usr/bin/setpriv");
     expect(startDesktop).toContain("--reuid=11002");
@@ -132,19 +143,23 @@ describe("immutable E2B worker image manifest", () => {
     expect(desktopSession).toContain("-localhost");
     expect(desktopSession).not.toMatch(/(^|\s)-ac(\s|$)/u);
     expect(desktopSession).not.toContain("-nopw");
+    expect(desktopSession).toContain('generation="$(mcookie)"');
+    expect(desktopSession).toContain("stat_fields[19]");
+    expect(desktopSession).toContain('>"${record_path}.tmp"');
     expect(desktopSession).toContain('record_pid Xvfb "${child_pid}"');
     expect(desktopSession).toContain('record_pid xfce4-session "${child_pid}"');
     expect(desktopSession).toContain('record_pid x11vnc "${child_pid}"');
     expect(desktopSession).toContain('record_pid novnc_proxy "${child_pid}"');
     expect(verifier).toContain("if 1 in security_types or 2 not in security_types:");
     expect(verifier).not.toContain("ps -eo");
-    expect(verifier).toContain('test -r "/proc/${pid}/status"');
-    expect(verifier).toContain('test -r "/proc/${pid}/cmdline"');
-    expect(verifier).toContain('"/proc/${pid}/status"');
-    expect(verifier).toContain("while IFS= read -r -d '' argument; do");
-    expect(verifier).toContain('[[ "${argument}" = "${expected_command}" ]]');
-    expect(verifier).not.toContain('cmdline" | grep');
-    expect(verifier).toContain("/run/agentsin/desktop/pids/Xvfb.pid");
+    expect(verifier).toContain("node /opt/agentsin/verify-process-identity.cjs");
+    expect(processVerifier).toContain("startAfter !== startBefore");
+    expect(processVerifier).toContain("executableAfter !== executableBefore");
+    expect(processVerifier).toContain("!recordAfter.bytes.equals(recordBefore.bytes)");
+    expect(processVerifier).toContain("stats.uid !== 0");
+    expect(processVerifier).toContain("!arraysEqual(argv, policy.argv)");
+    expect(processVerifier).toContain('executable: "/usr/bin/bash"');
+    expect(processVerifier).toContain('"/usr/share/novnc/utils/novnc_proxy"');
     expect(verifier).toContain("XAUTHORITY=/dev/null xdpyinfo");
     expect(verifier.indexOf("/opt/agentsin/start-sandbox.sh")).toBeLessThan(
       verifier.indexOf("node /opt/agentsin/verify-provenance.cjs"),

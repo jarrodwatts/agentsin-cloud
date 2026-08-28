@@ -44,6 +44,11 @@ export const agentsInCloudBaseTemplate = Template({
     mode: 0o555,
   })
   .copy(
+    "packages/e2b-sandbox/template/verify-process-identity.cjs",
+    "/opt/agentsin/verify-process-identity.cjs",
+    { mode: 0o444 },
+  )
+  .copy(
     "packages/e2b-sandbox/template/verify-provenance.cjs",
     "/opt/agentsin/verify-provenance.cjs",
     { mode: 0o444 },
