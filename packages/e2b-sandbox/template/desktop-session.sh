@@ -5,6 +5,7 @@ readonly desktop_root="/run/agentsin/desktop"
 readonly vnc_password_file="${desktop_root}/vnc.passwd"
 readonly xauthority_file="${desktop_root}/Xauthority"
 readonly xdg_runtime_directory="${desktop_root}/xdg"
+readonly pid_directory="${desktop_root}/pids"
 
 test "$(id -u)" = "11002"
 test "$(id -g)" = "11002"
@@ -21,21 +22,33 @@ export PATH="/usr/local/bin:/usr/bin:/bin"
 
 umask 077
 install -d -m 0700 "${XDG_RUNTIME_DIR}"
+install -d -m 0700 "${pid_directory}"
 rm -f "${XAUTHORITY}"
 xauth -f "${XAUTHORITY}" add "${DISPLAY}" MIT-MAGIC-COOKIE-1 "$(mcookie)"
 
+record_pid() {
+  local name="$1"
+  local pid="$2"
+  printf '%s\n' "${pid}" >"${pid_directory}/${name}.pid"
+}
+
 declare -a child_pids=()
+child_pid=""
 cleanup() {
   local pid
-  for pid in "${child_pids[@]:-}"; do
+  for pid in "${child_pids[@]}"; do
     kill "${pid}" 2>/dev/null || true
   done
-  wait 2>/dev/null || true
+  for pid in "${child_pids[@]}"; do
+    wait "${pid}" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT INT TERM
 
 Xvfb "${DISPLAY}" -auth "${XAUTHORITY}" -screen 0 1440x1024x24 -nolisten tcp &
-child_pids+=("$!")
+child_pid="$!"
+child_pids+=("${child_pid}")
+record_pid Xvfb "${child_pid}"
 for _ in $(seq 1 100); do
   if xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
     break
@@ -44,8 +57,10 @@ for _ in $(seq 1 100); do
 done
 xdpyinfo -display "${DISPLAY}" >/dev/null
 
-startxfce4 &
-child_pids+=("$!")
+xfce4-session &
+child_pid="$!"
+child_pids+=("${child_pid}")
+record_pid xfce4-session "${child_pid}"
 x11vnc \
   -display "${DISPLAY}" \
   -auth "${XAUTHORITY}" \
@@ -56,13 +71,17 @@ x11vnc \
   -rfbauth "${vnc_password_file}" \
   -noxdamage \
   -repeat &
-child_pids+=("$!")
+child_pid="$!"
+child_pids+=("${child_pid}")
+record_pid x11vnc "${child_pid}"
 /usr/share/novnc/utils/novnc_proxy \
   --vnc localhost:5900 \
   --listen 6080 \
   --web /usr/share/novnc \
   --heartbeat 30 &
-child_pids+=("$!")
+child_pid="$!"
+child_pids+=("${child_pid}")
+record_pid novnc_proxy "${child_pid}"
 
 set +e
 wait -n "${child_pids[@]}"

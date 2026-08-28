@@ -25,10 +25,13 @@ secret broker.
 The image verifier checks installed binaries, native PTY loading, distinct users, workspace ACLs,
 artifact hashes, empty secret directories, absent local login homes, and a real executable boot that
 must fail closed without a sealed bootstrap. Its desktop probe verifies the X/VNC processes run as
-the inspector UID, the agent UID cannot read the Xauthority or VNC password, unauthenticated X access
-fails, and VNC advertises password authentication without a no-auth option. A local hermetic canary
-additionally boots the worker, selects the hosted mTLS adapter, completes replay and heartbeat, and
-shuts down with fake in-memory ports only.
+the inspector UID by reading owner-only child PID files and checking the matching `/proc` status and
+command line. The agent UID cannot read the Xauthority or VNC password, unauthenticated X access
+fails, and VNC advertises password authentication without a no-auth option. Unexpected desktop exit
+is always fatal, including status zero; a clean worker exit is the separate intentional shutdown
+path. INT and TERM clean up exactly once and return deterministic signal-derived statuses. A local
+hermetic canary additionally boots the worker, selects the hosted mTLS adapter, completes replay and
+heartbeat, and shuts down with fake in-memory ports only.
 
 ## Release gate
 

@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Template tests hash checked-in filesystem inputs.
 import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeURL from "node:url";
 
 import { Template } from "e2b";
 import { describe, expect, it } from "vite-plus/test";
@@ -95,9 +97,15 @@ describe("immutable E2B worker image manifest", () => {
       new URL("../template/start-sandbox.sh", import.meta.url),
       "utf8",
     );
-    expect(supervisor).toContain('readonly bootstrap_ref="/run/agentsin/bootstrap/sealed.json"');
+    expect(supervisor).toContain('supervisor_bootstrap_ref="/run/agentsin/bootstrap/sealed.json"');
     expect(supervisor.match(/\/opt\/agentsin\/start-worker\.sh/g)).toHaveLength(1);
-    expect(supervisor).toContain('wait -n "${desktop_pid}" "${worker_pid}"');
+    expect(supervisor).not.toContain("wait -n");
+    expect(supervisor).not.toContain("set +e");
+    expect(supervisor).toContain(
+      'supervisor_observed_status="${supervisor_desktop_failure_status}"',
+    );
+    expect(supervisor).toContain("trap 'supervisor_handle_signal 130' INT");
+    expect(supervisor).toContain("trap 'supervisor_handle_signal 143' TERM");
     expect(supervisor).not.toContain('x11vnc -storepasswd "${vnc_password}"');
   });
 
@@ -124,12 +132,38 @@ describe("immutable E2B worker image manifest", () => {
     expect(desktopSession).toContain("-localhost");
     expect(desktopSession).not.toMatch(/(^|\s)-ac(\s|$)/u);
     expect(desktopSession).not.toContain("-nopw");
+    expect(desktopSession).toContain('record_pid Xvfb "${child_pid}"');
+    expect(desktopSession).toContain('record_pid xfce4-session "${child_pid}"');
+    expect(desktopSession).toContain('record_pid x11vnc "${child_pid}"');
+    expect(desktopSession).toContain('record_pid novnc_proxy "${child_pid}"');
     expect(verifier).toContain("if 1 in security_types or 2 not in security_types:");
-    expect(verifier).toContain("if ($1 != 11002) exit 1");
+    expect(verifier).not.toContain("ps -eo");
+    expect(verifier).toContain('test -r "/proc/${pid}/status"');
+    expect(verifier).toContain('test -r "/proc/${pid}/cmdline"');
+    expect(verifier).toContain('"/proc/${pid}/status"');
+    expect(verifier).toContain("while IFS= read -r -d '' argument; do");
+    expect(verifier).toContain('[[ "${argument}" = "${expected_command}" ]]');
+    expect(verifier).not.toContain('cmdline" | grep');
+    expect(verifier).toContain("/run/agentsin/desktop/pids/Xvfb.pid");
     expect(verifier).toContain("XAUTHORITY=/dev/null xdpyinfo");
     expect(verifier.indexOf("/opt/agentsin/start-sandbox.sh")).toBeLessThan(
       verifier.indexOf("node /opt/agentsin/verify-provenance.cjs"),
     );
+  });
+
+  it("distinguishes desktop, worker, and signal exits in the shell supervisor", () => {
+    const harness = NodeURL.fileURLToPath(
+      new URL("../template/start-sandbox.test.sh", import.meta.url),
+    );
+    const supervisor = NodeURL.fileURLToPath(
+      new URL("../template/start-sandbox.sh", import.meta.url),
+    );
+    const result = NodeChildProcess.spawnSync("/bin/bash", [harness, supervisor], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("sandbox supervisor harness passed");
   });
 
   it("refuses publication while apt and node-pty provenance remain unresolved", () => {

@@ -70,6 +70,10 @@ trap cleanup_supervisor EXIT INT TERM
 for _ in $(seq 1 200); do
   if [[ -s /run/agentsin/desktop/Xauthority ]] &&
     [[ -s /run/agentsin/desktop/vnc.passwd ]] &&
+    [[ -s /run/agentsin/desktop/pids/Xvfb.pid ]] &&
+    [[ -s /run/agentsin/desktop/pids/xfce4-session.pid ]] &&
+    [[ -s /run/agentsin/desktop/pids/x11vnc.pid ]] &&
+    [[ -s /run/agentsin/desktop/pids/novnc_proxy.pid ]] &&
     python3 - <<'PY'
 import socket
 with socket.create_connection(("127.0.0.1", 5900), timeout=0.1):
@@ -91,22 +95,42 @@ test "$(stat -c '%u:%g' /run/agentsin/desktop/Xauthority)" = "11002:11002"
 test "$(stat -c '%a' /run/agentsin/desktop/Xauthority)" = "600"
 test "$(stat -c '%u:%g' /run/agentsin/desktop/vnc.passwd)" = "11002:11002"
 test "$(stat -c '%a' /run/agentsin/desktop/vnc.passwd)" = "600"
+test "$(stat -c '%u:%g' /run/agentsin/desktop/pids)" = "11002:11002"
+test "$(stat -c '%a' /run/agentsin/desktop/pids)" = "700"
 ! setpriv --reuid=11001 --regid=11001 --clear-groups -- /usr/bin/test -r /run/agentsin/desktop/Xauthority
 ! setpriv --reuid=11001 --regid=11001 --clear-groups -- /usr/bin/test -r /run/agentsin/desktop/vnc.passwd
 ! setpriv --reuid=11001 --regid=11001 --clear-groups -- \
+  /usr/bin/test -r /run/agentsin/desktop/pids/Xvfb.pid
+! setpriv --reuid=11001 --regid=11001 --clear-groups -- \
   env DISPLAY=:0 XAUTHORITY=/dev/null xdpyinfo -display :0 >/dev/null 2>&1
 
-for _ in $(seq 1 100); do
-  if ps -eo comm= | awk '$1 == "xfce4-session" { found = 1 } END { exit !found }'; then
-    break
-  fi
-  sleep 0.05
-done
+verify_inspector_process() {
+  local name="$1"
+  local expected_command="$2"
+  local pid_file="/run/agentsin/desktop/pids/${name}.pid"
+  local argument
+  local command_found=0
+  local pid
+  test "$(stat -c '%u:%g' "${pid_file}")" = "11002:11002"
+  test "$(stat -c '%a' "${pid_file}")" = "600"
+  read -r pid <"${pid_file}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]]
+  test -r "/proc/${pid}/status"
+  test -r "/proc/${pid}/cmdline"
+  awk '$1 == "State:" { if ($2 == "Z") exit 1; state = 1 } $1 == "Uid:" && $2 == 11002 && $3 == 11002 && $4 == 11002 && $5 == 11002 { uid = 1 } END { exit !(state && uid) }' \
+    "/proc/${pid}/status"
+  while IFS= read -r -d '' argument; do
+    if [[ "${argument}" = "${expected_command}" ]]; then
+      command_found=1
+    fi
+  done <"/proc/${pid}/cmdline"
+  test "${command_found}" -eq 1
+}
 
-ps -eo uid=,comm= | awk '$2 == "Xvfb" { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
-ps -eo uid=,comm= | awk '$2 == "x11vnc" { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
-ps -eo uid=,args= | awk '$0 ~ /novnc_proxy/ { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
-ps -eo uid=,args= | awk '$0 ~ /xfce4-session/ { seen = 1; if ($1 != 11002) exit 1 } END { if (!seen) exit 1 }'
+verify_inspector_process Xvfb Xvfb
+verify_inspector_process xfce4-session xfce4-session
+verify_inspector_process x11vnc x11vnc
+verify_inspector_process novnc_proxy /usr/share/novnc/utils/novnc_proxy
 
 python3 - <<'PY'
 import socket
