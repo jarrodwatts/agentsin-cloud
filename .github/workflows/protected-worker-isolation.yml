@@ -92,6 +92,7 @@ jobs:
             .github/scripts/protected-worker-container-probe.mjs
             .github/scripts/protected-worker-isolation.sh
             .github/scripts/protected-worker-isolation.test.cjs
+            .github/scripts/protected-worker-mounts.jq
             .github/scripts/protected-worker-source-lib.cjs
             .github/scripts/protected-worker-source.cjs
             .github/workflows/protected-worker-isolation.yml

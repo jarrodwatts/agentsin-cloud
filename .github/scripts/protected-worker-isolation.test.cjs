@@ -21,6 +21,8 @@ const read = (relative) => readFileSync(path.join(repositoryRoot, relative), "ut
 const workflow = read(".github/workflows/protected-worker-isolation.yml");
 const normalCi = read(".github/workflows/ci.yml");
 const hostHarness = read(".github/scripts/protected-worker-isolation.sh");
+const mountValidationSource = read(".github/scripts/protected-worker-mounts.jq");
+const mountValidator = path.join(repositoryRoot, ".github/scripts/protected-worker-mounts.jq");
 const sourceHarness = read(".github/scripts/protected-worker-source.cjs");
 const sourceLibrary = read(".github/scripts/protected-worker-source-lib.cjs");
 const entrypoint = read(".github/scripts/protected-worker-container-entrypoint.sh");
@@ -199,7 +201,7 @@ test("normal pull-request CI never explicitly elevates its compatibility command
   assert.doesNotMatch(trustedJob, /PATH=\$PATH/u);
 });
 
-test("host harness stages inert bytes before hardened mountless execution", () => {
+test("host harness stages inert bytes before hardened controlled-mount execution", () => {
   for (const invariant of [
     "--read-only",
     "--network none",
@@ -212,6 +214,7 @@ test("host harness stages inert bytes before hardened mountless execution", () =
     "HostConfig.CapDrop",
     "HostConfig.SecurityOpt",
     "HostConfig.Binds",
+    "protected-worker-mounts.jq",
     "/proc/$container_pid/mountinfo",
     "docker wait",
   ]) {
@@ -247,10 +250,10 @@ test("host harness stages inert bytes before hardened mountless execution", () =
       finalCreate > stagingRemove &&
       finalStart > finalCreate,
   );
-  assert.match(stagingGuard, /State\.Status\}\}[^\n]+== "created"/u);
-  assert.match(stagingGuard, /State\.Running\}\}[^\n]+== "false"/u);
-  assert.match(stagingGuard, /HostConfig\.Binds\}\}[^\n]+== "null"/u);
-  assert.match(stagingGuard, /len \.Mounts\}\}[^\n]+== "0"/u);
+  assert.match(stagingGuard, /"created"[\s\S]+State\.Status\}\}/u);
+  assert.match(stagingGuard, /"false"[\s\S]+State\.Running\}\}/u);
+  assert.match(stagingGuard, /"null"[\s\S]+HostConfig\.Binds\}\}/u);
+  assert.match(stagingGuard, /"0"[\s\S]+len \.Mounts\}\}/u);
   assert.equal(hostHarness.match(/^assert_staging_inert$/gmu)?.length, 2);
   assert.match(hostHarness, /final_container_id="\$\(docker create[\s\S]+"\$staged_image_id"/u);
   assert.doesNotMatch(hostHarness, /docker (?:start|exec|wait) "\$staging_container_id"/u);
@@ -265,6 +268,188 @@ test("host harness stages inert bytes before hardened mountless execution", () =
   assert.match(cleanup, /docker rm --force "\$final_container_id"/u);
   assert.match(cleanup, /docker rm --force "\$staging_container_id"/u);
   assert.match(cleanup, /docker image rm --force "\$staged_image_id"/u);
+  assert.match(mountValidationSource, /\.HostConfig\.Binds == null/u);
+  assert.match(mountValidationSource, /\.HostConfig\.Tmpfs/u);
+  assert.match(mountValidationSource, /\.Mounts/u);
+  assert.doesNotMatch(
+    hostHarness.slice(finalCreate),
+    /docker inspect --format '\{\{len \.Mounts\}\}'/u,
+  );
+});
+
+const expectedTmpfsInspect = () => [
+  {
+    Config: { Volumes: null },
+    HostConfig: {
+      Binds: null,
+      Mounts: null,
+      VolumesFrom: null,
+      Tmpfs: {
+        "/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "/work": "rw,noexec,nosuid,nodev,size=4g,mode=1777",
+      },
+    },
+    Mounts: [],
+  },
+];
+
+const validateMountInspect = (inspect) =>
+  execFileSync("/usr/bin/jq", ["--exit-status", "--from-file", mountValidator], {
+    input: JSON.stringify(inspect),
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+const assertMountInspectRejected = (mutate, diagnostic) => {
+  const inspect = structuredClone(expectedTmpfsInspect());
+  mutate(inspect[0]);
+  assert.throws(
+    () => validateMountInspect(inspect),
+    (error) => {
+      assert.match(error.stderr, diagnostic);
+      return true;
+    },
+  );
+};
+
+test("Docker 28 reports legacy --tmpfs only in HostConfig.Tmpfs", () => {
+  const inspect = expectedTmpfsInspect();
+  assert.deepEqual(inspect[0].HostConfig.Tmpfs, {
+    "/tmp": "rw,noexec,nosuid,nodev,size=64m,mode=1777",
+    "/work": "rw,noexec,nosuid,nodev,size=4g,mode=1777",
+  });
+  assert.deepEqual(inspect[0].Mounts, []);
+  assert.doesNotThrow(() => validateMountInspect(inspect));
+
+  inspect[0].HostConfig.Tmpfs["/tmp"] = "mode=1777,size=64m,nodev,nosuid,noexec,rw";
+  assert.doesNotThrow(() => validateMountInspect(inspect));
+});
+
+test("mount validation rejects binds, volumes, host paths, and additional tmpfs mounts", () => {
+  assertMountInspectRejected((inspect) => {
+    inspect.HostConfig.Binds = ["/private/secret-marker:/host"];
+  }, /bind mounts are configured/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.HostConfig.Binds = [];
+  }, /bind mounts are configured/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.Mounts.push({
+      Type: "volume",
+      Source: "/var/lib/docker/volumes/worker/_data",
+      Destination: "/data",
+      Mode: "z",
+      RW: true,
+      Propagation: "",
+    });
+  }, /top-level runtime mounts must be empty/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.Mounts.push({
+      Type: "bind",
+      Source: "/private/secret-marker",
+      Destination: "/host",
+      Mode: "",
+      RW: false,
+      Propagation: "rprivate",
+    });
+  }, /top-level runtime mounts must be empty/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.Mounts = null;
+  }, /runtime mount report is missing/u);
+  assertMountInspectRejected((inspect) => {
+    delete inspect.Mounts;
+  }, /runtime mount report is missing/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.HostConfig.Tmpfs["/extra"] = "rw,noexec,nosuid,nodev,size=1m,mode=1777";
+  }, /tmpfs destinations must be exactly \/tmp and \/work/u);
+  assertMountInspectRejected((inspect) => {
+    delete inspect.HostConfig.Tmpfs["/work"];
+  }, /tmpfs destinations must be exactly \/tmp and \/work/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.HostConfig.Mounts = [{ Type: "tmpfs", Target: "/extra" }];
+  }, /structured mounts are configured/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.HostConfig.VolumesFrom = ["another-container:rw"];
+  }, /volumes-from is configured/u);
+  assertMountInspectRejected((inspect) => {
+    inspect.Config.Volumes = { "/anonymous": {} };
+  }, /image-declared volumes are configured/u);
+});
+
+test("mount validation enforces tmpfs security options and sizes without echoing inspect data", () => {
+  for (const [target, unsafeOptions, diagnostic] of [
+    ["/tmp", "rw,nosuid,nodev,size=64m,mode=1777", /\/tmp tmpfs options/u],
+    ["/tmp", "rw,noexec,nosuid,nodev,size=128m,mode=1777", /\/tmp tmpfs options/u],
+    ["/work", "rw,noexec,nosuid,nodev,size=4g,mode=0777", /\/work tmpfs options/u],
+  ]) {
+    assertMountInspectRejected((inspect) => {
+      inspect.HostConfig.Tmpfs[target] = unsafeOptions;
+    }, diagnostic);
+  }
+
+  const inspect = expectedTmpfsInspect();
+  inspect[0].Mounts.push({
+    Type: "bind",
+    Source: "/private/secret-marker",
+    Destination: "/host",
+    Mode: "",
+    RW: false,
+    Propagation: "rprivate",
+  });
+  assert.throws(
+    () => validateMountInspect(inspect),
+    (error) => {
+      assert.match(error.stderr, /top-level runtime mounts must be empty/u);
+      assert.doesNotMatch(error.stderr, /secret-marker/u);
+      return true;
+    },
+  );
+});
+
+test("host supplementary-group validation accepts only empty or 65534-only groups", () => {
+  const functionStart = hostHarness.indexOf("supplementary_groups_allowed() {");
+  const functionEnd = hostHarness.indexOf("\n}\n", functionStart) + 3;
+  const functionSource = hostHarness.slice(functionStart, functionEnd);
+  const validate = (groups) =>
+    execFileSync(
+      "bash",
+      ["-c", `${functionSource}\nsupplementary_groups_allowed "$1"`, "groups-test", groups],
+      { stdio: "pipe" },
+    );
+
+  assert.doesNotThrow(() => validate(""));
+  assert.doesNotThrow(() => validate("65534"));
+  assert.doesNotThrow(() => validate("65534 65534"));
+  assert.throws(() => validate("0"));
+  assert.throws(() => validate("65534 1234"));
+});
+
+test("every post-start host assertion has a stage-specific diagnostic", () => {
+  const finalStart = hostHarness.indexOf('docker start "$final_container_id"');
+  const postStart = hostHarness.slice(finalStart);
+  assert.doesNotMatch(postStart, /^\s*\[\[/gmu);
+  for (const diagnostic of [
+    "did not reach its base-owned observation gate",
+    "final container user is not 65534:65534",
+    "final container root filesystem is writable",
+    "final container network is enabled",
+    "final container capabilities were not all dropped",
+    "final container no-new-privileges is disabled",
+    "final container mount validation failed",
+    "final container PID is invalid",
+    "final container process has an unexpected UID",
+    "final container process has an unexpected GID",
+    "final container supplementary-group status is unavailable",
+    "final container process has an unauthorized supplementary group",
+    "final container process has effective capabilities",
+    "final container process does not enforce no-new-privileges",
+    "final container shares the host $namespace namespace",
+    "RUNNER_TEMP is visible in the protected container mounts",
+    "GITHUB_WORKSPACE is visible in the protected container mounts",
+    "Protected PR build/test exited with",
+    "final container inspection reported a nonzero exit",
+  ]) {
+    assert.ok(postStart.includes(diagnostic), `missing post-start diagnostic: ${diagnostic}`);
+  }
 });
 
 test("base-owned probe independently checks identity, caps, namespaces, network, files, and secrets", () => {
