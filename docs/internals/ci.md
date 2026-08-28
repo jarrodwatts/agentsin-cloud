@@ -16,10 +16,12 @@ quality gates on pull requests and pushes to `main`:
   harness always come from the protected default branch. It fetches the event's exact PR commit as
   inert data, rejects new or changed symlinks, submodules, and dependency-input drift, then builds
   and tests the worker as UID/GID 65534 inside a disposable digest-pinned container. The container
-  has no host mounts, network, capabilities, inherited credentials, or writable root filesystem. A
-  base-owned, hash-verified probe and the host harness independently verify identity, groups,
-  capabilities, mount/network/PID namespaces, host-file and secret denial, network denial, and the
-  final exit status. The ordinary **Test Worker Isolation Compatibility** job remains an
+  has no bind mounts, volumes, network, capabilities, inherited credentials, or writable root
+  filesystem. Its only writable paths are size-limited, `noexec`, `nosuid`, and `nodev` tmpfs
+  mounts at `/tmp` and `/work`. A base-owned, hash-verified probe and the host harness independently
+  verify identity, groups, capabilities, mount/network/PID namespaces, host-file and secret denial,
+  network denial, and the final exit status. The ordinary **Test Worker Isolation Compatibility**
+  job remains an
   unprivileged semantic check and does not itself elevate the test command. Like every ordinary
   `pull_request` job on a [GitHub-hosted Linux runner][runner-admin],
   it is compatibility feedback rather than a security boundary: the runner account has ambient

@@ -2,6 +2,29 @@
 set -euo pipefail
 export PATH=/usr/bin:/bin
 
+fail_invariant() {
+  printf 'Protected worker isolation invariant failed: %s\n' "$1" >&2
+  exit 1
+}
+
+require_equal() {
+  local expected="$1"
+  local actual="$2"
+  local message="$3"
+  if [[ "$actual" != "$expected" ]]; then
+    fail_invariant "$message"
+  fi
+}
+
+require_match() {
+  local value="$1"
+  local pattern="$2"
+  local message="$3"
+  if [[ ! "$value" =~ $pattern ]]; then
+    fail_invariant "$message"
+  fi
+}
+
 if (($# != 3)); then
   echo "usage: protected-worker-isolation.sh <protected-base> <pr-source> <oci-image>" >&2
   exit 1
@@ -52,10 +75,22 @@ staging_container_id="$(docker create \
   "$oci_image")"
 
 assert_staging_inert() {
-  [[ "$(docker inspect --format '{{.State.Status}}' "$staging_container_id")" == "created" ]]
-  [[ "$(docker inspect --format '{{.State.Running}}' "$staging_container_id")" == "false" ]]
-  [[ "$(docker inspect --format '{{json .HostConfig.Binds}}' "$staging_container_id")" == "null" ]]
-  [[ "$(docker inspect --format '{{len .Mounts}}' "$staging_container_id")" == "0" ]]
+  require_equal \
+    "created" \
+    "$(docker inspect --format '{{.State.Status}}' "$staging_container_id")" \
+    "staging container was not inert"
+  require_equal \
+    "false" \
+    "$(docker inspect --format '{{.State.Running}}' "$staging_container_id")" \
+    "staging container unexpectedly ran"
+  require_equal \
+    "null" \
+    "$(docker inspect --format '{{json .HostConfig.Binds}}' "$staging_container_id")" \
+    "staging container has bind mounts"
+  require_equal \
+    "0" \
+    "$(docker inspect --format '{{len .Mounts}}' "$staging_container_id")" \
+    "staging container has runtime mounts"
 }
 assert_staging_inert
 
@@ -103,7 +138,10 @@ tar -C "$pr_source" \
 
 assert_staging_inert
 staged_image_id="$(docker commit "$staging_container_id")"
-[[ "$staged_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+require_match \
+  "$staged_image_id" \
+  '^sha256:[0-9a-f]{64}$' \
+  "staged image does not have a content-addressed identifier"
 docker rm "$staging_container_id" >/dev/null
 staging_container_id=""
 
@@ -139,27 +177,60 @@ until docker exec --user 65534:65534 "$final_container_id" test -e /tmp/protecte
   sleep 0.25
 done
 
-[[ "$(docker inspect --format '{{.Config.User}}' "$final_container_id")" == "65534:65534" ]]
-[[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$final_container_id")" == "true" ]]
-[[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$final_container_id")" == "none" ]]
-[[ "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$final_container_id")" == '["ALL"]' ]]
-[[ "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$final_container_id")" == '["no-new-privileges:true"]' ]]
-[[ "$(docker inspect --format '{{json .HostConfig.Binds}}' "$final_container_id")" == "null" ]]
-[[ "$(docker inspect --format '{{len .Mounts}}' "$final_container_id")" == "0" ]]
+require_equal \
+  "65534:65534" \
+  "$(docker inspect --format '{{.Config.User}}' "$final_container_id")" \
+  "final container user is not 65534:65534"
+require_equal \
+  "true" \
+  "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$final_container_id")" \
+  "final container root filesystem is writable"
+require_equal \
+  "none" \
+  "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$final_container_id")" \
+  "final container network is enabled"
+require_equal \
+  '["ALL"]' \
+  "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$final_container_id")" \
+  "final container capabilities were not all dropped"
+require_equal \
+  '["no-new-privileges:true"]' \
+  "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$final_container_id")" \
+  "final container no-new-privileges is disabled"
+if ! docker inspect "$final_container_id" | \
+  /usr/bin/jq --exit-status --from-file \
+    "$protected_base/.github/scripts/protected-worker-mounts.jq" >/dev/null; then
+  fail_invariant "final container mount validation failed"
+fi
 
 container_pid="$(docker inspect --format '{{.State.Pid}}' "$final_container_id")"
-[[ "$container_pid" =~ ^[1-9][0-9]*$ ]]
+require_match "$container_pid" '^[1-9][0-9]*$' "final container PID is invalid"
 status="/proc/$container_pid/status"
-[[ "$(awk '/^Uid:/{print $2 ":" $3 ":" $4 ":" $5}' "$status")" == "65534:65534:65534:65534" ]]
-[[ "$(awk '/^Gid:/{print $2 ":" $3 ":" $4 ":" $5}' "$status")" == "65534:65534:65534:65534" ]]
-[[ "$(awk '/^Groups:/{sub(/^Groups:[[:space:]]*/, ""); print}' "$status")" == "65534" ]]
-[[ "$(awk '/^CapEff:/{print $2}' "$status")" =~ ^0+$ ]]
-[[ "$(awk '/^NoNewPrivs:/{print $2}' "$status")" == "1" ]]
-[[ "$(readlink "/proc/$container_pid/ns/mnt")" != "$(readlink /proc/self/ns/mnt)" ]]
-[[ "$(readlink "/proc/$container_pid/ns/net")" != "$(readlink /proc/self/ns/net)" ]]
-[[ "$(readlink "/proc/$container_pid/ns/pid")" != "$(readlink /proc/self/ns/pid)" ]]
-[[ "$(readlink "/proc/$container_pid/ns/ipc")" != "$(readlink /proc/self/ns/ipc)" ]]
-[[ "$(readlink "/proc/$container_pid/ns/uts")" != "$(readlink /proc/self/ns/uts)" ]]
+require_equal \
+  "65534:65534:65534:65534" \
+  "$(awk '/^Uid:/{print $2 ":" $3 ":" $4 ":" $5}' "$status")" \
+  "final container process has an unexpected UID"
+require_equal \
+  "65534:65534:65534:65534" \
+  "$(awk '/^Gid:/{print $2 ":" $3 ":" $4 ":" $5}' "$status")" \
+  "final container process has an unexpected GID"
+require_equal \
+  "65534" \
+  "$(awk '/^Groups:/{sub(/^Groups:[[:space:]]*/, ""); print}' "$status")" \
+  "final container process has supplementary groups"
+require_match \
+  "$(awk '/^CapEff:/{print $2}' "$status")" \
+  '^0+$' \
+  "final container process has effective capabilities"
+require_equal \
+  "1" \
+  "$(awk '/^NoNewPrivs:/{print $2}' "$status")" \
+  "final container process does not enforce no-new-privileges"
+for namespace in mnt net pid ipc uts; do
+  if [[ "$(readlink "/proc/$container_pid/ns/$namespace")" == "$(readlink "/proc/self/ns/$namespace")" ]]; then
+    fail_invariant "final container shares the host $namespace namespace"
+  fi
+done
 if grep -Fq "$runner_temp" "/proc/$container_pid/mountinfo"; then
   echo "RUNNER_TEMP is visible in the protected container mounts." >&2
   exit 1
@@ -182,5 +253,8 @@ if [[ "$wait_status" -ne 0 ]] || [[ "$container_exit" != "0" ]]; then
   echo "Protected PR build/test exited with ${container_exit:-timeout}." >&2
   exit 1
 fi
-[[ "$(docker inspect --format '{{.State.ExitCode}}' "$final_container_id")" == "0" ]]
+require_equal \
+  "0" \
+  "$(docker inspect --format '{{.State.ExitCode}}' "$final_container_id")" \
+  "final container inspection reported a nonzero exit"
 docker logs "$final_container_id"
