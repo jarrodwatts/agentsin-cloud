@@ -33,16 +33,7 @@ require(type == "array" and length == 1; "Docker inspect returned an unexpected 
     "/work tmpfs options must be rw,noexec,nosuid,nodev,size=4g,mode=1777"
   )
 | require((.Mounts | type) == "array"; "runtime mount report is missing")
-| require((.Mounts | length) == 2; "runtime mounts must contain exactly two entries")
-| require(all(.Mounts[]; .Type == "tmpfs"); "a bind or volume runtime mount is present")
 | require(
-    (.Mounts | map(.Destination) | sort) == ["/tmp", "/work"];
-    "runtime mount destinations must be exactly /tmp and /work"
-  )
-| require(all(.Mounts[]; .Source == ""); "a runtime mount exposes a source or host path")
-| require(all(.Mounts[]; .RW == true); "an authorized tmpfs is not writable")
-| require(all(.Mounts[]; (.Mode // "") == ""); "an authorized tmpfs has an unexpected mode field")
-| require(
-    all(.Mounts[]; (.Propagation // "") == "");
-    "an authorized tmpfs has unexpected propagation"
+    .Mounts == [];
+    "top-level runtime mounts must be empty; legacy --tmpfs is reported in HostConfig.Tmpfs"
   )

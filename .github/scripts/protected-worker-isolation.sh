@@ -25,6 +25,17 @@ require_match() {
   fi
 }
 
+supplementary_groups_allowed() {
+  local groups="$1"
+  local group
+  for group in $groups; do
+    if [[ "$group" != "65534" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 if (($# != 3)); then
   echo "usage: protected-worker-isolation.sh <protected-base> <pr-source> <oci-image>" >&2
   exit 1
@@ -214,10 +225,19 @@ require_equal \
   "65534:65534:65534:65534" \
   "$(awk '/^Gid:/{print $2 ":" $3 ":" $4 ":" $5}' "$status")" \
   "final container process has an unexpected GID"
-require_equal \
-  "65534" \
-  "$(awk '/^Groups:/{sub(/^Groups:[[:space:]]*/, ""); print}' "$status")" \
-  "final container process has supplementary groups"
+if ! supplementary_groups="$(awk '
+  /^Groups:/ {
+    found = 1
+    sub(/^Groups:[[:space:]]*/, "")
+    print
+  }
+  END { exit found ? 0 : 1 }
+' "$status")"; then
+  fail_invariant "final container supplementary-group status is unavailable"
+fi
+if ! supplementary_groups_allowed "$supplementary_groups"; then
+  fail_invariant "final container process has an unauthorized supplementary group"
+fi
 require_match \
   "$(awk '/^CapEff:/{print $2}' "$status")" \
   '^0+$' \
