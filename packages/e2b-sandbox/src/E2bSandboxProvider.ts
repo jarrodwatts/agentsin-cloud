@@ -1,5 +1,4 @@
 import * as NodeCrypto from "node:crypto";
-import * as NodePath from "node:path";
 
 import type {
   SandboxProvider,
@@ -20,10 +19,6 @@ import {
   type E2bSandboxProviderDependencies,
   type SandboxIdentityRecord,
 } from "./types.ts";
-
-const DEFAULT_MAX_INLINE_FILE_BYTES = 1024 * 1024;
-const DEFAULT_MAX_LIST_ENTRIES = 2_000;
-const DEFAULT_MAX_LIST_BYTES = 2 * 1024 * 1024;
 
 const error = (
   code: string,
@@ -74,30 +69,6 @@ const sha256 = (value: string | Uint8Array) =>
 
 const iso = (date: Date) => date.toISOString();
 const dateFromIso = (value: string) => DateTime.toDate(DateTime.makeUnsafe(value));
-
-const confinedPath = (workspaceDirectory: string, candidate: string | undefined) => {
-  const root = NodePath.posix.resolve(workspaceDirectory);
-  const resolved = NodePath.posix.resolve(root, candidate ?? ".");
-  if (resolved !== root && !resolved.startsWith(`${root}/`)) {
-    throw new E2bClientFailure({
-      code: "invalidRequest",
-      message: "Sandbox operation path must remain inside the thread workspace",
-      retryable: false,
-    });
-  }
-  return resolved;
-};
-
-const inlineFileContent = (bytes: Uint8Array) => {
-  try {
-    return {
-      content: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-      encoding: "utf8" as const,
-    };
-  } catch {
-    return { content: Buffer.from(bytes).toString("base64"), encoding: "base64" as const };
-  }
-};
 
 const createDispositionFrom = (failure: SandboxProviderError) => {
   if (typeof failure.details !== "object" || failure.details === null) return undefined;
@@ -164,44 +135,16 @@ export const makeE2bSandboxProvider = (
   dependencies: E2bSandboxProviderDependencies,
 ): SandboxProvider => {
   const activeTimeoutMs = dependencies.activeTimeoutMs ?? E2B_ACTIVE_TIMEOUT_MS;
-  const maxInlineFileBytes = dependencies.maxInlineFileBytes ?? DEFAULT_MAX_INLINE_FILE_BYTES;
-  const maxListEntries = dependencies.maxListEntries ?? DEFAULT_MAX_LIST_ENTRIES;
-  const maxListBytes = dependencies.maxListBytes ?? DEFAULT_MAX_LIST_BYTES;
 
-  const openExecutionWriters = async (request: Parameters<SandboxProvider["execute"]>[0]) => {
-    const stdout = await dependencies.artifacts.open({
-      workspaceId: request.workspaceId,
-      environmentId: request.environmentId,
-      sandboxId: request.sandboxId,
-      requestId: request.requestId,
-      kind: "command-stdout",
-      contentType: "text/plain; charset=utf-8",
-    });
-    try {
-      const stderr = await dependencies.artifacts.open({
-        workspaceId: request.workspaceId,
-        environmentId: request.environmentId,
-        sandboxId: request.sandboxId,
-        requestId: request.requestId,
-        kind: "command-stderr",
-        contentType: "text/plain; charset=utf-8",
-      });
-      return { stdout, stderr };
-    } catch (cause) {
-      await stdout.abort().catch(() => undefined);
-      throw cause;
-    }
-  };
-
-  const openPtyWriter = (request: Parameters<SandboxProvider["pty"]>[0]) =>
-    dependencies.artifacts.open({
-      workspaceId: request.workspaceId,
-      environmentId: request.environmentId,
-      sandboxId: request.sandboxId,
-      requestId: request.requestId,
-      kind: "pty-output",
-      contentType: "application/octet-stream",
-    });
+  const unsupportedWorkspaceOperation = (capability: "execute" | "files" | "pty") =>
+    Effect.fail(
+      error(
+        "E2B_UNSUPPORTED_CAPABILITY",
+        `Generic ${capability} access is disabled until the immutable worker image provides a kernel-enforced workspace boundary`,
+        false,
+        { capability },
+      ),
+    );
 
   const getIdentity = (request: {
     readonly sandboxId: SandboxIdentityRecord["sandboxId"];
@@ -290,9 +233,6 @@ export const makeE2bSandboxProvider = (
     capabilities: [
       "create",
       "connect",
-      "execute",
-      "files",
-      "pty",
       "pause",
       "resume",
       "snapshot",
@@ -677,168 +617,9 @@ export const makeE2bSandboxProvider = (
           completedAt,
         };
       }),
-    execute: (request) =>
-      Effect.gen(function* () {
-        const { identity } = yield* getRunning(request);
-        const cwd = yield* Effect.try({
-          try: () => confinedPath(identity.workspaceDirectory, request.cwd),
-          catch: (cause) => mapFailure("execute path validation", cause),
-        });
-        const startedAt = iso(dependencies.clock.now());
-        const output = yield* attempt("artifact open", () => openExecutionWriters(request));
-        const result = yield* attempt("execute", async () => {
-          try {
-            return await dependencies.client.execute(
-              identity.providerHandle,
-              {
-                command: request.command,
-                arguments: request.arguments,
-                cwd,
-                ...(request.environment === undefined ? {} : { environment: request.environment }),
-                ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
-              },
-              output,
-              activeTimeoutMs,
-            );
-          } catch (cause) {
-            await Promise.allSettled([output.stdout.abort(), output.stderr.abort()]);
-            throw cause;
-          }
-        });
-        return {
-          type: "executed",
-          requestId: request.requestId,
-          workspaceId: request.workspaceId,
-          sandboxId: request.sandboxId,
-          exitCode: result.exitCode,
-          ...(result.signal === undefined ? {} : { signal: result.signal }),
-          stdoutSummary: result.stdoutSummary,
-          stderrSummary: result.stderrSummary,
-          stdoutArtifact: result.stdoutArtifact,
-          stderrArtifact: result.stderrArtifact,
-          startedAt,
-          completedAt: iso(dependencies.clock.now()),
-        };
-      }),
-    files: (request) =>
-      Effect.gen(function* () {
-        const { identity } = yield* getRunning(request);
-        const operation = yield* Effect.try({
-          try: () => ({
-            ...request.operation,
-            path: confinedPath(identity.workspaceDirectory, request.operation.path),
-          }),
-          catch: (cause) => mapFailure("file path validation", cause),
-        });
-        const result = yield* attempt("files", () =>
-          dependencies.client.files(
-            identity.providerHandle,
-            operation,
-            {
-              maxReadBytes: maxInlineFileBytes,
-              maxListEntries,
-              maxListBytes,
-            },
-            activeTimeoutMs,
-          ),
-        );
-        if (result.type === "read") {
-          if (result.bytes.byteLength > maxInlineFileBytes) {
-            return yield* Effect.fail(
-              error(
-                "E2B_OUTPUT_LIMIT_EXCEEDED",
-                "File is too large for an inline sandbox response",
-                false,
-                { maxInlineFileBytes },
-              ),
-            );
-          }
-          const { content, encoding } = inlineFileContent(result.bytes);
-          return {
-            type: "files",
-            requestId: request.requestId,
-            workspaceId: request.workspaceId,
-            sandboxId: request.sandboxId,
-            result: {
-              type: "read",
-              path: result.path,
-              content,
-              encoding,
-              contentHash: sha256(result.bytes),
-            },
-            completedAt: iso(dependencies.clock.now()),
-          };
-        }
-        if (result.type === "list" && result.entries.length > maxListEntries) {
-          return yield* Effect.fail(
-            error(
-              "E2B_OUTPUT_LIMIT_EXCEEDED",
-              "Directory contains too many entries for an inline sandbox response",
-              false,
-              { maxListEntries },
-            ),
-          );
-        }
-        return {
-          type: "files",
-          requestId: request.requestId,
-          workspaceId: request.workspaceId,
-          sandboxId: request.sandboxId,
-          result,
-          completedAt: iso(dependencies.clock.now()),
-        };
-      }),
-    pty: (request) =>
-      Effect.gen(function* () {
-        const { identity } = yield* getRunning(request);
-        const operation = yield* Effect.try({
-          try: () =>
-            request.operation.type === "open"
-              ? {
-                  ...request.operation,
-                  cwd: confinedPath(identity.workspaceDirectory, request.operation.cwd),
-                }
-              : request.operation,
-          catch: (cause) => mapFailure("PTY path validation", cause),
-        });
-        const output =
-          request.operation.type === "open"
-            ? yield* attempt("PTY artifact open", () => openPtyWriter(request))
-            : undefined;
-        const result = yield* attempt("pty", async () => {
-          try {
-            return await dependencies.client.pty(
-              identity.providerHandle,
-              operation,
-              activeTimeoutMs,
-              output,
-            );
-          } catch (cause) {
-            await output?.abort().catch(() => undefined);
-            throw cause;
-          }
-        });
-        if ((result.outputSummary === undefined) !== (result.outputArtifact === undefined)) {
-          yield* Effect.exit(
-            attempt("PTY artifact abort", () => output?.abort() ?? Promise.resolve()),
-          );
-          return yield* Effect.fail(
-            error("E2B_INVALID_RESPONSE", "E2B returned incomplete PTY output metadata", false),
-          );
-        }
-        return {
-          type: "pty",
-          requestId: request.requestId,
-          workspaceId: request.workspaceId,
-          sandboxId: request.sandboxId,
-          ptyId: result.ptyId,
-          state: result.state,
-          ...(result.outputSummary === undefined || result.outputArtifact === undefined
-            ? {}
-            : { outputSummary: result.outputSummary, outputArtifact: result.outputArtifact }),
-          completedAt: iso(dependencies.clock.now()),
-        };
-      }),
+    execute: () => unsupportedWorkspaceOperation("execute"),
+    files: () => unsupportedWorkspaceOperation("files"),
+    pty: () => unsupportedWorkspaceOperation("pty"),
     pause: (request) =>
       Effect.gen(function* () {
         const { identity, remote } = yield* getActive(request);
@@ -1052,14 +833,17 @@ export const makeE2bSandboxProvider = (
       }),
   };
 
-  const withLifecycleLock = <A>(
-    request: { readonly sandboxId: SandboxIdentityRecord["sandboxId"] },
-    operation: () => Effect.Effect<A, SandboxProviderError>,
+  const withLifecycleLock = <
+    R extends { readonly sandboxId: SandboxIdentityRecord["sandboxId"] },
+    A,
+  >(
+    request: R,
+    operation: (lockedRequest: R) => Effect.Effect<A, SandboxProviderError>,
   ) =>
     Effect.tryPromise({
       try: () =>
         dependencies.lifecycleLocks.withLock(request.sandboxId, () =>
-          Effect.runPromise(operation()),
+          Effect.runPromise(operation(request)),
         ),
       catch: (cause) => {
         if (
@@ -1085,16 +869,16 @@ export const makeE2bSandboxProvider = (
 
   return {
     ...provider,
-    connect: (request) => withLifecycleLock(request, () => provider.connect(request)),
-    execute: (request) => withLifecycleLock(request, () => provider.execute(request)),
-    files: (request) => withLifecycleLock(request, () => provider.files(request)),
-    pty: (request) => withLifecycleLock(request, () => provider.pty(request)),
-    pause: (request) => withLifecycleLock(request, () => provider.pause(request)),
-    resume: (request) => withLifecycleLock(request, () => provider.resume(request)),
-    snapshot: (request) => withLifecycleLock(request, () => provider.snapshot(request)),
-    desktop: (request) => withLifecycleLock(request, () => provider.desktop(request)),
-    ports: (request) => withLifecycleLock(request, () => provider.ports(request)),
-    usage: (request) => withLifecycleLock(request, () => provider.usage(request)),
-    destroy: (request) => withLifecycleLock(request, () => provider.destroy(request)),
+    connect: (request) => withLifecycleLock(request, provider.connect),
+    execute: provider.execute,
+    files: provider.files,
+    pty: provider.pty,
+    pause: (request) => withLifecycleLock(request, provider.pause),
+    resume: (request) => withLifecycleLock(request, provider.resume),
+    snapshot: (request) => withLifecycleLock(request, provider.snapshot),
+    desktop: (request) => withLifecycleLock(request, provider.desktop),
+    ports: (request) => withLifecycleLock(request, provider.ports),
+    usage: (request) => withLifecycleLock(request, provider.usage),
+    destroy: (request) => withLifecycleLock(request, provider.destroy),
   };
 };

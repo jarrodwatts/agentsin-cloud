@@ -1,7 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "rootDir": ".",
+    "paths": {
+      "@t3tools/contracts": ["../contracts/src/index.ts"],
+      "@t3tools/contracts/cloud": ["../contracts/src/cloud.ts"]
+    },
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "template/**/*.ts"]

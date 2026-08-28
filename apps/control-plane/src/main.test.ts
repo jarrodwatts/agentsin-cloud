@@ -11,6 +11,7 @@ import { Pool } from "pg";
 import { type ControlPlaneConfigShape } from "./config.ts";
 import { type DatabaseService } from "./database.ts";
 import { makeMemoryEphemeralCoordination } from "./ephemeralCoordination.ts";
+import { CloudThreadLifecycleError } from "./cloudThreadLifecycle.ts";
 import { makeApplication, makeCloudThreadRecoveryLoop } from "./main.ts";
 import { type ThreadEventStoreService } from "./threadEventStore.ts";
 import {
@@ -118,7 +119,11 @@ it.effect("backs off a crashed lifecycle recovery drain and resumes it", () =>
             return calls;
           }).pipe(
             Effect.flatMap((attempt) =>
-              attempt === 1 ? Effect.fail("database unavailable") : Effect.succeed(0),
+              attempt === 1
+                ? Effect.fail(
+                    new CloudThreadLifecycleError({ code: "databaseFailure", retryable: true }),
+                  )
+                : Effect.succeed(0),
             ),
           ),
         10,

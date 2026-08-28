@@ -16,6 +16,8 @@ import { ArtifactStorage, productionArtifactStorageLayer } from "./artifactStora
 import { makeCloudRpc, type ThreadEventSignalHub } from "./cloudRpc.ts";
 import { attachCloudRpcWebSocket } from "./cloudRpcWebSocket.ts";
 import {
+  CloudThreadLifecycleDependencyError,
+  CloudThreadLifecycleError,
   makeCloudThreadLifecycle,
   type CloudThreadLifecycleDependencies,
 } from "./cloudThreadLifecycle.ts";
@@ -544,7 +546,10 @@ export interface HostedProductionDependencies extends WorkerProductionDependenci
 }
 
 export const makeCloudThreadRecoveryLoop = (
-  recoverPending: () => Effect.Effect<number, unknown>,
+  recoverPending: () => Effect.Effect<
+    number,
+    CloudThreadLifecycleError | CloudThreadLifecycleDependencyError
+  >,
   minimumDelayMs = 5_000,
   failureDelayMs = 30_000,
 ): Effect.Effect<never, never> => {

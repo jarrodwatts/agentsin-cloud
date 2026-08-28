@@ -135,6 +135,7 @@ const makeHarness = (options?: {
   readonly stderr?: string;
   readonly desktop?: boolean;
   readonly executeFailure?: E2bClientFailure;
+  readonly connectFailure?: E2bClientFailure;
   readonly identityReservationFailure?: boolean;
   readonly identityActivationFailure?: boolean;
   readonly reservationFailureUpdateFailure?: boolean;
@@ -170,6 +171,10 @@ const makeHarness = (options?: {
   let connectCalls = 0;
   const connectTimeouts: Array<number> = [];
   let executeCalls = 0;
+  let fileCalls = 0;
+  let ptyCalls = 0;
+  let portCalls = 0;
+  let identityGetCalls = 0;
   let createCalls = 0;
   let identityDestroyCalls = 0;
   let ptyOutputWriter: Parameters<E2bClient["pty"]>[3];
@@ -209,6 +214,7 @@ const makeHarness = (options?: {
     connect: async (_sandboxId, timeoutMs) => {
       connectCalls += 1;
       connectTimeouts.push(timeoutMs);
+      if (options?.connectFailure !== undefined) throw options.connectFailure;
       description = { ...description, state: "running" };
       return description;
     },
@@ -228,6 +234,7 @@ const makeHarness = (options?: {
       };
     },
     files: async (_sandboxId, operation, _limits) => {
+      fileCalls += 1;
       if (operation.type === "read") {
         return {
           type: "read",
@@ -245,6 +252,7 @@ const makeHarness = (options?: {
       return { type: operation.type, path: operation.path };
     },
     pty: async (_sandboxId, operation, _activeTimeoutMs, output) => {
+      ptyCalls += 1;
       if (operation.type === "open") {
         if (output === undefined) throw new Error("PTY output writer is required");
         ptyOutputWriter = output;
@@ -280,7 +288,10 @@ const makeHarness = (options?: {
             endpoint: "https://6080-sandbox-1.e2b.app",
             credentialRef: "e2b-traffic/sandbox-1",
           },
-    ports: async () => [{ internalPort: 3_000, endpoint: "https://3000-sandbox-1.e2b.app" }],
+    ports: async () => {
+      portCalls += 1;
+      return [{ internalPort: 3_000, endpoint: "https://3000-sandbox-1.e2b.app" }];
+    },
     observability: async () => [
       {
         timestamp: date("2026-08-27T12:01:00.000Z"),
@@ -384,6 +395,7 @@ const makeHarness = (options?: {
         });
       },
       get: async (_workspaceId, sandboxId) => {
+        identityGetCalls += 1;
         const identity = records.get(sandboxId);
         if (identity === undefined) return undefined;
         const reservationState = reservations.get(identity.reservationId)?.state;
@@ -512,6 +524,10 @@ const makeHarness = (options?: {
     connectCalls: () => connectCalls,
     connectTimeouts,
     executeCalls: () => executeCalls,
+    fileCalls: () => fileCalls,
+    ptyCalls: () => ptyCalls,
+    portCalls: () => portCalls,
+    identityGetCalls: () => identityGetCalls,
     ptyInputs,
     holdPause: () => {
       let signalEntered: () => void = () => undefined;
@@ -549,12 +565,14 @@ const makeHarness = (options?: {
 };
 
 describe("E2B SandboxProvider", () => {
-  it.effect("rejects a different thread and paths outside its workspace before execution", () =>
+  it.effect("rejects the wrong thread and disables generic workspace operations fail closed", () =>
     Effect.gen(function* () {
       const harness = makeHarness();
       const created = yield* harness.provider.create(createRequest);
+      const sandboxId = created.sandbox.sandboxId;
+      const identityGetsAfterCreate = harness.identityGetCalls();
       const wrongThread = harness.request(SandboxProviderConnectRequest, "connect", {
-        sandboxId: created.sandbox.sandboxId,
+        sandboxId,
         threadId: "thread-other",
       });
 
@@ -562,18 +580,52 @@ describe("E2B SandboxProvider", () => {
       expect(threadFailure.code).toBe("E2B_IDENTITY_MISMATCH");
       expect(harness.connectCalls()).toBe(0);
 
-      const traversalFailure = yield* Effect.flip(
+      const executeFailure = yield* Effect.flip(
         harness.provider.execute(
           harness.request(SandboxProviderExecuteRequest, "execute", {
-            sandboxId: created.sandbox.sandboxId,
-            command: "pwd",
-            arguments: [],
-            cwd: "../outside",
+            sandboxId,
+            command: "sh",
+            arguments: ["-lc", "cat /etc/shadow"],
+            cwd: "/workspace",
           }),
         ),
       );
-      expect(traversalFailure.code).toBe("E2B_INVALID_REQUEST");
+      const symlinkFailure = yield* Effect.flip(
+        harness.provider.files(
+          harness.request(SandboxProviderFilesRequest, "files", {
+            sandboxId,
+            operation: { type: "read", path: "/workspace/link-to-outside/secret" },
+          }),
+        ),
+      );
+      const ptyFailure = yield* Effect.flip(
+        harness.provider.pty(
+          harness.request(SandboxProviderPtyRequest, "pty", {
+            sandboxId,
+            operation: { type: "open", cwd: "/workspace", columns: 120, rows: 40 },
+          }),
+        ),
+      );
+
+      expect(harness.provider.capabilities).not.toContain("execute");
+      expect(harness.provider.capabilities).not.toContain("files");
+      expect(harness.provider.capabilities).not.toContain("pty");
+      expect(executeFailure).toMatchObject({
+        code: "E2B_UNSUPPORTED_CAPABILITY",
+        details: { capability: "execute" },
+      });
+      expect(symlinkFailure).toMatchObject({
+        code: "E2B_UNSUPPORTED_CAPABILITY",
+        details: { capability: "files" },
+      });
+      expect(ptyFailure).toMatchObject({
+        code: "E2B_UNSUPPORTED_CAPABILITY",
+        details: { capability: "pty" },
+      });
       expect(harness.executeCalls()).toBe(0);
+      expect(harness.fileCalls()).toBe(0);
+      expect(harness.ptyCalls()).toBe(0);
+      expect(harness.identityGetCalls()).toBe(identityGetsAfterCreate + 1);
     }),
   );
 
@@ -637,26 +689,6 @@ describe("E2B SandboxProvider", () => {
 
       expect(replay.sandbox).toEqual(first.sandbox);
       expect(harness.createCalls()).toBe(1);
-    }),
-  );
-
-  it.effect("stores full command output in R2 and keeps summaries bounded", () =>
-    Effect.gen(function* () {
-      const stdout = "a".repeat(8_000);
-      const harness = makeHarness({ stdout, stderr: "warning" });
-      const created = yield* harness.provider.create(createRequest);
-      const result = yield* harness.provider.execute(
-        harness.request(SandboxProviderExecuteRequest, "execute", {
-          sandboxId: created.sandbox.sandboxId,
-          command: "printf",
-          arguments: ["ok"],
-        }),
-      );
-
-      expect(result.stdoutSummary.length).toBeLessThanOrEqual(4_096);
-      expect(new TextDecoder().decode(harness.uploads[0]?.bytes)).toBe(stdout);
-      expect(new TextDecoder().decode(harness.uploads[1]?.bytes)).toBe("warning");
-      expect(result.stdoutArtifact.storage).toBe("r2");
     }),
   );
 
@@ -845,7 +877,7 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
-  it.effect("maps pause, resume, snapshot, files, PTY, ports, usage, and desktop", () =>
+  it.effect("maps pause, resume, snapshot, ports, usage, and desktop", () =>
     Effect.gen(function* () {
       const harness = makeHarness();
       const created = yield* harness.provider.create(createRequest);
@@ -860,36 +892,6 @@ describe("E2B SandboxProvider", () => {
       );
       expect(resumed.sandbox.state).toBe("ready");
       expect(harness.connectTimeouts).toEqual([900_000]);
-      const files = yield* harness.provider.files(
-        harness.request(SandboxProviderFilesRequest, "files", {
-          sandboxId,
-          operation: { type: "read", path: "/workspace/a" },
-        }),
-      );
-      expect(files.result.type).toBe("read");
-      const pty = yield* harness.provider.pty(
-        harness.request(SandboxProviderPtyRequest, "pty", {
-          sandboxId,
-          operation: { type: "open", columns: 120, rows: 40 },
-        }),
-      );
-      expect(pty.ptyId).toBe("41");
-      yield* harness.provider.pty(
-        harness.request(SandboxProviderPtyRequest, "pty", {
-          sandboxId,
-          operation: { type: "input", ptyId: pty.ptyId, data: "pwd\n" },
-        }),
-      );
-      const closedPty = yield* harness.provider.pty(
-        harness.request(SandboxProviderPtyRequest, "pty", {
-          sandboxId,
-          operation: { type: "close", ptyId: pty.ptyId },
-        }),
-      );
-      expect(harness.ptyInputs).toEqual(["pwd\n"]);
-      expect(closedPty.outputSummary).toBe("cloud prompt");
-      expect(closedPty.outputArtifact?.sizeBytes).toBe(12);
-      expect(new TextDecoder().decode(harness.uploads.at(-1)?.bytes)).toBe("cloud prompt");
       const ports = yield* harness.provider.ports(
         harness.request(SandboxProviderPortsRequest, "ports", { sandboxId }),
       );
@@ -935,12 +937,8 @@ describe("E2B SandboxProvider", () => {
         harness.request(SandboxProviderPauseRequest, "pause", { sandboxId }),
       );
       const failure = yield* Effect.flip(
-        harness.provider.execute(
-          harness.request(SandboxProviderExecuteRequest, "execute", {
-            sandboxId,
-            command: "true",
-            arguments: [],
-          }),
+        harness.provider.ports(
+          harness.request(SandboxProviderPortsRequest, "ports", { sandboxId }),
         ),
       );
 
@@ -980,7 +978,7 @@ describe("E2B SandboxProvider", () => {
     }),
   );
 
-  it.effect("serializes pause with execute so a paused sandbox cannot be auto-resumed", () =>
+  it.effect("serializes pause with ports so a paused sandbox cannot be auto-resumed", () =>
     Effect.gen(function* () {
       const harness = makeHarness();
       const created = yield* harness.provider.create(createRequest);
@@ -991,23 +989,19 @@ describe("E2B SandboxProvider", () => {
         .pipe(Effect.forkChild);
       yield* Effect.promise(() => hold.entered);
       const contended = harness.nextContention();
-      const execute = yield* Effect.flip(
-        harness.provider.execute(
-          harness.request(SandboxProviderExecuteRequest, "execute", {
-            sandboxId,
-            command: "true",
-            arguments: [],
-          }),
+      const ports = yield* Effect.flip(
+        harness.provider.ports(
+          harness.request(SandboxProviderPortsRequest, "ports", { sandboxId }),
         ),
       ).pipe(Effect.forkChild);
       yield* Effect.promise(() => contended);
 
-      expect(harness.executeCalls()).toBe(0);
+      expect(harness.portCalls()).toBe(0);
       hold.release();
       yield* Fiber.join(pause);
-      const failure = yield* Fiber.join(execute);
+      const failure = yield* Fiber.join(ports);
       expect(failure.code).toBe("E2B_SANDBOX_PAUSED");
-      expect(harness.executeCalls()).toBe(0);
+      expect(harness.portCalls()).toBe(0);
     }),
   );
 
@@ -1060,27 +1054,25 @@ describe("E2B SandboxProvider", () => {
   it.effect("returns typed sanitized upstream failures", () =>
     Effect.gen(function* () {
       const harness = makeHarness({
-        executeFailure: new E2bClientFailure({
+        connectFailure: new E2bClientFailure({
           code: "unavailable",
-          message: "E2B execute failed",
+          message: "E2B connect failed",
           retryable: true,
         }),
       });
       const created = yield* harness.provider.create(createRequest);
       const failure = yield* Effect.flip(
-        harness.provider.execute(
-          harness.request(SandboxProviderExecuteRequest, "execute", {
+        harness.provider.connect(
+          harness.request(SandboxProviderConnectRequest, "connect", {
             sandboxId: created.sandbox.sandboxId,
-            command: "false",
-            arguments: [],
           }),
         ),
       );
       expect(failure).toEqual({
         code: "E2B_UNAVAILABLE",
-        message: "E2B execute failed",
+        message: "E2B connect failed",
         retryable: true,
-        details: { operation: "execute" },
+        details: { operation: "connect" },
       });
     }),
   );
