@@ -41,10 +41,14 @@ test("protected workflow is default-branch-owned and read-only", () => {
   assert.match(workflow, /event_repository" == "\$GITHUB_REPOSITORY/u);
   assert.match(workflow, /event_base_repository" == "\$GITHUB_REPOSITORY/u);
   assert.match(workflow, /event_base_ref" == "\$event_default_branch/u);
-  assert.match(workflow, /event_base_sha" == "\$GITHUB_SHA/u);
+  assert.match(workflow, /GITHUB_REF" == "refs\/heads\/\$\{event_default_branch\}/u);
+  assert.doesNotMatch(workflow, /pull_request\.base\.sha|event_base_sha/u);
   assert.match(workflow, /PATH=\/usr\/bin:\/bin/u);
   assert.match(workflow, /GIT_CONFIG_GLOBAL=\/dev\/null/u);
   assert.match(workflow, /-c credential\.helper=/u);
+  assert.match(workflow, /ls-remote[\s\S]+--exit-code[\s\S]+--refs[\s\S]+"\$GITHUB_REF"/u);
+  assert.match(workflow, /remote_default_sha" == "\$GITHUB_SHA/u);
+  assert.match(workflow, /remote_default_ref" == "\$GITHUB_REF/u);
   assert.match(workflow, /\+\$\{GITHUB_SHA\}:refs\/aic\/protected-base/u);
   assert.match(workflow, /--no-recurse-submodules/u);
   assert.match(workflow, /":\(exclude\)\.repos"/u);
@@ -53,7 +57,7 @@ test("protected workflow is default-branch-owned and read-only", () => {
   assert.match(workflow, /\/usr\/bin\/sha256sum --check/u);
   assert.doesNotMatch(workflow, /GITHUB_TOKEN|github\.token|Authorization|extraheader/u);
   assert.ok(
-    workflow.indexOf('[[ "$event_base_sha" == "$GITHUB_SHA" ]]') <
+    workflow.indexOf('[[ "$remote_default_sha" == "$GITHUB_SHA" ]]') <
       workflow.indexOf('"+${GITHUB_SHA}:refs/aic/protected-base"'),
   );
   assert.ok(
@@ -69,6 +73,52 @@ test("protected workflow is default-branch-owned and read-only", () => {
   assert.ok(
     workflow.indexOf("Pull digest-pinned toolchain") < workflow.indexOf("Fetch inert PR source"),
   );
+});
+
+test("stale event base SHA is ignored while remote default drift fails closed", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "agentsin-protected-default-"));
+  const repository = path.join(root, "repository");
+  const runGit = (...args) =>
+    execFileSync("/usr/bin/git", ["-C", repository, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const acceptsProtectedBase = ({ githubRef, githubSha }) => {
+    if (githubRef !== "refs/heads/main") return false;
+    const remoteDefault = runGit("ls-remote", "--exit-code", "--refs", repository, githubRef);
+    const [remoteSha, remoteRef, ...extra] = remoteDefault.split("\t");
+    return extra.length === 0 && remoteSha === githubSha && remoteRef === githubRef;
+  };
+
+  try {
+    mkdirSync(repository);
+    execFileSync("/usr/bin/git", ["init", "--quiet", "--initial-branch=main", repository]);
+    runGit("config", "user.email", "protected-ci@example.invalid");
+    runGit("config", "user.name", "Protected CI");
+    writeFileSync(path.join(repository, "README.md"), "stale base\n");
+    runGit("add", "README.md");
+    runGit("commit", "--quiet", "-m", "stale event base");
+    const eventBaseSha = runGit("rev-parse", "HEAD");
+
+    writeFileSync(path.join(repository, "README.md"), "current default\n");
+    runGit("commit", "--quiet", "--all", "-m", "current default");
+    const githubSha = runGit("rev-parse", "HEAD");
+
+    assert.notEqual(eventBaseSha, githubSha);
+    assert.equal(
+      acceptsProtectedBase({ eventBaseSha, githubRef: "refs/heads/main", githubSha }),
+      true,
+    );
+
+    writeFileSync(path.join(repository, "README.md"), "remote moved\n");
+    runGit("commit", "--quiet", "--all", "-m", "remote moved");
+    assert.equal(
+      acceptsProtectedBase({ eventBaseSha, githubRef: "refs/heads/main", githubSha }),
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("protected base archive excludes unconfigured gitlinks without creating a checkout", () => {
@@ -149,7 +199,7 @@ test("normal pull-request CI never explicitly elevates its compatibility command
   assert.doesNotMatch(trustedJob, /PATH=\$PATH/u);
 });
 
-test("host harness enforces the nested-container boundary without mounts or inherited PATH", () => {
+test("host harness stages inert bytes before hardened mountless execution", () => {
   for (const invariant of [
     "--read-only",
     "--network none",
@@ -170,6 +220,51 @@ test("host harness enforces the nested-container boundary without mounts or inhe
   assert.doesNotMatch(hostHarness, /(?:--volume|-v\s|--mount|docker\.sock)/u);
   assert.doesNotMatch(hostHarness, /env\s+"?PATH=|sudo\s+env/u);
   assert.match(hostHarness, /sha256sum[\s\S]+protected-worker-container-probe\.mjs/u);
+
+  const stagingCreate = hostHarness.indexOf('staging_container_id="$(docker create');
+  const stagingGuardStart = hostHarness.indexOf("assert_staging_inert() {", stagingCreate);
+  const stagingGuardEnd = hostHarness.indexOf("}\nassert_staging_inert", stagingGuardStart);
+  const stagingGuard = hostHarness.slice(stagingGuardStart, stagingGuardEnd);
+  const stagingCheckBeforeCopy = hostHarness.indexOf("\nassert_staging_inert\n", stagingGuardEnd);
+  const prSourceArchive = hostHarness.indexOf('tar -C "$pr_source"', stagingCreate);
+  const prSourceCopy = hostHarness.indexOf(
+    'docker cp - "$staging_container_id:/opt"',
+    prSourceArchive,
+  );
+  const stagingCheckAfterCopy = hostHarness.indexOf("\nassert_staging_inert\n", prSourceCopy);
+  const imageCommit = hostHarness.indexOf('docker commit "$staging_container_id"');
+  const stagingRemove = hostHarness.indexOf('docker rm "$staging_container_id"', imageCommit);
+  const finalCreate = hostHarness.indexOf('final_container_id="$(docker create');
+  const finalStart = hostHarness.indexOf('docker start "$final_container_id"');
+  assert.ok(
+    stagingCreate >= 0 &&
+      stagingGuardStart > stagingCreate &&
+      stagingCheckBeforeCopy > stagingGuardEnd &&
+      prSourceCopy > stagingCheckBeforeCopy &&
+      stagingCheckAfterCopy > prSourceCopy &&
+      imageCommit > stagingCheckAfterCopy &&
+      stagingRemove > imageCommit &&
+      finalCreate > stagingRemove &&
+      finalStart > finalCreate,
+  );
+  assert.match(stagingGuard, /State\.Status\}\}[^\n]+== "created"/u);
+  assert.match(stagingGuard, /State\.Running\}\}[^\n]+== "false"/u);
+  assert.match(stagingGuard, /HostConfig\.Binds\}\}[^\n]+== "null"/u);
+  assert.match(stagingGuard, /len \.Mounts\}\}[^\n]+== "0"/u);
+  assert.equal(hostHarness.match(/^assert_staging_inert$/gmu)?.length, 2);
+  assert.match(hostHarness, /final_container_id="\$\(docker create[\s\S]+"\$staged_image_id"/u);
+  assert.doesNotMatch(hostHarness, /docker (?:start|exec|wait) "\$staging_container_id"/u);
+  assert.deepEqual(
+    [...hostHarness.matchAll(/docker start "\$(\w+)"/gu)].map((match) => match[1]),
+    ["final_container_id"],
+  );
+
+  const cleanupStart = hostHarness.indexOf("cleanup() {");
+  const cleanupEnd = hostHarness.indexOf("}\ntrap cleanup EXIT", cleanupStart);
+  const cleanup = hostHarness.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanup, /docker rm --force "\$final_container_id"/u);
+  assert.match(cleanup, /docker rm --force "\$staging_container_id"/u);
+  assert.match(cleanup, /docker image rm --force "\$staged_image_id"/u);
 });
 
 test("base-owned probe independently checks identity, caps, namespaces, network, files, and secrets", () => {
