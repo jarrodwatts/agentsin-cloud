@@ -815,7 +815,9 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        return yield* process(attempt);
+        const processed = yield* process(attempt);
+        yield* pausePendingBillingFences(now, leaseExpiresAt, 25);
+        return processed;
       }),
     retryProviderFailure: (workspaceId, settlementId) =>
       Effect.gen(function* () {
@@ -832,7 +834,9 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        return yield* process(attempt);
+        const processed = yield* process(attempt);
+        yield* pausePendingBillingFences(now, leaseExpiresAt, 25);
+        return processed;
       }),
     retryAuthorization: (workspaceId, threadId) =>
       Effect.gen(function* () {
@@ -849,7 +853,11 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        if (existing !== undefined) return yield* process(existing);
+        if (existing !== undefined) {
+          const processed = yield* process(existing);
+          yield* pausePendingBillingFences(now, leaseExpiresAt, 25);
+          return processed;
+        }
         const attempts = yield* repositoryEffect("bind-authorization-recovery", () =>
           options.repository.claimReady({
             processorId: options.processorId,
@@ -866,7 +874,9 @@ export const makeUsageSettlementService = (options: {
         if (attempt === undefined) {
           return yield* serviceError("invalidRequest", "authorization-recovery-not-ready", false);
         }
-        return yield* process(attempt);
+        const processed = yield* process(attempt);
+        yield* pausePendingBillingFences(now, leaseExpiresAt, 25);
+        return processed;
       }),
   };
 };

@@ -811,6 +811,7 @@ const persistWorkspaceRecoveryAuthorization = async (
     readonly workspaceId: WorkspaceId;
     readonly threadId: ThreadId;
     readonly settlementId: SettlementId;
+    readonly reason: Exclude<UsageBillingFence["reason"], "provider-outcome-uncertain">;
     readonly now: string;
   },
 ) => {
@@ -818,8 +819,8 @@ const persistWorkspaceRecoveryAuthorization = async (
   const workspaceFence = await client.query<{ readonly fence_id: string }>(
     `SELECT fence_id FROM cloud_usage_workspace_billing_fence
       WHERE workspace_id = $1 AND source_thread_id = $2 AND settlement_id = $3
-        AND state = 'active' FOR UPDATE`,
-    [input.workspaceId, input.threadId, input.settlementId],
+        AND reason = $4 AND state = 'active' FOR UPDATE`,
+    [input.workspaceId, input.threadId, input.settlementId, input.reason],
   );
   const fenceId = workspaceFence.rows[0]?.fence_id;
   if (fenceId === undefined) return undefined;
@@ -1291,6 +1292,7 @@ const insertAttempt = async (
       workspaceId: candidate.workspace_id as WorkspaceId,
       threadId: candidate.thread_id as ThreadId,
       settlementId,
+      reason: "authorization-unavailable",
       now: request.now,
     });
   }
@@ -1474,6 +1476,7 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         workspaceId,
         threadId: current.threadId,
         settlementId,
+        reason: "insufficient-balance",
         now,
       });
       const result = await client.query(
@@ -2218,6 +2221,7 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         workspaceId,
         threadId: current.threadId,
         settlementId,
+        reason: "provider-definitive-failure",
         now,
       });
       const attemptResult = await client.query<{
@@ -2343,6 +2347,7 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         workspaceId,
         threadId,
         settlementId: rebound.settlementId,
+        reason: "authorization-unavailable",
         now,
       });
       return requireAttempt(client, workspaceId, rebound.settlementId);
