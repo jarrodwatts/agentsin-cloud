@@ -139,7 +139,9 @@ import { useMediaQuery } from "../hooks/useMediaQuery";
 import {
   CLOUD_DESKTOP_INSPECTOR_DEFAULT_WIDTH,
   CLOUD_DESKTOP_INSPECTOR_WIDTH_STORAGE_KEY,
-  RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
+  performRightPanelToggleForLayout,
+  RIGHT_PANEL_COMPACT_LAYOUT_MEDIA_QUERY,
+  shouldCollapseRightPanelOnCompactEntry,
 } from "../rightPanelLayout";
 import {
   selectActiveRightPanel,
@@ -391,7 +393,7 @@ import {
   startAttachmentUpload,
 } from "../lib/attachmentUploadQueue";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
-import { RightPanelSheet } from "./RightPanelSheet";
+import { RightPanelCompactPane } from "./RightPanelCompactPane";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
 import { Button } from "./ui/button";
@@ -1521,7 +1523,8 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [pendingUserInputQuestionIndexByRequestId, setPendingUserInputQuestionIndexByRequestId] =
     useState<Record<string, number>>({});
-  const shouldUseRightPanelSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
+  const shouldUseCompactRightPanel = useMediaQuery(RIGHT_PANEL_COMPACT_LAYOUT_MEDIA_QUERY);
+  const previousCompactRightPanelRef = useRef<boolean | null>(null);
   const [terminalFocusRequestId, setTerminalFocusRequestId] = useState(0);
   const [pullRequestDialogState, setPullRequestDialogState] =
     useState<PullRequestDialogState | null>(null);
@@ -1818,14 +1821,10 @@ function ChatViewContent(props: ChatViewProps) {
     activeRightPanelSurface?.kind === "cloud-desktop"
       ? CLOUD_DESKTOP_INSPECTOR_WIDTH_STORAGE_KEY
       : undefined;
-  const rightPanelSheetNonModal =
-    shouldUseRightPanelSheet &&
-    activeRightPanelSurface?.kind === "cloud-desktop" &&
-    cloudDesktopAvailable;
-  const canMaximizeRightPanel = rightPanelOpen && !shouldUseRightPanelSheet;
+  const canMaximizeRightPanel = rightPanelOpen && !shouldUseCompactRightPanel;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
-  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !shouldUseRightPanelSheet;
+  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !shouldUseCompactRightPanel;
 
   useEffect(() => {
     if (!activeThreadRef) return;
@@ -3616,6 +3615,21 @@ function ChatViewContent(props: ChatViewProps) {
       useRightPanelStore.getState().close(activeThreadRef);
     }
   }, [activeThreadRef]);
+  useEffect(() => {
+    const previousCompact = previousCompactRightPanelRef.current;
+    previousCompactRightPanelRef.current = shouldUseCompactRightPanel;
+    if (
+      !shouldCollapseRightPanelOnCompactEntry(
+        previousCompact,
+        shouldUseCompactRightPanel,
+        rightPanelOpen,
+      )
+    ) {
+      return;
+    }
+    closePreviewPanel();
+    if (previousCompact === false) scheduleComposerFocus();
+  }, [closePreviewPanel, rightPanelOpen, scheduleComposerFocus, shouldUseCompactRightPanel]);
   const addTerminalSurface = useCallback(() => {
     if (!activeThreadRef || !activeThreadId || !activeProject) return;
     const cwd = gitCwd ?? activeProject.workspaceRoot;
@@ -3756,6 +3770,21 @@ function ChatViewContent(props: ChatViewProps) {
     }
     useRightPanelStore.getState().toggleVisibility(activeThreadRef);
   }, [activeThreadRef, closePreviewPanel, rightPanelOpen]);
+  const toggleRightPanelForCurrentLayout = useCallback(() => {
+    performRightPanelToggleForLayout({
+      compact: shouldUseCompactRightPanel,
+      panelOpen: rightPanelOpen,
+      closePanel: closePreviewPanel,
+      restoreComposerFocus: scheduleComposerFocus,
+      togglePanel: toggleRightPanel,
+    });
+  }, [
+    closePreviewPanel,
+    rightPanelOpen,
+    scheduleComposerFocus,
+    shouldUseCompactRightPanel,
+    toggleRightPanel,
+  ]);
   const toggleRightPanelMaximized = useCallback(() => {
     if (!canMaximizeRightPanel) return;
     setMaximizedRightPanelThreadKey((threadKey) =>
@@ -5229,7 +5258,7 @@ function ChatViewContent(props: ChatViewProps) {
       if (command === "rightPanel.toggle") {
         event.preventDefault();
         event.stopPropagation();
-        toggleRightPanel();
+        toggleRightPanelForCurrentLayout();
         return;
       }
 
@@ -5340,7 +5369,7 @@ function ChatViewContent(props: ChatViewProps) {
     onToggleDiff,
     settleThread,
     supportsSettlement,
-    toggleRightPanel,
+    toggleRightPanelForCurrentLayout,
     toggleRightPanelMaximized,
     toggleTerminalVisibility,
     composerRef,
@@ -6757,7 +6786,7 @@ function ChatViewContent(props: ChatViewProps) {
         rightPanelOpen && activeRightPanelSurface?.kind === "agents" ? 0 : agentPanelModel.liveCount
       }
       onToggleTerminal={toggleTerminalVisibility}
-      onToggleRightPanel={toggleRightPanel}
+      onToggleRightPanel={toggleRightPanelForCurrentLayout}
     />
   );
   const panelLayoutControls = (
@@ -6770,7 +6799,7 @@ function ChatViewContent(props: ChatViewProps) {
       )}
       data-workspace-titlebar-controls
     >
-      {rightPanelOpen && !shouldUseRightPanelSheet ? (
+      {rightPanelOpen && !shouldUseCompactRightPanel ? (
         <RightPanelMaximizeControl
           maximized={rightPanelMaximized}
           onToggle={toggleRightPanelMaximized}
@@ -6947,12 +6976,20 @@ function ChatViewContent(props: ChatViewProps) {
       className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
       data-app-shell-content
     >
-      {rightPanelOpen && !shouldUseRightPanelSheet ? panelLayoutControls : null}
+      {rightPanelOpen && !shouldUseCompactRightPanel ? panelLayoutControls : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
-          rightPanelMaximized ? "w-0 flex-none" : "flex-1",
+          shouldUseCompactRightPanel && rightPanelOpen
+            ? "hidden"
+            : rightPanelMaximized
+              ? "w-0 flex-none"
+              : "flex-1",
         )}
+        aria-hidden={shouldUseCompactRightPanel && rightPanelOpen ? "true" : undefined}
+        data-chat-column-compact-panel-away={
+          shouldUseCompactRightPanel && rightPanelOpen ? "true" : "false"
+        }
         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
       >
         {/* Top bar */}
@@ -7346,7 +7383,7 @@ function ChatViewContent(props: ChatViewProps) {
         ))}
       </div>
 
-      {!shouldUseRightPanelSheet && rightPanelOpen && activeThreadRef ? (
+      {!shouldUseCompactRightPanel && rightPanelOpen && activeThreadRef ? (
         <RightPanelTabs
           mode="inline"
           maximized={rightPanelMaximized}
@@ -7392,19 +7429,14 @@ function ChatViewContent(props: ChatViewProps) {
           {rightPanelContent}
         </RightPanelTabs>
       ) : null}
-      {shouldUseRightPanelSheet && rightPanelOpen && activeThreadRef ? (
-        <RightPanelSheet
-          open
-          onClose={closePreviewPanel}
-          bottomInset={isDraftHeroState ? 0 : composerOverlayHeight}
-          nonModal={rightPanelSheetNonModal}
-        >
+      {shouldUseCompactRightPanel && rightPanelOpen && activeThreadRef ? (
+        <RightPanelCompactPane onClose={toggleRightPanelForCurrentLayout}>
           <RightPanelTabs
             mode="sheet"
             // Same effective inset as the closed-state titlebar controls
             // (pr-3 in the tab bar plus this pixel equals the absolute
             // right inset plus mr-px), so the cluster does not creep when
-            // the sheet opens.
+            // the compact workspace opens.
             layoutControls={<div className="mr-px flex items-center">{panelToggleControls}</div>}
             surfaces={rightPanelState.surfaces}
             activeSurfaceId={activeRightPanelSurface?.id ?? null}
@@ -7447,7 +7479,7 @@ function ChatViewContent(props: ChatViewProps) {
           >
             {rightPanelContent}
           </RightPanelTabs>
-        </RightPanelSheet>
+        </RightPanelCompactPane>
       ) : null}
 
       {expandedImage && (

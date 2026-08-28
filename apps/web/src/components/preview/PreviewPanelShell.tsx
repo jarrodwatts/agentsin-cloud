@@ -10,6 +10,7 @@ import {
 import { isElectron } from "~/env";
 import { useResizableWidth } from "~/hooks/useResizableWidth";
 import { cn } from "~/lib/utils";
+import { FOCUS_CANVAS_CHAT_MIN_WIDTH } from "~/rightPanelLayout";
 
 import { RightPanelResizeHandle } from "./RightPanelResizeHandle";
 
@@ -31,12 +32,13 @@ const PREVIEW_PANEL_DEFAULT_WIDTH = 540;
  * fullscreen) the remaining 30% of the viewport minus the sidebar left the
  * sibling below its usable width and the composer overflowed.
  */
-const SIBLING_COLUMN_MIN_WIDTH = 360;
 
 export function getPreviewPanelMaxWidth(viewportWidth: number, containerWidth?: number): number {
   const fractionCap = Math.floor(viewportWidth * PREVIEW_PANEL_MAX_WIDTH_FRACTION);
   const containerCap =
-    containerWidth === undefined ? Infinity : Math.floor(containerWidth) - SIBLING_COLUMN_MIN_WIDTH;
+    containerWidth === undefined
+      ? Infinity
+      : Math.floor(containerWidth) - FOCUS_CANVAS_CHAT_MIN_WIDTH;
   // Never below the panel's own minimum: when the row cannot fit both
   // columns' minimums the sibling yields, and useResizableWidth's clamp
   // must not see max < min (it would resolve the inversion to min and,
