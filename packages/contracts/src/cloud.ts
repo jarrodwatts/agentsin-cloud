@@ -9,6 +9,7 @@
  */
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as SchemaGetter from "effect/SchemaGetter";
 
 import {
   ApprovalRequestId,
@@ -135,7 +136,13 @@ export const EvmAddress = TrimmedNonEmptyString.check(Schema.isPattern(/^0x[0-9a
 export type EvmAddress = typeof EvmAddress.Type;
 export const EvmTransactionHash = TrimmedNonEmptyString.check(
   Schema.isPattern(/^0x[0-9a-fA-F]{64}$/),
-).pipe(Schema.brand("EvmTransactionHash"));
+).pipe(
+  Schema.decode({
+    decode: SchemaGetter.transform((value) => value.toLowerCase()),
+    encode: SchemaGetter.transform((value) => value.toLowerCase()),
+  }),
+  Schema.brand("EvmTransactionHash"),
+);
 export type EvmTransactionHash = typeof EvmTransactionHash.Type;
 
 export const MONAD_MAINNET_CHAIN_ID = 143 as const;
@@ -2375,6 +2382,7 @@ export type UsageSettlementTrigger = typeof UsageSettlementTrigger.Type;
 
 export const UsageSettlementAttemptState = Schema.Literals([
   "reserved",
+  "retry-waiting",
   "submission-pending",
   "reconciliation-required",
   "transfer-applied",

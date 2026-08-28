@@ -21,6 +21,8 @@ import type { Pool, PoolClient, QueryResultRow } from "pg";
 
 export const SETTLEMENT_INTERVAL_MS = 5 * 60_000;
 export const SETTLEMENT_AMOUNT_THRESHOLD_MICRO_USDC = 250_000;
+export const SETTLEMENT_RETRY_BASE_MS = 5_000;
+export const SETTLEMENT_RETRY_MAX_MS = 5 * 60_000;
 
 export class UsageSettlementRepositoryError extends Error {
   readonly code: "conflict" | "notFound" | "configurationMissing" | "databaseFailure";
@@ -40,6 +42,7 @@ export interface UsageSettlementAttempt {
   readonly trigger: UsageSettlementTrigger;
   readonly walletId: WalletId;
   readonly authorizationId: WalletDelegatedAuthorizationId;
+  readonly authorizationGeneration: number;
   readonly walletAddress: EvmAddress;
   readonly treasuryAddress: EvmAddress;
   readonly firstPricingSequence: number;
@@ -48,8 +51,11 @@ export interface UsageSettlementAttempt {
   readonly markupDeltaMicroUsdc: SignedMicroUsdc;
   readonly totalDeltaMicroUsdc: number;
   readonly requestFingerprint: string;
+  readonly providerAttemptGeneration: number;
+  readonly providerIdempotencyKey: string;
   readonly postings: ReadonlyArray<UsageSettlementAccrualPosting>;
   readonly providerActivityRef?: string;
+  readonly nextSubmitNotBefore?: string;
   readonly txHash?: EvmTransactionHash;
   readonly transferSubmittedAt?: string;
   readonly failureCode?: string;
@@ -59,6 +65,26 @@ export interface UsageSettlementAttempt {
   readonly updatedAt: string;
   readonly finalizedAt?: string;
   readonly receipt?: UsageSettlementReceipt;
+  readonly billingFenceId?: string;
+}
+
+export interface UsageBillingFence {
+  readonly fenceId: string;
+  readonly workspaceId: WorkspaceId;
+  readonly threadId: ThreadId;
+  readonly settlementId?: SettlementId;
+  readonly reason:
+    | "insufficient-balance"
+    | "authorization-unavailable"
+    | "provider-definitive-failure"
+    | "provider-outcome-uncertain";
+  readonly state: "pause-pending" | "paused" | "cleared";
+  readonly processingOwner?: string;
+  readonly processingLeaseExpiresAt?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly pausedAt?: string;
+  readonly clearedAt?: string;
 }
 
 export interface UsageSettlementClaimRequest {
@@ -69,6 +95,7 @@ export interface UsageSettlementClaimRequest {
   readonly trigger?: "sandbox-paused" | "sandbox-closed";
   readonly workspaceId?: WorkspaceId;
   readonly threadId?: ThreadId;
+  readonly recoverAuthorizationFence?: boolean;
 }
 
 export interface UsageSettlementRepository {
@@ -114,9 +141,24 @@ export interface UsageSettlementRepository {
     failureCode: string,
     now: string,
   ) => Promise<UsageSettlementAttempt>;
+  readonly markFinalizationRequired: (
+    attempt: UsageSettlementAttempt,
+    processorId: string,
+    failureCode: string,
+    now: string,
+  ) => Promise<UsageSettlementAttempt>;
+  readonly closeProviderAttemptNotApplied: (
+    attempt: UsageSettlementAttempt,
+    processorId: string,
+    providerActivityRef: string | undefined,
+    failureCode: string,
+    now: string,
+    nextSubmitNotBefore: string,
+  ) => Promise<UsageSettlementAttempt>;
   readonly markLowBalancePausePending: (
     attempt: UsageSettlementAttempt,
     processorId: string,
+    providerActivityRef: string | undefined,
     failureCode: string,
     now: string,
   ) => Promise<UsageSettlementAttempt>;
@@ -137,6 +179,31 @@ export interface UsageSettlementRepository {
     failureCode: string,
     now: string,
   ) => Promise<void>;
+  readonly claimPendingBillingFences: (
+    processorId: string,
+    now: string,
+    leaseExpiresAt: string,
+    limit: number,
+  ) => Promise<ReadonlyArray<UsageBillingFence>>;
+  readonly markBillingFencePaused: (
+    fence: UsageBillingFence,
+    processorId: string,
+    pausedAt: string,
+  ) => Promise<UsageBillingFence>;
+  readonly claimProviderFailureRetry: (
+    workspaceId: WorkspaceId,
+    settlementId: SettlementId,
+    processorId: string,
+    now: string,
+    leaseExpiresAt: string,
+  ) => Promise<UsageSettlementAttempt>;
+  readonly claimAuthorizationRecovery: (
+    workspaceId: WorkspaceId,
+    threadId: ThreadId,
+    processorId: string,
+    now: string,
+    leaseExpiresAt: string,
+  ) => Promise<UsageSettlementAttempt | undefined>;
 }
 
 interface CandidateRow extends QueryResultRow {
@@ -149,6 +216,7 @@ interface CandidateRow extends QueryResultRow {
 interface AuthorizationRow extends QueryResultRow {
   readonly wallet_id: string;
   readonly authorization_id: string;
+  readonly authorization_generation: number;
   readonly wallet_address: string;
   readonly treasury_address: string;
   readonly per_charge_limit_micro_usdc: string;
@@ -179,6 +247,7 @@ interface AttemptRow extends QueryResultRow {
   readonly trigger_kind: UsageSettlementTrigger;
   readonly wallet_id: string;
   readonly authorization_id: string;
+  readonly authorization_generation: number;
   readonly wallet_address: string;
   readonly treasury_address: string;
   readonly first_pricing_sequence: string;
@@ -187,7 +256,8 @@ interface AttemptRow extends QueryResultRow {
   readonly markup_delta_micro_usdc: string;
   readonly total_delta_micro_usdc: string;
   readonly request_fingerprint: string;
-  readonly provider_activity_ref: string | null;
+  readonly provider_attempt_generation: number;
+  readonly next_submit_not_before: string | null;
   readonly tx_hash: string | null;
   readonly transfer_submitted_at: string | null;
   readonly failure_code: string | null;
@@ -198,6 +268,12 @@ interface AttemptRow extends QueryResultRow {
   readonly finalized_at: string | null;
 }
 
+interface ProviderAttemptRow extends QueryResultRow {
+  readonly generation: number;
+  readonly idempotency_key: string;
+  readonly provider_activity_ref: string | null;
+}
+
 interface ReceiptRow extends QueryResultRow {
   readonly payload: unknown;
   readonly payload_sha256: string;
@@ -206,6 +282,115 @@ interface ReceiptRow extends QueryResultRow {
   readonly signature: string;
   readonly signed_at: string;
 }
+
+interface BillingFenceRow extends QueryResultRow {
+  readonly workspace_id: string;
+  readonly thread_id: string;
+  readonly fence_id: string;
+  readonly settlement_id: string | null;
+  readonly reason: UsageBillingFence["reason"];
+  readonly state: UsageBillingFence["state"];
+  readonly processing_owner: string | null;
+  readonly processing_lease_expires_at: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly paused_at: string | null;
+  readonly cleared_at: string | null;
+}
+
+const authorizationIsActive = async (
+  client: PoolClient,
+  attempt: UsageSettlementAttempt,
+  now: string,
+) => {
+  const result = await client.query(
+    `SELECT 1
+       FROM cloud_wallet wallet
+       JOIN cloud_wallet_delegated_authorization authz
+         ON authz.workspace_id = wallet.workspace_id AND authz.wallet_id = wallet.wallet_id
+      WHERE wallet.workspace_id = $1 AND wallet.wallet_id = $2 AND wallet.state = 'active'
+        AND authz.authorization_id = $3 AND authz.state = 'active'
+        AND authz.starts_at <= $4::timestamptz AND authz.expires_at > $4::timestamptz
+      FOR SHARE OF wallet, authz`,
+    [attempt.workspaceId, attempt.walletId, attempt.authorizationId, now],
+  );
+  return result.rowCount === 1;
+};
+
+const rebindAuthorizationIfNeeded = async (
+  client: PoolClient,
+  attempt: UsageSettlementAttempt,
+  now: string,
+) => {
+  if (await authorizationIsActive(client, attempt, now)) return attempt;
+  if (
+    !(["reserved", "retry-waiting", "low-balance-paused"] as const).includes(attempt.state as never)
+  ) {
+    return attempt;
+  }
+  const replacement = await client.query<AuthorizationRow>(
+    `SELECT wallet.wallet_id, authz.authorization_id,
+            wallet.evm_address AS wallet_address, authz.treasury_address,
+            authz.per_charge_limit_micro_usdc::text
+       FROM cloud_wallet wallet
+       JOIN cloud_wallet_delegated_authorization authz
+         ON authz.workspace_id = wallet.workspace_id AND authz.wallet_id = wallet.wallet_id
+      WHERE wallet.workspace_id = $1 AND wallet.state = 'active'
+        AND authz.state = 'active'
+        AND authz.starts_at <= $2::timestamptz AND authz.expires_at > $2::timestamptz
+        AND authz.treasury_address = $3
+        AND authz.per_charge_limit_micro_usdc >= $4
+      ORDER BY wallet.wallet_id, authz.authorization_id
+      LIMIT 1 FOR SHARE`,
+    [attempt.workspaceId, now, attempt.treasuryAddress, attempt.totalDeltaMicroUsdc],
+  );
+  const authorization = replacement.rows[0];
+  if (authorization === undefined) {
+    throw new UsageSettlementRepositoryError(
+      "configurationMissing",
+      "no active delegated authorization can cover the settlement",
+    );
+  }
+  const nextGeneration = attempt.authorizationGeneration + 1;
+  await client.query(
+    `INSERT INTO cloud_usage_settlement_authorization_binding (
+       workspace_id, settlement_id, generation, wallet_id, authorization_id,
+       wallet_address, treasury_address, bound_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz)`,
+    [
+      attempt.workspaceId,
+      attempt.settlementId,
+      nextGeneration,
+      authorization.wallet_id,
+      authorization.authorization_id,
+      authorization.wallet_address,
+      authorization.treasury_address,
+      now,
+    ],
+  );
+  const updated = await client.query(
+    `UPDATE cloud_usage_settlement_attempt
+        SET wallet_id = $3, authorization_id = $4, wallet_address = $5,
+            authorization_generation = $6, updated_at = $7::timestamptz
+      WHERE workspace_id = $1 AND settlement_id = $2
+        AND authorization_generation = $8
+        AND state IN ('reserved', 'retry-waiting', 'low-balance-paused')`,
+    [
+      attempt.workspaceId,
+      attempt.settlementId,
+      authorization.wallet_id,
+      authorization.authorization_id,
+      authorization.wallet_address,
+      nextGeneration,
+      now,
+      attempt.authorizationGeneration,
+    ],
+  );
+  if (updated.rowCount !== 1) {
+    throw new UsageSettlementRepositoryError("conflict", "settlement authorization changed");
+  }
+  return requireAttempt(client, attempt.workspaceId, attempt.settlementId);
+};
 
 const canonical = (value: unknown): string => {
   if (value === null || typeof value === "string" || typeof value === "boolean") {
@@ -224,6 +409,51 @@ const canonical = (value: unknown): string => {
 
 const digest = (domain: string, value: unknown) =>
   NodeCrypto.createHash("sha256").update(`${domain}\0`).update(canonical(value)).digest("hex");
+
+const providerIdempotencyKey = (requestFingerprint: string, generation: number) =>
+  digest("agents-in-cloud/usage-settlement-provider-attempt/v1", {
+    requestFingerprint,
+    generation,
+  });
+
+const lockProviderIdentity = (
+  client: PoolClient,
+  domain: "activity" | "transaction",
+  identity: string,
+) =>
+  client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+    `agents-in-cloud/usage-settlement-${domain}/v1`,
+    identity.toLowerCase(),
+  ]);
+
+const providerActivityIsReused = async (
+  client: PoolClient,
+  attempt: UsageSettlementAttempt,
+  providerActivityRef: string,
+) => {
+  await lockProviderIdentity(client, "activity", providerActivityRef);
+  const reused = await client.query(
+    `SELECT 1 FROM cloud_usage_settlement_provider_attempt
+      WHERE provider_activity_ref = $1
+        AND NOT (workspace_id = $2 AND settlement_id = $3 AND generation = $4)
+      LIMIT 1 FOR SHARE`,
+    [
+      providerActivityRef,
+      attempt.workspaceId,
+      attempt.settlementId,
+      attempt.providerAttemptGeneration,
+    ],
+  );
+  return reused.rowCount === 1;
+};
+
+export const settlementRetryNotBefore = (now: string, generation: number) => {
+  const delay = Math.min(
+    SETTLEMENT_RETRY_MAX_MS,
+    SETTLEMENT_RETRY_BASE_MS * 2 ** Math.min(generation - 1, 16),
+  );
+  return DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(now), { milliseconds: delay }));
+};
 
 const decodeReceipt = Schema.decodeUnknownSync(UsageSettlementReceipt);
 const receiptPayloadHash = (value: UsageSettlementReceipt["payload"]) =>
@@ -261,10 +491,14 @@ const postingFromRow = (row: PostingRow): UsageSettlementAccrualPosting => ({
 });
 
 const attemptColumns = `workspace_id::text AS workspace_id, settlement_id, thread_id, state,
-  trigger_kind, wallet_id, authorization_id, wallet_address, treasury_address,
+  trigger_kind, wallet_id, authorization_id, authorization_generation,
+  wallet_address, treasury_address,
   first_pricing_sequence::text, last_pricing_sequence::text,
   upstream_delta_micro_usdc::text, markup_delta_micro_usdc::text,
-  total_delta_micro_usdc::text, request_fingerprint, provider_activity_ref, tx_hash,
+  total_delta_micro_usdc::text, request_fingerprint, provider_attempt_generation, tx_hash,
+  CASE WHEN next_submit_not_before IS NULL THEN NULL ELSE
+    to_char(next_submit_not_before AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  END AS next_submit_not_before,
   CASE WHEN transfer_submitted_at IS NULL THEN NULL ELSE
     to_char(transfer_submitted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
   END AS transfer_submitted_at,
@@ -285,6 +519,197 @@ const postingColumns = `item.accrual_id, item.sample_id, item.environment_id, it
   to_char(item.interval_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS interval_end,
   item.upstream_delta_micro_usdc::text, item.markup_delta_micro_usdc::text,
   item.total_delta_micro_usdc::text`;
+
+const billingFenceColumns = `fence.workspace_id::text, fence.thread_id, fence.fence_id,
+  fence.settlement_id, fence.reason, fence.state, fence.processing_owner,
+  CASE WHEN fence.processing_lease_expires_at IS NULL THEN NULL ELSE
+    to_char(fence.processing_lease_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  END AS processing_lease_expires_at,
+  to_char(fence.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+  to_char(fence.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+  CASE WHEN fence.paused_at IS NULL THEN NULL ELSE
+    to_char(fence.paused_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  END AS paused_at,
+  CASE WHEN fence.cleared_at IS NULL THEN NULL ELSE
+    to_char(fence.cleared_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  END AS cleared_at`;
+
+const billingFenceFromRow = (row: BillingFenceRow): UsageBillingFence => ({
+  fenceId: row.fence_id,
+  workspaceId: row.workspace_id as WorkspaceId,
+  threadId: row.thread_id as ThreadId,
+  ...(row.settlement_id === null ? {} : { settlementId: row.settlement_id as SettlementId }),
+  reason: row.reason,
+  state: row.state,
+  ...(row.processing_owner === null ? {} : { processingOwner: row.processing_owner }),
+  ...(row.processing_lease_expires_at === null
+    ? {}
+    : { processingLeaseExpiresAt: row.processing_lease_expires_at }),
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+  ...(row.paused_at === null ? {} : { pausedAt: row.paused_at }),
+  ...(row.cleared_at === null ? {} : { clearedAt: row.cleared_at }),
+});
+
+const ensureBillingFence = async (
+  client: PoolClient,
+  input: {
+    readonly workspaceId: WorkspaceId;
+    readonly threadId: ThreadId;
+    readonly settlementId?: SettlementId;
+    readonly reason: UsageBillingFence["reason"];
+    readonly processorId: string;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  },
+) => {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+    "agents-in-cloud/workspace-billing-gate/v1",
+    input.workspaceId,
+  ]);
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+    "agents-in-cloud/usage-billing-fence/v1",
+    `${input.workspaceId}:${input.threadId}`,
+  ]);
+  const active = await client.query<{
+    readonly fence_id: string;
+    readonly episode: number;
+    readonly settlement_id: string | null;
+    readonly recovery_settlement_id: string | null;
+  }>(
+    `SELECT fence_id, episode, settlement_id, recovery_settlement_id
+       FROM cloud_usage_billing_fence
+      WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared' FOR UPDATE`,
+    [input.workspaceId, input.threadId],
+  );
+  const existing = active.rows[0];
+  const episode =
+    existing?.episode ??
+    Number(
+      (
+        await client.query<{ readonly episode: string }>(
+          `SELECT (COALESCE(max(episode), 0) + 1)::text AS episode
+             FROM cloud_usage_billing_fence WHERE workspace_id = $1 AND thread_id = $2`,
+          [input.workspaceId, input.threadId],
+        )
+      ).rows[0]!.episode,
+    );
+  const fenceId = `billing-fence-${digest("agents-in-cloud/usage-billing-fence/v1", {
+    workspaceId: input.workspaceId,
+    threadId: input.threadId,
+    episode,
+  }).slice(0, 48)}`;
+  const effectiveFenceId = existing?.fence_id ?? fenceId;
+  if (existing === undefined) {
+    await client.query(
+      `INSERT INTO cloud_usage_billing_fence (
+         workspace_id, thread_id, fence_id, episode, settlement_id, reason, state,
+         processing_owner, processing_lease_expires_at, created_at, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,'pause-pending',$7,$8::timestamptz,$9::timestamptz,$9::timestamptz)`,
+      [
+        input.workspaceId,
+        input.threadId,
+        fenceId,
+        episode,
+        input.settlementId ?? null,
+        input.reason,
+        input.processorId,
+        input.leaseExpiresAt,
+        input.now,
+      ],
+    );
+  } else {
+    const boundSettlementId = existing.settlement_id ?? existing.recovery_settlement_id;
+    if (
+      input.settlementId !== undefined &&
+      boundSettlementId !== null &&
+      boundSettlementId !== input.settlementId
+    ) {
+      throw new UsageSettlementRepositoryError(
+        "conflict",
+        "active billing fence is bound to a different settlement",
+      );
+    }
+    await client.query(
+      `UPDATE cloud_usage_billing_fence
+          SET reason = $4,
+              recovery_settlement_id = COALESCE(recovery_settlement_id,
+                CASE WHEN settlement_id IS NULL THEN $5 ELSE NULL END),
+              updated_at = $6::timestamptz
+        WHERE workspace_id = $1 AND thread_id = $2 AND fence_id = $3`,
+      [
+        input.workspaceId,
+        input.threadId,
+        existing.fence_id,
+        input.reason,
+        input.settlementId ?? null,
+        input.now,
+      ],
+    );
+  }
+  await client.query(
+    `INSERT INTO cloud_usage_billing_fence_event (
+       workspace_id, thread_id, fence_id, sequence, reason, settlement_id, recorded_at
+     ) SELECT $1,$2,$3,COALESCE(max(sequence),0)+1,$4,$5,$6::timestamptz
+         FROM cloud_usage_billing_fence_event
+        WHERE workspace_id = $1 AND thread_id = $2 AND fence_id = $3`,
+    [
+      input.workspaceId,
+      input.threadId,
+      effectiveFenceId,
+      input.reason,
+      input.settlementId ?? null,
+      input.now,
+    ],
+  );
+};
+
+const bindAuthorizationFenceToSettlement = async (
+  client: PoolClient,
+  input: {
+    readonly workspaceId: WorkspaceId;
+    readonly threadId: ThreadId;
+    readonly settlementId: SettlementId;
+    readonly processorId: string;
+    readonly leaseExpiresAt: string;
+    readonly now: string;
+  },
+) => {
+  const cleared = await client.query(
+    `UPDATE cloud_usage_billing_fence
+        SET state = 'cleared', cleared_at = $3::timestamptz,
+            processing_owner = NULL, processing_lease_expires_at = NULL,
+            updated_at = $3::timestamptz
+      WHERE workspace_id = $1 AND thread_id = $2 AND settlement_id IS NULL
+        AND reason = 'authorization-unavailable' AND state = 'paused'`,
+    [input.workspaceId, input.threadId, input.now],
+  );
+  if (cleared.rowCount !== 1) {
+    throw new UsageSettlementRepositoryError(
+      "conflict",
+      "authorization billing fence is not ready to bind a settlement",
+    );
+  }
+  await ensureBillingFence(client, {
+    ...input,
+    reason: "authorization-unavailable",
+  });
+  const rebound = await client.query(
+    `UPDATE cloud_usage_billing_fence
+        SET state = 'paused', paused_at = $4::timestamptz,
+            processing_owner = NULL, processing_lease_expires_at = NULL,
+            updated_at = $4::timestamptz
+      WHERE workspace_id = $1 AND thread_id = $2 AND settlement_id = $3
+        AND state = 'pause-pending'`,
+    [input.workspaceId, input.threadId, input.settlementId, input.now],
+  );
+  if (rebound.rowCount !== 1) {
+    throw new UsageSettlementRepositoryError(
+      "conflict",
+      "authorization billing hold could not transfer to the settlement",
+    );
+  }
+};
 
 const transaction = async <A>(pool: Pool, use: (client: PoolClient) => Promise<A>) => {
   const client = await pool.connect();
@@ -318,21 +743,32 @@ const loadAttempt = async (
   );
   const row = attemptResult.rows[0];
   if (row === undefined) return undefined;
-  const [postingResult, receiptResult] = await Promise.all([
-    client.query<PostingRow>(
-      `SELECT ${postingColumns} FROM cloud_usage_settlement_item item
+  const postingResult = await client.query<PostingRow>(
+    `SELECT ${postingColumns} FROM cloud_usage_settlement_item item
         WHERE workspace_id = $1 AND settlement_id = $2 ORDER BY position`,
-      [workspaceId, settlementId],
-    ),
-    client.query<ReceiptRow>(
-      `SELECT payload, payload_sha256, signature_algorithm, signature_key_id,
+    [workspaceId, settlementId],
+  );
+  const receiptResult = await client.query<ReceiptRow>(
+    `SELECT payload, payload_sha256, signature_algorithm, signature_key_id,
               signature,
               to_char(signed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS signed_at
          FROM cloud_usage_settlement_receipt
         WHERE workspace_id = $1 AND settlement_id = $2`,
-      [workspaceId, settlementId],
-    ),
-  ]);
+    [workspaceId, settlementId],
+  );
+  const providerAttemptResult = await client.query<ProviderAttemptRow>(
+    `SELECT generation, idempotency_key, provider_activity_ref
+         FROM cloud_usage_settlement_provider_attempt
+        WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3`,
+    [workspaceId, settlementId, row.provider_attempt_generation],
+  );
+  const fenceResult = await client.query<{ readonly fence_id: string }>(
+    `SELECT fence_id FROM cloud_usage_billing_fence
+      WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'
+        AND (settlement_id IS NULL OR settlement_id = $3)`,
+    [workspaceId, row.thread_id, settlementId],
+  );
+  const providerAttempt = providerAttemptResult.rows[0];
   const receiptRow = receiptResult.rows[0];
   const receipt =
     receiptRow === undefined
@@ -362,6 +798,7 @@ const loadAttempt = async (
     trigger: row.trigger_kind,
     walletId: row.wallet_id as WalletId,
     authorizationId: row.authorization_id as WalletDelegatedAuthorizationId,
+    authorizationGeneration: row.authorization_generation,
     walletAddress: row.wallet_address as EvmAddress,
     treasuryAddress: row.treasury_address as EvmAddress,
     firstPricingSequence: safeNumber(row.first_pricing_sequence),
@@ -370,10 +807,17 @@ const loadAttempt = async (
     markupDeltaMicroUsdc: safeNumber(row.markup_delta_micro_usdc) as SignedMicroUsdc,
     totalDeltaMicroUsdc: safeNumber(row.total_delta_micro_usdc),
     requestFingerprint: row.request_fingerprint,
+    providerAttemptGeneration: row.provider_attempt_generation,
+    providerIdempotencyKey:
+      providerAttempt?.idempotency_key ??
+      providerIdempotencyKey(row.request_fingerprint, row.provider_attempt_generation),
     postings: postingResult.rows.map(postingFromRow),
-    ...(row.provider_activity_ref === null
+    ...(providerAttempt?.provider_activity_ref === null || providerAttempt === undefined
       ? {}
-      : { providerActivityRef: row.provider_activity_ref }),
+      : { providerActivityRef: providerAttempt.provider_activity_ref }),
+    ...(row.next_submit_not_before === null
+      ? {}
+      : { nextSubmitNotBefore: row.next_submit_not_before }),
     ...(row.tx_hash === null ? {} : { txHash: row.tx_hash as EvmTransactionHash }),
     ...(row.transfer_submitted_at === null
       ? {}
@@ -387,6 +831,7 @@ const loadAttempt = async (
     updatedAt: row.updated_at,
     ...(row.finalized_at === null ? {} : { finalizedAt: row.finalized_at }),
     ...(receipt === undefined ? {} : { receipt }),
+    ...(fenceResult.rows[0] === undefined ? {} : { billingFenceId: fenceResult.rows[0].fence_id }),
   } satisfies UsageSettlementAttempt;
 };
 
@@ -483,7 +928,17 @@ const insertAttempt = async (
     [candidate.workspace_id, request.now],
   );
   const authorization = authorizationResult.rows[0];
-  if (authorization === undefined) return undefined;
+  if (authorization === undefined) {
+    await ensureBillingFence(client, {
+      workspaceId: candidate.workspace_id as WorkspaceId,
+      threadId: candidate.thread_id as ThreadId,
+      reason: "authorization-unavailable",
+      processorId: request.processorId,
+      leaseExpiresAt: request.leaseExpiresAt,
+      now: request.now,
+    });
+    return undefined;
+  }
 
   const available = await candidatePostings(
     client,
@@ -491,11 +946,21 @@ const insertAttempt = async (
     candidate.thread_id as ThreadId,
   );
   const postings = choosePrefix(available, safeNumber(authorization.per_charge_limit_micro_usdc));
-  if (postings.length === 0) return undefined;
+  if (postings.length === 0) {
+    await ensureBillingFence(client, {
+      workspaceId: candidate.workspace_id as WorkspaceId,
+      threadId: candidate.thread_id as ThreadId,
+      reason: "authorization-unavailable",
+      processorId: request.processorId,
+      leaseExpiresAt: request.leaseExpiresAt,
+      now: request.now,
+    });
+    return undefined;
+  }
   const upstream = safeSum(postings.map((posting) => posting.upstreamDeltaMicroUsdc));
   const markup = safeSum(postings.map((posting) => posting.markupDeltaMicroUsdc));
   const total = safeSum(postings.map((posting) => posting.totalDeltaMicroUsdc));
-  if (total <= 0 || total !== upstream + markup) return undefined;
+  if (total <= 0 || BigInt(total) !== BigInt(upstream) + BigInt(markup)) return undefined;
   const first = postings[0]!;
   const last = postings[postings.length - 1]!;
   const identity = {
@@ -519,7 +984,8 @@ const insertAttempt = async (
   ).slice(0, 48)}` as SettlementId;
   const trigger =
     request.trigger ??
-    (Math.abs(total) >= SETTLEMENT_AMOUNT_THRESHOLD_MICRO_USDC
+    (Math.abs(safeNumber(candidate.total_delta_micro_usdc)) >=
+    SETTLEMENT_AMOUNT_THRESHOLD_MICRO_USDC
       ? "amount-threshold"
       : "five-minute-window");
   await client.query(
@@ -550,6 +1016,21 @@ const insertAttempt = async (
       requestFingerprint,
       request.processorId,
       request.leaseExpiresAt,
+      request.now,
+    ],
+  );
+  await client.query(
+    `INSERT INTO cloud_usage_settlement_authorization_binding (
+       workspace_id, settlement_id, generation, wallet_id, authorization_id,
+       wallet_address, treasury_address, bound_at
+     ) VALUES ($1,$2,1,$3,$4,$5,$6,$7::timestamptz)`,
+    [
+      candidate.workspace_id,
+      settlementId,
+      authorization.wallet_id,
+      authorization.authorization_id,
+      authorization.wallet_address,
+      authorization.treasury_address,
       request.now,
     ],
   );
@@ -584,6 +1065,16 @@ const insertAttempt = async (
       ],
     );
   }
+  if (request.recoverAuthorizationFence === true) {
+    await bindAuthorizationFenceToSettlement(client, {
+      workspaceId: candidate.workspace_id as WorkspaceId,
+      threadId: candidate.thread_id as ThreadId,
+      settlementId,
+      processorId: request.processorId,
+      leaseExpiresAt: request.leaseExpiresAt,
+      now: request.now,
+    });
+  }
   return requireAttempt(client, candidate.workspace_id as WorkspaceId, settlementId);
 };
 
@@ -615,6 +1106,23 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
           WHERE item.accrual_id IS NULL
             AND ($1::uuid IS NULL OR ledger.workspace_id = $1)
             AND ($2::text IS NULL OR ledger.thread_id = $2)
+            AND (
+              NOT EXISTS (
+                SELECT 1 FROM cloud_usage_billing_fence fence
+                 WHERE fence.workspace_id = ledger.workspace_id
+                   AND fence.thread_id = ledger.thread_id AND fence.state <> 'cleared'
+              ) OR ($7::boolean AND EXISTS (
+                SELECT 1 FROM cloud_usage_billing_fence fence
+                 WHERE fence.workspace_id = ledger.workspace_id
+                   AND fence.thread_id = ledger.thread_id
+                   AND fence.reason = 'authorization-unavailable' AND fence.state = 'paused'
+              )))
+            AND NOT EXISTS (
+              SELECT 1 FROM cloud_usage_settlement_attempt blocked
+               WHERE blocked.workspace_id = ledger.workspace_id
+                 AND blocked.thread_id = ledger.thread_id
+                 AND blocked.state <> 'finalized'
+            )
           GROUP BY ledger.workspace_id, ledger.thread_id
          HAVING sum(ledger.total_delta_micro_usdc) > 0
             AND ($3::boolean OR min(ledger.recorded_at) <= $4::timestamptz
@@ -628,6 +1136,7 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
           cutoff,
           SETTLEMENT_AMOUNT_THRESHOLD_MICRO_USDC,
           request.limit,
+          request.recoverAuthorizationFence ?? false,
         ],
       );
       const attempts: Array<UsageSettlementAttempt> = [];
@@ -639,6 +1148,44 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
     }),
   claimRecoverable: (processorId, now, leaseExpiresAt, limit) =>
     transaction(pool, async (client) => {
+      const unauthorizable = await client.query<{
+        readonly workspace_id: string;
+        readonly thread_id: string;
+        readonly settlement_id: string;
+      }>(
+        `SELECT attempt.workspace_id::text, attempt.thread_id, attempt.settlement_id
+           FROM cloud_usage_settlement_attempt attempt
+          WHERE attempt.state IN (
+            'reserved', 'retry-waiting', 'submission-pending', 'reconciliation-required'
+          )
+            AND NOT EXISTS (
+              SELECT 1 FROM cloud_wallet wallet
+              JOIN cloud_wallet_delegated_authorization authz
+                ON authz.workspace_id = wallet.workspace_id AND authz.wallet_id = wallet.wallet_id
+              WHERE wallet.workspace_id = attempt.workspace_id
+                AND wallet.wallet_id = attempt.wallet_id AND wallet.state = 'active'
+                AND authz.authorization_id = attempt.authorization_id AND authz.state = 'active'
+                AND authz.starts_at <= $1::timestamptz AND authz.expires_at > $1::timestamptz
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM cloud_usage_billing_fence fence
+               WHERE fence.workspace_id = attempt.workspace_id
+                 AND fence.thread_id = attempt.thread_id AND fence.state <> 'cleared'
+            )
+          ORDER BY attempt.created_at LIMIT $2 FOR UPDATE OF attempt SKIP LOCKED`,
+        [now, limit],
+      );
+      for (const blocked of unauthorizable.rows) {
+        await ensureBillingFence(client, {
+          workspaceId: blocked.workspace_id as WorkspaceId,
+          threadId: blocked.thread_id as ThreadId,
+          settlementId: blocked.settlement_id as SettlementId,
+          reason: "authorization-unavailable",
+          processorId,
+          leaseExpiresAt,
+          now,
+        });
+      }
       const rows = await client.query<{
         readonly workspace_id: string;
         readonly settlement_id: string;
@@ -647,10 +1194,30 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
            SELECT workspace_id, settlement_id
              FROM cloud_usage_settlement_attempt
             WHERE state IN (
-              'reserved', 'submission-pending', 'reconciliation-required',
+              'reserved', 'retry-waiting', 'submission-pending', 'reconciliation-required',
               'transfer-applied', 'low-balance-pause-pending'
             )
+              AND (state <> 'retry-waiting' OR next_submit_not_before <= $1::timestamptz)
               AND (processing_owner IS NULL OR processing_lease_expires_at <= $1::timestamptz)
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM cloud_usage_billing_fence fence
+                   WHERE fence.workspace_id = cloud_usage_settlement_attempt.workspace_id
+                     AND fence.thread_id = cloud_usage_settlement_attempt.thread_id
+                     AND fence.state <> 'cleared'
+                )
+                OR (
+                  state = 'transfer-applied'
+                  AND EXISTS (
+                    SELECT 1 FROM cloud_usage_billing_fence fence
+                     WHERE fence.workspace_id = cloud_usage_settlement_attempt.workspace_id
+                       AND fence.thread_id = cloud_usage_settlement_attempt.thread_id
+                       AND fence.settlement_id = cloud_usage_settlement_attempt.settlement_id
+                       AND fence.reason = 'provider-outcome-uncertain'
+                       AND fence.state = 'paused'
+                  )
+                )
+              )
             ORDER BY created_at, workspace_id, settlement_id
             LIMIT $2 FOR UPDATE SKIP LOCKED
          )
@@ -680,7 +1247,15 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
             SET processing_owner = $3, processing_lease_expires_at = $4::timestamptz,
                 updated_at = $5::timestamptz
           WHERE workspace_id = $1 AND settlement_id = $2
-            AND state = 'low-balance-paused' AND processing_owner IS NULL`,
+            AND state = 'low-balance-paused'
+            AND (processing_owner IS NULL OR processing_lease_expires_at <= $5::timestamptz)
+            AND EXISTS (
+              SELECT 1 FROM cloud_usage_billing_fence fence
+               WHERE fence.workspace_id = cloud_usage_settlement_attempt.workspace_id
+                 AND fence.thread_id = cloud_usage_settlement_attempt.thread_id
+                 AND fence.settlement_id = cloud_usage_settlement_attempt.settlement_id
+                 AND fence.state = 'paused'
+            )`,
         [workspaceId, settlementId, processorId, leaseExpiresAt, now],
       );
       if (result.rowCount !== 1) {
@@ -693,48 +1268,416 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
     }),
   get: (workspaceId, settlementId) => loadAttempt(pool, workspaceId, settlementId),
   setSubmissionPending: (attempt, processorId, now) =>
-    transaction(pool, (client) =>
-      updateOwned(
+    transaction(pool, async (client) => {
+      const current = await requireAttempt(client, attempt.workspaceId, attempt.settlementId);
+      if (current.processingOwner !== processorId) {
+        throw new UsageSettlementRepositoryError("conflict", "settlement processing lease changed");
+      }
+      if (!(await authorizationIsActive(client, current, now))) {
+        await ensureBillingFence(client, {
+          workspaceId: current.workspaceId,
+          threadId: current.threadId,
+          settlementId: current.settlementId,
+          reason: "authorization-unavailable",
+          processorId,
+          leaseExpiresAt: current.processingLeaseExpiresAt ?? now,
+          now,
+        });
+        return updateOwned(
+          client,
+          current,
+          processorId,
+          `UPDATE cloud_usage_settlement_attempt
+              SET failure_code = 'authorization-unavailable', processing_owner = NULL,
+                  processing_lease_expires_at = NULL, updated_at = $4::timestamptz`,
+          [now],
+          ["reserved", "retry-waiting", "low-balance-paused"],
+        );
+      }
+      const pending = await updateOwned(
         client,
-        attempt,
+        current,
         processorId,
         `UPDATE cloud_usage_settlement_attempt
-            SET state = 'submission-pending', failure_code = NULL, updated_at = $4::timestamptz`,
+            SET state = 'submission-pending', next_submit_not_before = NULL,
+                failure_code = NULL, updated_at = $4::timestamptz`,
         [now],
-        ["reserved", "low-balance-paused"],
-      ),
-    ),
+        ["reserved", "retry-waiting", "low-balance-paused"],
+      );
+      await client.query(
+        `INSERT INTO cloud_usage_settlement_provider_attempt (
+           workspace_id, settlement_id, generation, idempotency_key, state, created_at, updated_at
+         ) VALUES ($1,$2,$3,$4,'submission-pending',$5::timestamptz,$5::timestamptz)`,
+        [
+          pending.workspaceId,
+          pending.settlementId,
+          pending.providerAttemptGeneration,
+          pending.providerIdempotencyKey,
+          now,
+        ],
+      );
+      return requireAttempt(client, pending.workspaceId, pending.settlementId);
+    }),
   recordTransfer: (attempt, processorId, transfer, now) =>
-    transaction(pool, (client) =>
-      updateOwned(
-        client,
-        attempt,
-        processorId,
-        `UPDATE cloud_usage_settlement_attempt
-            SET state = 'transfer-applied', provider_activity_ref = $4,
+    transaction(pool, async (client) => {
+      await lockProviderIdentity(client, "activity", transfer.providerActivityRef);
+      await lockProviderIdentity(client, "transaction", transfer.txHash);
+      const reused = await client.query<{
+        readonly workspace_id: string;
+        readonly settlement_id: string;
+        readonly generation: number;
+      }>(
+        `SELECT workspace_id::text, settlement_id, generation
+           FROM cloud_usage_settlement_provider_attempt
+          WHERE provider_activity_ref = $1 OR lower(tx_hash) = lower($2)
+          LIMIT 1 FOR SHARE`,
+        [transfer.providerActivityRef, transfer.txHash],
+      );
+      const prior = reused.rows[0];
+      if (
+        prior !== undefined &&
+        (prior.workspace_id !== attempt.workspaceId ||
+          prior.settlement_id !== attempt.settlementId ||
+          prior.generation !== attempt.providerAttemptGeneration)
+      ) {
+        await ensureBillingFence(client, {
+          workspaceId: attempt.workspaceId,
+          threadId: attempt.threadId,
+          settlementId: attempt.settlementId,
+          reason: "provider-outcome-uncertain",
+          processorId,
+          leaseExpiresAt: attempt.processingLeaseExpiresAt ?? now,
+          now,
+        });
+        return updateOwned(
+          client,
+          attempt,
+          processorId,
+          `UPDATE cloud_usage_settlement_attempt
+              SET state = 'reconciliation-required', failure_code = $4,
+                  processing_owner = NULL, processing_lease_expires_at = NULL,
+                  updated_at = $5::timestamptz`,
+          ["provider-transfer-identity-reused", now],
+          ["submission-pending", "reconciliation-required"],
+        );
+      }
+      const activity = await client.query(
+        `UPDATE cloud_usage_settlement_provider_attempt
+            SET state = 'applied', provider_activity_ref = COALESCE(provider_activity_ref, $4),
                 tx_hash = $5, transfer_submitted_at = $6::timestamptz,
-                failure_code = NULL, updated_at = $7::timestamptz`,
-        [transfer.providerActivityRef, transfer.txHash, transfer.submittedAt, now],
-        ["submission-pending", "reconciliation-required"],
-      ),
-    ),
-  markReconciliationRequired: (attempt, processorId, providerActivityRef, failureCode, now) =>
-    transaction(pool, (client) =>
-      updateOwned(
+                closed_at = $7::timestamptz, updated_at = $7::timestamptz
+          WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3
+            AND state IN ('submission-pending', 'unknown')
+            AND (provider_activity_ref IS NULL OR provider_activity_ref = $4)`,
+        [
+          attempt.workspaceId,
+          attempt.settlementId,
+          attempt.providerAttemptGeneration,
+          transfer.providerActivityRef,
+          transfer.txHash.toLowerCase(),
+          transfer.submittedAt,
+          now,
+        ],
+      );
+      if (activity.rowCount !== 1) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "provider transfer does not match the active settlement generation",
+        );
+      }
+      return updateOwned(
         client,
         attempt,
         processorId,
         `UPDATE cloud_usage_settlement_attempt
-            SET state = 'reconciliation-required', provider_activity_ref = COALESCE($4, provider_activity_ref),
-                failure_code = $5, processing_owner = NULL,
-                processing_lease_expires_at = NULL, updated_at = $6::timestamptz`,
-        [providerActivityRef ?? null, failureCode, now],
+            SET state = 'transfer-applied', tx_hash = $4,
+                transfer_submitted_at = $5::timestamptz,
+                failure_code = NULL, updated_at = $6::timestamptz`,
+        [transfer.txHash.toLowerCase(), transfer.submittedAt, now],
         ["submission-pending", "reconciliation-required"],
-      ),
-    ),
-  markLowBalancePausePending: (attempt, processorId, failureCode, now) =>
-    transaction(pool, (client) =>
-      updateOwned(
+      );
+    }),
+  markReconciliationRequired: (attempt, processorId, providerActivityRef, failureCode, now) =>
+    transaction(pool, async (client) => {
+      if (providerActivityRef !== undefined) {
+        if (await providerActivityIsReused(client, attempt, providerActivityRef)) {
+          await ensureBillingFence(client, {
+            workspaceId: attempt.workspaceId,
+            threadId: attempt.threadId,
+            settlementId: attempt.settlementId,
+            reason: "provider-outcome-uncertain",
+            processorId,
+            leaseExpiresAt: attempt.processingLeaseExpiresAt ?? now,
+            now,
+          });
+          return updateOwned(
+            client,
+            attempt,
+            processorId,
+            `UPDATE cloud_usage_settlement_attempt
+                SET state = 'reconciliation-required', failure_code = $4,
+                    processing_owner = NULL, processing_lease_expires_at = NULL,
+                    updated_at = $5::timestamptz`,
+            ["provider-activity-identity-reused", now],
+            ["submission-pending", "reconciliation-required"],
+          );
+        }
+        const activity = await client.query(
+          `UPDATE cloud_usage_settlement_provider_attempt
+              SET state = 'unknown', provider_activity_ref = COALESCE(provider_activity_ref, $4),
+                  updated_at = $5::timestamptz
+            WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3
+              AND state IN ('submission-pending', 'unknown')
+              AND (provider_activity_ref IS NULL OR provider_activity_ref = $4)`,
+          [
+            attempt.workspaceId,
+            attempt.settlementId,
+            attempt.providerAttemptGeneration,
+            providerActivityRef,
+            now,
+          ],
+        );
+        if (activity.rowCount !== 1) {
+          throw new UsageSettlementRepositoryError(
+            "conflict",
+            "provider activity does not match the active settlement generation",
+          );
+        }
+      }
+      await ensureBillingFence(client, {
+        workspaceId: attempt.workspaceId,
+        threadId: attempt.threadId,
+        settlementId: attempt.settlementId,
+        reason: "provider-outcome-uncertain",
+        processorId,
+        leaseExpiresAt: attempt.processingLeaseExpiresAt ?? now,
+        now,
+      });
+      return updateOwned(
+        client,
+        attempt,
+        processorId,
+        `UPDATE cloud_usage_settlement_attempt
+            SET state = 'reconciliation-required', failure_code = $4,
+                processing_owner = NULL, processing_lease_expires_at = NULL,
+                updated_at = $5::timestamptz`,
+        [failureCode, now],
+        ["submission-pending", "reconciliation-required"],
+      );
+    }),
+  markFinalizationRequired: (attempt, processorId, failureCode, now) =>
+    transaction(pool, async (client) => {
+      await ensureBillingFence(client, {
+        workspaceId: attempt.workspaceId,
+        threadId: attempt.threadId,
+        settlementId: attempt.settlementId,
+        reason: "provider-outcome-uncertain",
+        processorId,
+        leaseExpiresAt: attempt.processingLeaseExpiresAt ?? now,
+        now,
+      });
+      return updateOwned(
+        client,
+        attempt,
+        processorId,
+        `UPDATE cloud_usage_settlement_attempt
+            SET failure_code = $4, processing_owner = NULL,
+                processing_lease_expires_at = NULL, updated_at = $5::timestamptz`,
+        [failureCode, now],
+        ["transfer-applied"],
+      );
+    }),
+  closeProviderAttemptNotApplied: (
+    attempt,
+    processorId,
+    providerActivityRef,
+    failureCode,
+    now,
+    nextSubmitNotBefore,
+  ) =>
+    transaction(pool, async (client) => {
+      const current = await requireAttempt(client, attempt.workspaceId, attempt.settlementId);
+      if (current.processingOwner !== processorId) {
+        throw new UsageSettlementRepositoryError("conflict", "settlement processing lease changed");
+      }
+      if (
+        providerActivityRef !== undefined &&
+        (await providerActivityIsReused(client, current, providerActivityRef))
+      ) {
+        await ensureBillingFence(client, {
+          workspaceId: current.workspaceId,
+          threadId: current.threadId,
+          settlementId: current.settlementId,
+          reason: "provider-outcome-uncertain",
+          processorId,
+          leaseExpiresAt: current.processingLeaseExpiresAt ?? now,
+          now,
+        });
+        return updateOwned(
+          client,
+          current,
+          processorId,
+          `UPDATE cloud_usage_settlement_attempt
+              SET state = 'reconciliation-required', failure_code = $4,
+                  processing_owner = NULL, processing_lease_expires_at = NULL,
+                  updated_at = $5::timestamptz`,
+          ["provider-activity-identity-reused", now],
+          ["submission-pending", "reconciliation-required"],
+        );
+      }
+      const storedActivity = await client.query<{
+        readonly provider_activity_ref: string | null;
+        readonly state: string;
+      }>(
+        `SELECT provider_activity_ref, state FROM cloud_usage_settlement_provider_attempt
+          WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3 FOR UPDATE`,
+        [current.workspaceId, current.settlementId, current.providerAttemptGeneration],
+      );
+      const storedActivityRef = storedActivity.rows[0]?.provider_activity_ref ?? undefined;
+      if (
+        storedActivityRef !== undefined &&
+        providerActivityRef !== undefined &&
+        storedActivityRef !== providerActivityRef
+      ) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "definitive provider activity does not match durable history",
+        );
+      }
+      const activity =
+        providerActivityRef === undefined
+          ? await client.query(
+              `UPDATE cloud_usage_settlement_provider_attempt
+                  SET state = 'not-applied', closed_at = $4::timestamptz,
+                      updated_at = $4::timestamptz
+                WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3
+                  AND state IN ('submission-pending', 'unknown')
+                  AND provider_activity_ref IS NULL`,
+              [current.workspaceId, current.settlementId, current.providerAttemptGeneration, now],
+            )
+          : await client.query(
+              `UPDATE cloud_usage_settlement_provider_attempt
+                  SET state = 'not-applied',
+                      provider_activity_ref = COALESCE(provider_activity_ref, $5),
+                      closed_at = $4::timestamptz,
+                      updated_at = $4::timestamptz
+                WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3
+                  AND state IN ('submission-pending', 'unknown')
+                  AND (provider_activity_ref IS NULL OR provider_activity_ref = $5)`,
+              [
+                current.workspaceId,
+                current.settlementId,
+                current.providerAttemptGeneration,
+                now,
+                providerActivityRef,
+              ],
+            );
+      if (activity.rowCount !== 1) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          `definitive provider result does not match active settlement generation ${current.providerAttemptGeneration} (${storedActivity.rows[0]?.state ?? "missing"})`,
+        );
+      }
+      const authorizationActive = await authorizationIsActive(client, current, now);
+      await ensureBillingFence(client, {
+        workspaceId: current.workspaceId,
+        threadId: current.threadId,
+        settlementId: current.settlementId,
+        reason: authorizationActive ? "provider-definitive-failure" : "authorization-unavailable",
+        processorId,
+        leaseExpiresAt: current.processingLeaseExpiresAt ?? nextSubmitNotBefore,
+        now,
+      });
+      return updateOwned(
+        client,
+        current,
+        processorId,
+        `UPDATE cloud_usage_settlement_attempt
+            SET state = 'retry-waiting', provider_attempt_generation = provider_attempt_generation + 1,
+                next_submit_not_before = $4::timestamptz, failure_code = $5,
+                processing_owner = NULL, processing_lease_expires_at = NULL,
+                updated_at = $6::timestamptz`,
+        [nextSubmitNotBefore, failureCode, now],
+        ["submission-pending", "reconciliation-required"],
+      );
+    }),
+  markLowBalancePausePending: (attempt, processorId, providerActivityRef, failureCode, now) =>
+    transaction(pool, async (client) => {
+      if (
+        providerActivityRef !== undefined &&
+        (await providerActivityIsReused(client, attempt, providerActivityRef))
+      ) {
+        await ensureBillingFence(client, {
+          workspaceId: attempt.workspaceId,
+          threadId: attempt.threadId,
+          settlementId: attempt.settlementId,
+          reason: "provider-outcome-uncertain",
+          processorId,
+          leaseExpiresAt: attempt.processingLeaseExpiresAt ?? now,
+          now,
+        });
+        return updateOwned(
+          client,
+          attempt,
+          processorId,
+          `UPDATE cloud_usage_settlement_attempt
+              SET state = 'reconciliation-required', failure_code = $4,
+                  processing_owner = NULL, processing_lease_expires_at = NULL,
+                  updated_at = $5::timestamptz`,
+          ["provider-activity-identity-reused", now],
+          ["submission-pending", "reconciliation-required"],
+        );
+      }
+      const activity = await client.query(
+        `UPDATE cloud_usage_settlement_provider_attempt
+            SET state = 'not-applied', provider_activity_ref = COALESCE(provider_activity_ref, $4),
+                closed_at = $5::timestamptz, updated_at = $5::timestamptz
+          WHERE workspace_id = $1 AND settlement_id = $2 AND generation = $3
+            AND state IN ('submission-pending', 'unknown')
+            AND ($4::text IS NULL OR provider_activity_ref IS NULL OR provider_activity_ref = $4)`,
+        [
+          attempt.workspaceId,
+          attempt.settlementId,
+          attempt.providerAttemptGeneration,
+          providerActivityRef ?? null,
+          now,
+        ],
+      );
+      if (activity.rowCount !== 1) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "low-balance result does not match the active settlement generation",
+        );
+      }
+      await ensureBillingFence(client, {
+        workspaceId: attempt.workspaceId,
+        threadId: attempt.threadId,
+        settlementId: attempt.settlementId,
+        reason: "insufficient-balance",
+        processorId,
+        leaseExpiresAt: attempt.processingLeaseExpiresAt ?? now,
+        now,
+      });
+      const existingFence = await client.query<{ readonly state: string }>(
+        `SELECT state FROM cloud_usage_billing_fence
+          WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared' FOR UPDATE`,
+        [attempt.workspaceId, attempt.threadId],
+      );
+      if (existingFence.rows[0]?.state === "paused") {
+        return updateOwned(
+          client,
+          attempt,
+          processorId,
+          `UPDATE cloud_usage_settlement_attempt
+              SET state = 'low-balance-paused',
+                  provider_attempt_generation = provider_attempt_generation + 1,
+                  failure_code = $4, processing_owner = NULL,
+                  processing_lease_expires_at = NULL, updated_at = $5::timestamptz`,
+          [failureCode, now],
+          ["submission-pending", "reconciliation-required"],
+        );
+      }
+      return updateOwned(
         client,
         attempt,
         processorId,
@@ -743,21 +1686,41 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
                 updated_at = $5::timestamptz`,
         [failureCode, now],
         ["submission-pending", "reconciliation-required"],
-      ),
-    ),
+      );
+    }),
   markLowBalancePaused: (attempt, processorId, now) =>
-    transaction(pool, (client) =>
-      updateOwned(
+    transaction(pool, async (client) => {
+      const paused = await updateOwned(
         client,
         attempt,
         processorId,
         `UPDATE cloud_usage_settlement_attempt
-            SET state = 'low-balance-paused', processing_owner = NULL,
+            SET state = 'low-balance-paused',
+                provider_attempt_generation = provider_attempt_generation + 1,
+                processing_owner = NULL,
                 processing_lease_expires_at = NULL, updated_at = $4::timestamptz`,
         [now],
         ["low-balance-pause-pending"],
-      ),
-    ),
+      );
+      const fence = await client.query(
+        `UPDATE cloud_usage_billing_fence
+            SET state = 'paused', paused_at = $5::timestamptz,
+                processing_owner = NULL, processing_lease_expires_at = NULL,
+                updated_at = $5::timestamptz
+          WHERE workspace_id = $1 AND thread_id = $2
+            AND (settlement_id = $3 OR recovery_settlement_id = $3)
+            AND state = 'pause-pending'
+            AND processing_owner = $4`,
+        [attempt.workspaceId, attempt.threadId, attempt.settlementId, processorId, now],
+      );
+      if (fence.rowCount !== 1) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "low-balance billing fence lease changed",
+        );
+      }
+      return requireAttempt(client, paused.workspaceId, paused.settlementId);
+    }),
   finalize: (attempt, processorId, receipt, now) =>
     transaction(pool, async (client) => {
       const current = await requireAttempt(client, attempt.workspaceId, attempt.settlementId);
@@ -804,7 +1767,7 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
           now,
         ],
       );
-      return updateOwned(
+      const finalized = await updateOwned(
         client,
         current,
         processorId,
@@ -815,6 +1778,27 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         [now],
         ["transfer-applied"],
       );
+      await client.query(
+        `UPDATE cloud_usage_billing_fence
+            SET state = 'cleared', cleared_at = $3::timestamptz,
+                processing_owner = NULL, processing_lease_expires_at = NULL,
+                updated_at = $3::timestamptz
+          WHERE workspace_id = $1 AND thread_id = $2 AND state = 'paused'
+            AND settlement_id = $4`,
+        [current.workspaceId, current.threadId, now, current.settlementId],
+      );
+      const activeFence = await client.query(
+        `SELECT 1 FROM cloud_usage_billing_fence
+          WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared' LIMIT 1`,
+        [current.workspaceId, current.threadId],
+      );
+      if (activeFence.rowCount !== 0) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "billing fence must be durably paused before settlement finalization",
+        );
+      }
+      return finalized;
     }),
   releaseLease: (attempt, processorId, failureCode, now) =>
     transaction(pool, async (client) => {
@@ -829,5 +1813,165 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
       if (result.rowCount !== 1) {
         throw new UsageSettlementRepositoryError("conflict", "settlement processing lease changed");
       }
+    }),
+  claimPendingBillingFences: (processorId, now, leaseExpiresAt, limit) =>
+    transaction(pool, async (client) => {
+      const result = await client.query<BillingFenceRow>(
+        `WITH candidates AS (
+           SELECT workspace_id, thread_id, fence_id
+             FROM cloud_usage_billing_fence
+            WHERE state = 'pause-pending'
+              AND (processing_owner IS NULL OR processing_owner = $3
+                OR processing_lease_expires_at <= $1::timestamptz)
+            ORDER BY created_at, workspace_id, thread_id
+            LIMIT $2 FOR UPDATE SKIP LOCKED
+         )
+         UPDATE cloud_usage_billing_fence fence
+            SET processing_owner = $3, processing_lease_expires_at = $4::timestamptz,
+                updated_at = $1::timestamptz
+           FROM candidates
+          WHERE fence.workspace_id = candidates.workspace_id
+            AND fence.thread_id = candidates.thread_id
+            AND fence.fence_id = candidates.fence_id
+         RETURNING ${billingFenceColumns}`,
+        [now, limit, processorId, leaseExpiresAt],
+      );
+      return result.rows.map(billingFenceFromRow);
+    }),
+  markBillingFencePaused: (fence, processorId, pausedAt) =>
+    transaction(pool, async (client) => {
+      const result = await client.query<BillingFenceRow>(
+        `UPDATE cloud_usage_billing_fence fence
+            SET state = 'paused', paused_at = $5::timestamptz,
+                processing_owner = NULL, processing_lease_expires_at = NULL,
+                updated_at = $5::timestamptz
+          WHERE workspace_id = $1 AND thread_id = $2 AND fence_id = $3
+            AND state = 'pause-pending' AND processing_owner = $4
+          RETURNING ${billingFenceColumns}`,
+        [fence.workspaceId, fence.threadId, fence.fenceId, processorId, pausedAt],
+      );
+      const row = result.rows[0];
+      if (row === undefined) {
+        throw new UsageSettlementRepositoryError("conflict", "billing fence lease changed");
+      }
+      await client.query(
+        `UPDATE cloud_usage_settlement_attempt attempt
+            SET state = 'low-balance-paused',
+                provider_attempt_generation = provider_attempt_generation + 1,
+                processing_owner = NULL, processing_lease_expires_at = NULL,
+                updated_at = $4::timestamptz
+          WHERE attempt.workspace_id = $1 AND attempt.thread_id = $2
+            AND attempt.state = 'low-balance-pause-pending'
+            AND attempt.settlement_id = (
+              SELECT settlement_id FROM cloud_usage_billing_fence
+               WHERE workspace_id = $1 AND thread_id = $2 AND fence_id = $3
+            )`,
+        [fence.workspaceId, fence.threadId, fence.fenceId, pausedAt],
+      );
+      return billingFenceFromRow(row);
+    }),
+  claimProviderFailureRetry: (workspaceId, settlementId, processorId, now, leaseExpiresAt) =>
+    transaction(pool, async (client) => {
+      const attemptResult = await client.query<{
+        readonly thread_id: string;
+        readonly state: UsageSettlementAttemptState;
+      }>(
+        `SELECT thread_id, state FROM cloud_usage_settlement_attempt
+          WHERE workspace_id = $1 AND settlement_id = $2
+            AND state IN ('reserved', 'retry-waiting', 'reconciliation-required')
+            AND (state <> 'retry-waiting' OR next_submit_not_before <= $3::timestamptz)
+            AND (
+              state <> 'reconciliation-required'
+              OR updated_at <= $3::timestamptz - interval '5 seconds'
+            )
+            AND (processing_owner IS NULL OR processing_lease_expires_at <= $3::timestamptz)
+          FOR UPDATE`,
+        [workspaceId, settlementId, now],
+      );
+      const attemptRow = attemptResult.rows[0];
+      if (attemptRow === undefined) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "provider-failure settlement is not retry eligible",
+        );
+      }
+      const fence = await client.query(
+        `SELECT 1 FROM cloud_usage_billing_fence
+          WHERE workspace_id = $1 AND thread_id = $2 AND settlement_id = $3
+            AND state = 'paused' FOR SHARE`,
+        [workspaceId, attemptRow.thread_id, settlementId],
+      );
+      if (fence.rowCount !== 1) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "provider-failure billing fence must remain paused through explicit recovery",
+        );
+      }
+      await client.query(
+        `UPDATE cloud_usage_settlement_attempt
+            SET state = CASE WHEN state = 'retry-waiting' THEN 'reserved' ELSE state END,
+                next_submit_not_before = CASE
+                  WHEN state = 'retry-waiting' THEN NULL ELSE next_submit_not_before
+                END,
+                processing_owner = $3, processing_lease_expires_at = $4::timestamptz,
+                updated_at = $5::timestamptz
+          WHERE workspace_id = $1 AND settlement_id = $2`,
+        [workspaceId, settlementId, processorId, leaseExpiresAt, now],
+      );
+      return requireAttempt(client, workspaceId, settlementId);
+    }),
+  claimAuthorizationRecovery: (workspaceId, threadId, processorId, now, leaseExpiresAt) =>
+    transaction(pool, async (client) => {
+      const fence = await client.query<{ readonly settlement_id: string | null }>(
+        `SELECT settlement_id
+           FROM cloud_usage_billing_fence
+          WHERE workspace_id = $1 AND thread_id = $2
+            AND reason = 'authorization-unavailable' AND state = 'paused'
+          FOR UPDATE`,
+        [workspaceId, threadId],
+      );
+      const settlementId = fence.rows[0]?.settlement_id;
+      if (settlementId == null) return undefined;
+      const current = await requireAttempt(client, workspaceId, settlementId as SettlementId);
+      if (current.state !== "reserved" && current.state !== "retry-waiting") {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "authorization may change only before a provider submission generation starts",
+        );
+      }
+      if (
+        current.state === "retry-waiting" &&
+        current.nextSubmitNotBefore !== undefined &&
+        current.nextSubmitNotBefore > now
+      ) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "authorization recovery is waiting for its persisted retry window",
+        );
+      }
+      const rebound = await rebindAuthorizationIfNeeded(client, current, now);
+      if (!(await authorizationIsActive(client, rebound, now))) {
+        throw new UsageSettlementRepositoryError(
+          "configurationMissing",
+          "an active delegated authorization is required for recovery",
+        );
+      }
+      const claimed = await client.query(
+        `UPDATE cloud_usage_settlement_attempt
+            SET state = 'reserved', next_submit_not_before = NULL,
+                processing_owner = $3, processing_lease_expires_at = $4::timestamptz,
+                updated_at = $5::timestamptz
+          WHERE workspace_id = $1 AND settlement_id = $2
+            AND state IN ('reserved', 'retry-waiting')
+            AND (processing_owner IS NULL OR processing_lease_expires_at <= $5::timestamptz)`,
+        [workspaceId, rebound.settlementId, processorId, leaseExpiresAt, now],
+      );
+      if (claimed.rowCount !== 1) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "authorization recovery settlement lease changed",
+        );
+      }
+      return requireAttempt(client, workspaceId, rebound.settlementId);
     }),
 });

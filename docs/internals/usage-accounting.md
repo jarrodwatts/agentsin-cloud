@@ -70,17 +70,33 @@ closes. PostgreSQL assigns each accrual to at most one deterministic settlement 
 external call. A bounded processing lease prevents ordinary concurrent submission, while the same
 settlement ID and request fingerprint are the mandatory provider idempotency identity after a
 crash. `submission-pending` is deliberately ambiguous: recovery inspects Turnkey/on-chain evidence
-before it may submit. Unknown outcomes enter `reconciliation-required` and are never blindly
-retried.
+before it may submit. Unknown outcomes enter `reconciliation-required`, establish a durable
+billing hold, and are never blindly resubmitted. Explicit inspection retries have a persisted
+minimum delay; definitive `notApplied` evidence closes one immutable provider-attempt generation
+before a fresh idempotency key can be created.
+
+Authorization is revalidated in the same PostgreSQL transaction that starts every provider-attempt
+generation. Expiry or revocation at that boundary creates an authorization hold without calling
+Turnkey. A replacement authorization may be bound only after the prior provider generation is
+definitively not applied; ambiguous or already-applied generations keep their original authority
+and remain inspect-only.
 
 After an exact Monad transfer is observed, the control plane signs a receipt binding the workspace,
 thread, ordered E2B evidence range, every immutable H4 posting, signed upstream/markup/total sums,
-and transaction hash. The receipt and finalized attempt are immutable. Signing failure after a
-transfer leaves `transfer-applied` recoverable without another transfer.
+and transaction hash. The receipt and finalized attempt are immutable. Signing, validation, or
+finalization failure after a transfer leaves `transfer-applied` recoverable without another
+transfer and activates the same durable runtime hold until receipt finalization succeeds.
 
-Insufficient balance durably moves the attempt to a low-balance state and invokes the injected
-runtime boundary to pause the thread without destroying its workspace. Ordinary recovery skips that
-state. Only an explicit post-funding retry can re-enter submission.
+Insufficient balance, unavailable authorization, definitive provider failure, and ambiguous
+provider evidence create a durable per-thread billing fence. The fence's episode gives runtime
+pause one stable idempotency key across crashes and lost responses. PostgreSQL blocks thread create
+and resume transitions while that fence is active. The hold stays active through retries and is
+cleared atomically only with successful receipt finalization; low balance requires an explicit
+post-funding retry.
+
+Migration `0017-usage-settlement-hardening.sql` is additive over the original settlement schema. It
+backfills authorization and provider-attempt generation history, canonicalizes safe legacy hashes,
+and fails closed when case-variant hashes or incomplete applied history require operator review.
 
 ## Production gates
 
@@ -90,7 +106,11 @@ ports and uses fakes in tests. Production must remain disabled until the composi
 - an idempotent WalletService/Turnkey adapter that verifies Monad chain 143, native Circle USDC,
   treasury, exact amount, transaction status, and confirmation depth;
 - a KMS-backed receipt signer whose public key and rotation history are published;
-- the C4 fail-closed pause boundary for insufficient balance;
+- the C4 runtime pause adapter and authoritative create/resume composition for every billing-fence
+  transition;
+- activation and recovery of the approved workspace-wide wallet-policy hold, including pausing
+  already-running sibling threads; the checked-in per-thread fence must not be presented as that
+  workspace-wide control;
 - an authenticated E2B invoice source for H4 and an operator reconciler comparing that source,
   immutable accruals, signed receipts, wallet reservations, and on-chain transfers;
 - a controlled tiny-value Monad mainnet canary before customer funds are enabled.

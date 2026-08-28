@@ -30,6 +30,7 @@ import {
 import { makePostgresUsageSettlementRepository } from "./usageSettlementRepository.ts";
 import {
   makeUsageSettlementService,
+  MonadSettlementPortError,
   SettlementReceiptSignerError,
   SettlementRuntimeBoundaryError,
   type MonadSettlementObservation,
@@ -70,8 +71,11 @@ const fixture = (url: string) =>
         "0002-cloud-thread-store.sql",
         "0004-cloud-thread-lifecycle.sql",
         "0012-user-wallets.sql",
+        "0013-cloud-thread-runtime.sql",
         "0014-usage-ledger.sql",
+        "0015-e2b-template-identity.sql",
         "0016-usage-settlements.sql",
+        "0017-usage-settlement-hardening.sql",
       ]) {
         const migration = await NodeFSP.readFile(
           new URL(`./migrations/${filename}`, import.meta.url),
@@ -81,7 +85,7 @@ const fixture = (url: string) =>
       }
       await pool.query(
         await NodeFSP.readFile(
-          new URL("./migrations/0016-usage-settlements.sql", import.meta.url),
+          new URL("./migrations/0017-usage-settlement-hardening.sql", import.meta.url),
           "utf8",
         ),
       );
@@ -99,8 +103,8 @@ const fixture = (url: string) =>
         `INSERT INTO cloud_e2b_sandbox_identity (
            workspace_id, reservation_id, thread_id, environment_id, project_id, revision_id,
            repository_identity, workspace_directory, sandbox_id, provider_handle, state,
-           requested_at, activated_at, updated_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$11,$11)`,
+           provider_template_id, provider_build_id, requested_at, activated_at, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$12,$13,$13,$13)`,
         [
           workspaceId,
           "settlement-reservation",
@@ -112,6 +116,8 @@ const fixture = (url: string) =>
           "/workspace/agentsin-cloud",
           sandboxId,
           "e2b-settlement-sandbox",
+          "agentsin-cloud-settlement",
+          "11111111-1111-4111-8111-111111111111",
           "2026-08-28T00:00:00.000Z",
         ],
       );
@@ -189,6 +195,7 @@ const accrue = (
   records: Map<string, VerifiedE2bUsageEvidence>,
   value: VerifiedE2bUsageEvidence,
   idempotencyKey: string,
+  now = "2026-08-28T00:06:00.000Z",
 ) => {
   const source: VerifiedE2bUsageSource = {
     read: (request) => Effect.succeed(records.get(request.evidenceId)!),
@@ -196,7 +203,7 @@ const accrue = (
   const service = makeUsageMeteringService({
     repository: makePostgresUsageLedgerRepository(pool),
     source,
-    now: () => "2026-08-28T00:06:00.000Z",
+    now: () => now,
     sampleId: (request) => `sample-${request.idempotencyKey}` as UsageSampleId,
     accrualId: (request) => `accrual-${request.idempotencyKey}` as UsageAccrualId,
   });
@@ -223,13 +230,18 @@ const makeChain = () => {
   let inspectResult: MonadSettlementObservation = { status: "notApplied" };
   let submits = 0;
   let inspections = 0;
+  let inspectFailure: MonadSettlementPortError | undefined;
+  const submitKeys: Array<string> = [];
   const port: MonadSettlementPort = {
     inspect: () => {
       inspections += 1;
-      return Effect.succeed(inspectResult);
+      return inspectFailure === undefined
+        ? Effect.succeed(inspectResult)
+        : Effect.fail(inspectFailure);
     },
-    submit: () => {
+    submit: (request) => {
       submits += 1;
+      submitKeys.push(request.idempotencyKey);
       return Effect.succeed(submitResult);
     },
   };
@@ -237,11 +249,20 @@ const makeChain = () => {
     port,
     submits: () => submits,
     inspections: () => inspections,
+    submitKeys: () => submitKeys,
     setSubmit: (value: MonadSettlementObservation) => {
       submitResult = value;
     },
     setInspect: (value: MonadSettlementObservation) => {
+      inspectFailure = undefined;
       inspectResult = value;
+    },
+    setInspectFailure: (outcome: "uncertain" | "notApplied") => {
+      inspectFailure = new MonadSettlementPortError({
+        code: "provider-inspection-failed",
+        outcome,
+        retryable: outcome === "uncertain",
+      });
     },
   };
 };
@@ -262,9 +283,11 @@ const signer = (fails = false): SettlementReceiptSigner => ({
 const makeRuntime = () => {
   let pauses = 0;
   let fails = false;
+  const requestIds: Array<string> = [];
   const runtime: SettlementRuntimeBoundary = {
-    pauseForInsufficientBalance: () => {
+    pauseForBillingFailure: (request) => {
       pauses += 1;
+      requestIds.push(request.requestId);
       return fails
         ? Effect.fail(
             new SettlementRuntimeBoundaryError({ code: "runtime-unavailable", retryable: true }),
@@ -275,6 +298,7 @@ const makeRuntime = () => {
   return {
     runtime,
     pauses: () => pauses,
+    requestIds: () => requestIds,
     setFail: (value: boolean) => {
       fails = value;
     },
@@ -304,6 +328,36 @@ const onlySettlementId = (pool: Pool) =>
       "SELECT settlement_id FROM cloud_usage_settlement_attempt",
     )
     .then((result) => result.rows[0]!.settlement_id as SettlementId);
+
+const settlementIds = (pool: Pool) =>
+  pool
+    .query<{ readonly settlement_id: string }>(
+      "SELECT settlement_id FROM cloud_usage_settlement_attempt ORDER BY created_at, settlement_id",
+    )
+    .then((result) => result.rows.map((row) => row.settlement_id as SettlementId));
+
+const addAuthorization = (pool: Pool, id: string) =>
+  pool.query(
+    `INSERT INTO cloud_wallet_delegated_authorization (
+       workspace_id, wallet_id, authorization_id, chain_id, token_contract,
+       treasury_address, per_charge_limit_micro_usdc, daily_limit_micro_usdc,
+       starts_at, expires_at, policy_revision, provider_policy_ref,
+       provider_delegated_user_ref, provider_delegated_credential_ref,
+       state, created_at, updated_at
+     ) VALUES ($1,$2,$3,143,$4,$5,10000000,50000000,$6,$7,1,$8,$9,$10,'active',$6,$6)`,
+    [
+      workspaceId,
+      walletId,
+      id,
+      "0x754704Bc059F8C67012fEd69BC8A327a5aafb603",
+      treasuryAddress,
+      "2026-08-28T00:00:00.000Z",
+      "2026-08-29T00:00:00.000Z",
+      `turnkey-policy-${id}`,
+      `turnkey-user-${id}`,
+      `secret://turnkey/delegated/${id}`,
+    ],
+  );
 
 it.effect("settles immutable debit and credit accruals once under concurrent delivery", () =>
   withPostgres((pool) =>
@@ -463,8 +517,9 @@ it.effect("recovers after transfer submission without submitting a second transa
       const failing = settlementService(pool, chain, signer(true), runtime.runtime, "settler-a");
       expect(
         yield* failing.settleReady({ trigger: "sandbox-closed", workspaceId, threadId }),
-      ).toMatchObject({ claimed: 1, pending: 1, finalized: 0 });
+      ).toMatchObject({ claimed: 1, pending: 1, finalized: 0, billingPaused: 1 });
       expect(chain.submits()).toBe(1);
+      expect(runtime.pauses()).toBe(1);
       const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
       const before = yield* Effect.promise(() =>
         makePostgresUsageSettlementRepository(pool).get(workspaceId, settlementId),
@@ -473,6 +528,100 @@ it.effect("recovers after transfer submission without submitting a second transa
 
       const recovered = settlementService(pool, chain, signer(), runtime.runtime, "settler-b");
       expect((yield* recovered.recoverPending()).finalized).toBe(1);
+      expect(chain.submits()).toBe(1);
+    }),
+  ),
+);
+
+it.effect("holds compute when a receipt signer returns a mismatched signature", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("signature-mismatch", 1, 2_100, "b");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "signature-mismatch-v1");
+      const chain = makeChain();
+      const runtime = makeRuntime();
+      const mismatchedSigner: SettlementReceiptSigner = {
+        sign: ({ signedAt }) =>
+          Effect.succeed({
+            algorithm: "ed25519",
+            keyId: "kms://settlement-receipts/v1",
+            payloadHash: "f".repeat(64) as UsageEvidenceSha256,
+            signature: "mismatched-signature",
+            signedAt,
+          }),
+      };
+      const held = yield* settlementService(
+        pool,
+        chain,
+        mismatchedSigner,
+        runtime.runtime,
+        "settler-signature-mismatch",
+      ).settleReady({ trigger: "sandbox-closed", workspaceId, threadId });
+      expect(held).toMatchObject({ claimed: 1, finalized: 0, billingPaused: 1 });
+      expect(runtime.pauses()).toBe(1);
+      expect(
+        yield* Effect.promise(() =>
+          pool.query(
+            `SELECT reason, state FROM cloud_usage_billing_fence
+              WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'`,
+            [workspaceId, threadId],
+          ),
+        ),
+      ).toMatchObject({
+        rows: [{ reason: "provider-outcome-uncertain", state: "paused" }],
+      });
+
+      const recovered = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-signature-recovery",
+        "2026-08-28T00:16:00.000Z",
+      ).recoverPending();
+      expect(recovered.finalized).toBe(1);
+      expect(chain.submits()).toBe(1);
+      expect(
+        yield* Effect.promise(() =>
+          pool.query(
+            `SELECT count(*)::integer AS count FROM cloud_usage_billing_fence
+              WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'`,
+            [workspaceId, threadId],
+          ),
+        ),
+      ).toMatchObject({ rows: [{ count: 0 }] });
+    }),
+  ),
+);
+
+it.effect("rejects a future provider submission timestamp and pauses compute", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("future-submission", 1, 2_200, "e");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "future-submission-v1");
+      const chain = makeChain();
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-future-submission",
+        txHash: `0x${"e".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:00.001Z",
+      });
+      const runtime = makeRuntime();
+      const result = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-future-submission",
+        "2026-08-28T00:15:00.000Z",
+      ).settleReady({ trigger: "sandbox-closed", workspaceId, threadId });
+      expect(result).toMatchObject({
+        claimed: 1,
+        finalized: 0,
+        reconciliationRequired: 1,
+        billingPaused: 1,
+      });
+      expect(runtime.pauses()).toBe(1);
       expect(chain.submits()).toBe(1);
     }),
   ),
@@ -507,8 +656,9 @@ it.effect("reconciles an uncertain transfer and never resubmits it", () =>
           signer(),
           runtime.runtime,
           "settler-not-applied-mismatch",
-        ).recoverPending(),
-      ).toMatchObject({ reconciliationRequired: 1, finalized: 0 });
+          "2026-08-28T00:15:05.000Z",
+        ).retryProviderFailure(workspaceId, yield* Effect.promise(() => onlySettlementId(pool))),
+      ).toMatchObject({ state: "reconciliation-required" });
       expect(chain.submits()).toBe(1);
 
       chain.setInspect({
@@ -524,8 +674,9 @@ it.effect("reconciles an uncertain transfer and never resubmits it", () =>
           signer(),
           runtime.runtime,
           "settler-mismatch",
-        ).recoverPending(),
-      ).toMatchObject({ reconciliationRequired: 1, finalized: 0 });
+          "2026-08-28T00:15:10.000Z",
+        ).retryProviderFailure(workspaceId, yield* Effect.promise(() => onlySettlementId(pool))),
+      ).toMatchObject({ state: "reconciliation-required" });
 
       chain.setInspect({
         status: "applied",
@@ -539,9 +690,50 @@ it.effect("reconciles an uncertain transfer and never resubmits it", () =>
         signer(),
         runtime.runtime,
         "settler-b",
-      ).recoverPending();
-      expect(recovered.finalized).toBe(1);
+        "2026-08-28T00:15:15.000Z",
+      ).retryProviderFailure(workspaceId, yield* Effect.promise(() => onlySettlementId(pool)));
+      expect(recovered.state).toBe("finalized");
       expect(chain.submits()).toBe(1);
+    }),
+  ),
+);
+
+it.effect("holds compute when provider inspection fails definitively", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("inspection-failure", 1, 3_500, "3");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "inspection-failure-v1");
+      const chain = makeChain();
+      chain.setInspectFailure("notApplied");
+      const runtime = makeRuntime();
+      const firstSweep = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-inspection-failure",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      expect(firstSweep).toMatchObject({
+        claimed: 1,
+        reconciliationRequired: 1,
+        billingPaused: 1,
+      });
+      expect(chain.submits()).toBe(0);
+      expect(runtime.pauses()).toBe(1);
+      const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
+      const held = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-inspection-failure-retry",
+        "2026-08-28T00:15:05.000Z",
+      ).retryProviderFailure(workspaceId, settlementId);
+      expect(held).toMatchObject({
+        state: "reconciliation-required",
+        failureCode: "provider-inspection-failed",
+      });
+      expect(chain.submits()).toBe(0);
     }),
   ),
 );
@@ -571,22 +763,43 @@ it.effect("durably pauses on low balance and resumes only after an explicit fund
       expect(stored?.receipt).toBeUndefined();
       expect((yield* service.recoverPending()).claimed).toBe(0);
 
+      const stillUnderfunded = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-still-underfunded",
+      ).retryLowBalance(workspaceId, settlementId);
+      expect(stillUnderfunded.state).toBe("low-balance-paused");
+      expect(chain.submits()).toBe(2);
+      expect(runtime.pauses()).toBe(1);
+
       chain.setSubmit({
         status: "applied",
         providerActivityRef: "turnkey-funded-1",
         txHash: appliedTx,
         submittedAt: "2026-08-28T00:15:00.000Z",
       });
+      yield* Effect.promise(() =>
+        makePostgresUsageSettlementRepository(pool).claimLowBalance(
+          workspaceId,
+          settlementId,
+          "settler-funding-crash",
+          "2026-08-28T00:15:01.000Z",
+          "2026-08-28T00:15:02.000Z",
+        ),
+      );
       const funded = yield* settlementService(
         pool,
         chain,
         signer(),
         runtime.runtime,
         "settler-b",
+        "2026-08-28T00:15:03.000Z",
       ).retryLowBalance(workspaceId, settlementId);
       expect(funded.state).toBe("finalized");
       expect(runtime.pauses()).toBe(1);
-      expect(chain.submits()).toBe(2);
+      expect(chain.submits()).toBe(3);
     }),
   ),
 );
@@ -614,9 +827,884 @@ it.effect("keeps a failed low-balance pause durable and retries only the pause b
       ).toBe("low-balance-pause-pending");
 
       runtime.setFail(false);
-      expect((yield* service.recoverPending()).lowBalancePaused).toBe(1);
+      expect((yield* service.recoverPending()).billingPaused).toBe(1);
       expect(chain.submits()).toBe(1);
-      expect(runtime.pauses()).toBe(2);
+      expect(runtime.pauses()).toBe(3);
+      expect(new Set(runtime.requestIds()).size).toBe(1);
+      expect(
+        (yield* Effect.promise(() =>
+          makePostgresUsageSettlementRepository(pool).get(workspaceId, settlementId),
+        ))?.state,
+      ).toBe("low-balance-paused");
+    }),
+  ),
+);
+
+it.effect("bounds definitive retries with a new auditable provider generation", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("bounded-retry", 1, 6_000, "8");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "bounded-retry-v1");
+      const chain = makeChain();
+      chain.setSubmit({
+        status: "notApplied",
+        providerActivityRef: "turnkey-bounded-not-applied",
+      });
+      const runtime = makeRuntime();
+      const firstService = settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-first",
+      );
+      const firstSweep = yield* firstService.settleReady({
+        trigger: "sandbox-paused",
+        workspaceId,
+        threadId,
+      });
+      expect(firstSweep).toMatchObject({ claimed: 1, finalized: 0, billingPaused: 1 });
+      expect(chain.submits()).toBe(1);
+      const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
+      const waiting = yield* Effect.promise(() =>
+        makePostgresUsageSettlementRepository(pool).get(workspaceId, settlementId),
+      );
+      expect(waiting).toMatchObject({ state: "retry-waiting", providerAttemptGeneration: 2 });
+
+      expect(
+        Exit.isFailure(
+          yield* Effect.exit(
+            settlementService(
+              pool,
+              chain,
+              signer(),
+              runtime.runtime,
+              "settler-too-early",
+              "2026-08-28T00:15:04.999Z",
+            ).retryProviderFailure(workspaceId, settlementId),
+          ),
+        ),
+      ).toBe(true);
+      expect(chain.submits()).toBe(1);
+
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-bounded-retry-2",
+        txHash: `0x${"b".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:05.000Z",
+      });
+      yield* Effect.promise(() =>
+        makePostgresUsageSettlementRepository(pool).claimProviderFailureRetry(
+          workspaceId,
+          settlementId,
+          "settler-provider-crash",
+          "2026-08-28T00:15:05.000Z",
+          "2026-08-28T00:15:06.000Z",
+        ),
+      );
+      const finalized = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-second",
+        "2026-08-28T00:15:07.000Z",
+      ).retryProviderFailure(workspaceId, settlementId);
+      expect(finalized.state).toBe("finalized");
+      expect(chain.submits()).toBe(2);
+      expect(new Set(chain.submitKeys()).size).toBe(2);
+      const history = yield* Effect.promise(() =>
+        pool.query<{ readonly generation: number; readonly state: string }>(
+          `SELECT generation, state FROM cloud_usage_settlement_provider_attempt
+            WHERE workspace_id = $1 AND settlement_id = $2 ORDER BY generation`,
+          [workspaceId, settlementId],
+        ),
+      );
+      expect(history.rows).toEqual([
+        { generation: 1, state: "not-applied" },
+        { generation: 2, state: "applied" },
+      ]);
+    }),
+  ),
+);
+
+it.effect("keeps one active hold while retry outcomes change reason", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("cross-reason", 1, 6_500, "0");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "cross-reason-v1");
+      const chain = makeChain();
+      chain.setSubmit({ status: "notApplied" });
+      const runtime = makeRuntime();
+      yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-cross-provider",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
+      chain.setSubmit({ status: "insufficientBalance" });
+      const low = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-cross-low",
+        "2026-08-28T00:15:05.000Z",
+      ).retryProviderFailure(workspaceId, settlementId);
+      expect(low.state).toBe("low-balance-paused");
+      const activeAfterLow = yield* Effect.promise(() =>
+        pool.query<{ readonly fence_id: string; readonly reason: string; readonly state: string }>(
+          `SELECT fence_id, reason, state FROM cloud_usage_billing_fence
+            WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'`,
+          [workspaceId, threadId],
+        ),
+      );
+      expect(activeAfterLow.rows).toHaveLength(1);
+      expect(activeAfterLow.rows[0]).toMatchObject({
+        reason: "insufficient-balance",
+        state: "paused",
+      });
+
+      chain.setSubmit({ status: "notApplied" });
+      const providerAgain = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-cross-provider-again",
+        "2026-08-28T00:15:06.000Z",
+      ).retryLowBalance(workspaceId, settlementId);
+      expect(providerAgain.state).toBe("retry-waiting");
+      const activeAfterProvider = yield* Effect.promise(() =>
+        pool.query<{ readonly fence_id: string; readonly reason: string }>(
+          `SELECT fence_id, reason FROM cloud_usage_billing_fence
+            WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared'`,
+          [workspaceId, threadId],
+        ),
+      );
+      expect(activeAfterProvider.rows).toEqual([
+        {
+          fence_id: activeAfterLow.rows[0]!.fence_id,
+          reason: "provider-definitive-failure",
+        },
+      ]);
+      const events = yield* Effect.promise(() =>
+        pool.query<{ readonly reason: string }>(
+          `SELECT reason FROM cloud_usage_billing_fence_event
+            WHERE workspace_id = $1 AND thread_id = $2 ORDER BY sequence`,
+          [workspaceId, threadId],
+        ),
+      );
+      expect(events.rows.map((row) => row.reason)).toEqual([
+        "provider-definitive-failure",
+        "insufficient-balance",
+        "provider-definitive-failure",
+      ]);
+    }),
+  ),
+);
+
+it.effect("inspects an uncertain transfer after authorization expiry without rebinding", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("expired-after-submit", 1, 6_750, "7");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "expired-after-submit-v1");
+      const chain = makeChain();
+      chain.setSubmit({ status: "unknown", providerActivityRef: "turnkey-expired-unknown" });
+      const runtime = makeRuntime();
+      yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-expired-submit",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_wallet_delegated_authorization SET state = 'revoked', updated_at = $2
+            WHERE workspace_id = $1 AND authorization_id = $3`,
+          [workspaceId, "2026-08-28T00:15:01.000Z", authorizationId],
+        ),
+      );
+      chain.setInspect({
+        status: "applied",
+        providerActivityRef: "turnkey-expired-unknown",
+        txHash: `0x${"f".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:00.000Z",
+      });
+      const finalized = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-expired-inspect",
+        "2026-08-28T00:15:05.000Z",
+      ).retryProviderFailure(workspaceId, settlementId);
+      expect(finalized).toMatchObject({
+        state: "finalized",
+        authorizationId,
+        authorizationGeneration: 1,
+      });
+      expect(chain.submits()).toBe(1);
+      expect(chain.inspections()).toBe(2);
+    }),
+  ),
+);
+
+it.effect("revalidates authorization immediately before the first provider generation", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("revoked-before-provider", 1, 6_800, "6");
+      yield* accrue(
+        pool,
+        new Map([[first.evidenceId, first]]),
+        first,
+        "revoked-before-provider-v1",
+      );
+      const repository = makePostgresUsageSettlementRepository(pool);
+      const [claimed] = yield* Effect.promise(() =>
+        repository.claimReady({
+          processorId: "settler-auth-race",
+          now: "2026-08-28T00:15:00.000Z",
+          leaseExpiresAt: "2026-08-28T00:16:00.000Z",
+          limit: 1,
+          trigger: "sandbox-paused",
+          workspaceId,
+          threadId,
+        }),
+      );
+      expect(claimed).toBeDefined();
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_wallet_delegated_authorization SET state = 'revoked', updated_at = $2
+            WHERE workspace_id = $1 AND authorization_id = $3`,
+          [workspaceId, "2026-08-28T00:15:00.500Z", authorizationId],
+        ),
+      );
+      const held = yield* Effect.promise(() =>
+        repository.setSubmissionPending(claimed!, "settler-auth-race", "2026-08-28T00:15:01.000Z"),
+      );
+      expect(held).toMatchObject({
+        state: "reserved",
+        failureCode: "authorization-unavailable",
+      });
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query(
+            `SELECT count(*)::integer AS count
+                 FROM cloud_usage_settlement_provider_attempt WHERE workspace_id = $1`,
+            [workspaceId],
+          ),
+        )).rows[0],
+      ).toEqual({ count: 0 });
+      const runtime = makeRuntime();
+      const sweep = yield* settlementService(
+        pool,
+        makeChain(),
+        signer(),
+        runtime.runtime,
+        "settler-auth-race",
+        "2026-08-28T00:15:02.000Z",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      expect(sweep).toMatchObject({ claimed: 0, billingPaused: 1 });
+      expect(runtime.requestIds()).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect("rebinds only after an uncertain transfer is definitively not applied", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("rebind-after-not-applied", 1, 6_900, "a");
+      yield* accrue(
+        pool,
+        new Map([[first.evidenceId, first]]),
+        first,
+        "rebind-after-not-applied-v1",
+      );
+      const chain = makeChain();
+      chain.setSubmit({ status: "unknown", providerActivityRef: "turnkey-rebind-unknown" });
+      const runtime = makeRuntime();
+      yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-rebind-submit",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_wallet_delegated_authorization SET state = 'revoked', updated_at = $2
+            WHERE workspace_id = $1 AND authorization_id = $3`,
+          [workspaceId, "2026-08-28T00:15:01.000Z", authorizationId],
+        ),
+      );
+      expect(
+        yield* Effect.promise(() =>
+          makePostgresUsageSettlementRepository(pool).get(workspaceId, settlementId),
+        ),
+      ).toMatchObject({
+        state: "reconciliation-required",
+        providerAttemptGeneration: 1,
+        providerActivityRef: "turnkey-rebind-unknown",
+      });
+      chain.setInspect({ status: "notApplied", providerActivityRef: "turnkey-rebind-unknown" });
+      expect(
+        yield* Effect.promise(() =>
+          pool.query(
+            `SELECT state, provider_activity_ref FROM cloud_usage_settlement_provider_attempt
+              WHERE workspace_id = $1 AND settlement_id = $2 AND generation = 1`,
+            [workspaceId, settlementId],
+          ),
+        ),
+      ).toMatchObject({
+        rows: [{ state: "unknown", provider_activity_ref: "turnkey-rebind-unknown" }],
+      });
+      const waiting = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-rebind-inspect",
+        "2026-08-28T00:15:05.000Z",
+      ).retryProviderFailure(workspaceId, settlementId);
+      expect(waiting).toMatchObject({
+        state: "retry-waiting",
+        authorizationGeneration: 1,
+        providerAttemptGeneration: 2,
+      });
+      const blockedGeneration = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-rebind-expired-generation",
+        "2026-08-28T00:15:10.000Z",
+      ).retryProviderFailure(workspaceId, settlementId);
+      expect(blockedGeneration).toMatchObject({
+        state: "reserved",
+        failureCode: "authorization-unavailable",
+        providerAttemptGeneration: 2,
+      });
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query(
+            `SELECT generation FROM cloud_usage_settlement_provider_attempt
+                WHERE workspace_id = $1 AND settlement_id = $2 ORDER BY generation`,
+            [workspaceId, settlementId],
+          ),
+        )).rows,
+      ).toEqual([{ generation: 1 }]);
+      yield* Effect.promise(() => addAuthorization(pool, "settlement-authorization-rebound"));
+      yield* Effect.promise(() =>
+        makePostgresUsageSettlementRepository(pool).claimAuthorizationRecovery(
+          workspaceId,
+          threadId,
+          "settler-authorization-crash",
+          "2026-08-28T00:15:15.000Z",
+          "2026-08-28T00:15:16.000Z",
+        ),
+      );
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-rebound-applied",
+        txHash: `0x${"1".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:06.000Z",
+      });
+      chain.setInspect({ status: "notApplied" });
+      const rebound = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-rebind-submit-new",
+        "2026-08-28T00:15:17.000Z",
+      ).retryAuthorization(workspaceId, threadId);
+      expect(rebound).toMatchObject({
+        state: "finalized",
+        authorizationId: "settlement-authorization-rebound",
+        authorizationGeneration: 2,
+        providerAttemptGeneration: 2,
+      });
+      expect(chain.submits()).toBe(2);
+      expect(new Set(chain.submitKeys()).size).toBe(2);
+      const bindings = yield* Effect.promise(() =>
+        pool.query<{ readonly generation: number; readonly authorization_id: string }>(
+          `SELECT generation, authorization_id
+             FROM cloud_usage_settlement_authorization_binding
+            WHERE workspace_id = $1 AND settlement_id = $2 ORDER BY generation`,
+          [workspaceId, settlementId],
+        ),
+      );
+      expect(bindings.rows).toEqual([
+        { generation: 1, authorization_id: authorizationId },
+        { generation: 2, authorization_id: "settlement-authorization-rebound" },
+      ]);
+    }),
+  ),
+);
+
+it.effect("keeps the full-candidate amount trigger when a charge cap splits the batch", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_wallet_delegated_authorization
+              SET per_charge_limit_micro_usdc = 200000 WHERE workspace_id = $1`,
+          [workspaceId],
+        ),
+      );
+      const first = evidence("split-one", 1, 150_000, "1");
+      const second = {
+        ...evidence("split-two", 1, 300_000, "2"),
+        intervalStart: "2026-08-28T00:05:00.000Z",
+        intervalEnd: "2026-08-28T00:10:00.000Z",
+        observedAt: "2026-08-28T00:11:00.000Z",
+      };
+      const records = new Map([
+        [first.evidenceId, first],
+        [second.evidenceId, second],
+      ]);
+      yield* accrue(pool, records, first, "split-one-v1");
+      yield* accrue(pool, records, second, "split-two-v1", "2026-08-28T00:11:00.000Z");
+      const chain = makeChain();
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-split-1",
+        txHash: `0x${"c".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:06:00.000Z",
+      });
+      const runtime = makeRuntime();
+      const result = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-split",
+        "2026-08-28T00:06:00.000Z",
+      ).settleReady();
+      expect(result).toMatchObject({ claimed: 1, finalized: 1 });
+      const id = yield* Effect.promise(() => onlySettlementId(pool));
+      const stored = yield* Effect.promise(() =>
+        makePostgresUsageSettlementRepository(pool).get(workspaceId, id),
+      );
+      expect(stored).toMatchObject({ trigger: "amount-threshold", totalDeltaMicroUsdc: 157_500 });
+      expect(stored?.postings).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect("canonicalizes transaction hashes and fences a case-variant reuse", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("canonical-first", 1, 7_000, "3");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "canonical-first-v1");
+      const chain = makeChain();
+      const uppercaseTx = `0x${"D".repeat(64)}` as EvmTransactionHash;
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-canonical-first",
+        txHash: uppercaseTx,
+        submittedAt: "2026-08-28T00:15:00.000Z",
+      });
+      const runtime = makeRuntime();
+      yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-canonical-first",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      const firstId = yield* Effect.promise(() => onlySettlementId(pool));
+      expect(
+        (yield* Effect.promise(() =>
+          makePostgresUsageSettlementRepository(pool).get(workspaceId, firstId),
+        ))?.txHash,
+      ).toBe(uppercaseTx.toLowerCase());
+
+      const second = {
+        ...evidence("canonical-second", 1, 15_000, "4"),
+        intervalStart: "2026-08-28T00:05:00.000Z",
+        intervalEnd: "2026-08-28T00:10:00.000Z",
+        observedAt: "2026-08-28T00:11:00.000Z",
+      };
+      yield* accrue(
+        pool,
+        new Map([[second.evidenceId, second]]),
+        second,
+        "canonical-second-v1",
+        "2026-08-28T00:11:00.000Z",
+      );
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-canonical-second",
+        txHash: uppercaseTx,
+        submittedAt: "2026-08-28T00:16:00.000Z",
+      });
+      const secondSweep = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-canonical-second",
+        "2026-08-28T00:16:00.000Z",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      expect(secondSweep).toMatchObject({ finalized: 0, reconciliationRequired: 1 });
+      const receipts = yield* Effect.promise(() =>
+        pool.query<{ readonly count: string }>(
+          "SELECT count(*)::text AS count FROM cloud_usage_settlement_receipt",
+        ),
+      );
+      expect(receipts.rows[0]?.count).toBe("1");
+      expect(yield* Effect.promise(() => settlementIds(pool))).toHaveLength(2);
+    }),
+  ),
+);
+
+it.effect("fences a reused provider activity returned with insufficient balance", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const first = evidence("low-reuse-first", 1, 7_100, "4");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "low-reuse-first-v1");
+      const chain = makeChain();
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-low-reused-activity",
+        txHash: `0x${"4".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:00.000Z",
+      });
+      const runtime = makeRuntime();
+      yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-low-reuse-first",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+
+      const second = {
+        ...evidence("low-reuse-second", 1, 7_200, "5"),
+        intervalStart: "2026-08-28T00:05:00.000Z",
+        intervalEnd: "2026-08-28T00:10:00.000Z",
+        observedAt: "2026-08-28T00:11:00.000Z",
+      };
+      yield* accrue(
+        pool,
+        new Map([[second.evidenceId, second]]),
+        second,
+        "low-reuse-second-v1",
+        "2026-08-28T00:11:00.000Z",
+      );
+      chain.setSubmit({
+        status: "insufficientBalance",
+        providerActivityRef: "turnkey-low-reused-activity",
+      });
+      const result = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-low-reuse-second",
+        "2026-08-28T00:16:00.000Z",
+      ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId });
+      expect(result).toMatchObject({
+        lowBalancePaused: 0,
+        reconciliationRequired: 1,
+        billingPaused: 1,
+      });
+      expect(runtime.pauses()).toBe(1);
+    }),
+  ),
+);
+
+it.effect("serializes concurrent canonical transfer identity collisions into a durable hold", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      const secondThreadId = "settlement-thread-race-two" as ThreadId;
+      yield* Effect.promise(() =>
+        pool.query(
+          "INSERT INTO cloud_thread (workspace_id, thread_id, environment_id) VALUES ($1,$2,$3)",
+          [workspaceId, secondThreadId, "settlement-environment-race-two"],
+        ),
+      );
+      const firstSettlementId = "settlement-canonical-race-one" as SettlementId;
+      const secondSettlementId = "settlement-canonical-race-two" as SettlementId;
+      for (const [position, settlementId, settlementThreadId, owner] of [
+        [1, firstSettlementId, threadId, "settler-race-one"],
+        [2, secondSettlementId, secondThreadId, "settler-race-two"],
+      ] as const) {
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_usage_settlement_attempt (
+               workspace_id, settlement_id, thread_id, state, trigger_kind, wallet_id,
+               authorization_id, wallet_address, treasury_address, first_pricing_sequence,
+               last_pricing_sequence, accrual_count, upstream_delta_micro_usdc,
+               markup_delta_micro_usdc, total_delta_micro_usdc, request_fingerprint,
+               processing_owner, processing_lease_expires_at, created_at, updated_at
+             ) VALUES ($1,$2,$3,'submission-pending','sandbox-paused',$4,$5,$6,$7,
+               $8,$8,1,100,5,105,$9,$10,$11,$12,$12)`,
+            [
+              workspaceId,
+              settlementId,
+              settlementThreadId,
+              walletId,
+              authorizationId,
+              walletAddress,
+              treasuryAddress,
+              position,
+              NodeCrypto.createHash("sha256").update(settlementId).digest("hex"),
+              owner,
+              "2026-08-28T00:16:00.000Z",
+              "2026-08-28T00:15:00.000Z",
+            ],
+          ),
+        );
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_usage_settlement_authorization_binding (
+               workspace_id, settlement_id, generation, wallet_id, authorization_id,
+               wallet_address, treasury_address, bound_at
+             ) VALUES ($1,$2,1,$3,$4,$5,$6,$7)`,
+            [
+              workspaceId,
+              settlementId,
+              walletId,
+              authorizationId,
+              walletAddress,
+              treasuryAddress,
+              "2026-08-28T00:15:00.000Z",
+            ],
+          ),
+        );
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_usage_settlement_provider_attempt (
+               workspace_id, settlement_id, generation, idempotency_key, state, created_at, updated_at
+             ) VALUES ($1,$2,1,$3,'submission-pending',$4,$4)`,
+            [
+              workspaceId,
+              settlementId,
+              NodeCrypto.createHash("sha256").update(`provider:${settlementId}`).digest("hex"),
+              "2026-08-28T00:15:00.000Z",
+            ],
+          ),
+        );
+      }
+      const repository = makePostgresUsageSettlementRepository(pool);
+      const [firstAttempt, secondAttempt] = yield* Effect.promise(() =>
+        Promise.all([
+          repository.get(workspaceId, firstSettlementId),
+          repository.get(workspaceId, secondSettlementId),
+        ]),
+      );
+      expect(firstAttempt).toBeDefined();
+      expect(secondAttempt).toBeDefined();
+      const sharedTransfer = {
+        providerActivityRef: "turnkey-concurrent-canonical-identity",
+        txHash: `0x${"c".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:00.000Z",
+      };
+      const outcomes = yield* Effect.promise(() =>
+        Promise.all([
+          repository.recordTransfer(
+            firstAttempt!,
+            "settler-race-one",
+            sharedTransfer,
+            "2026-08-28T00:15:01.000Z",
+          ),
+          repository.recordTransfer(
+            secondAttempt!,
+            "settler-race-two",
+            sharedTransfer,
+            "2026-08-28T00:15:01.000Z",
+          ),
+        ]),
+      );
+      expect(outcomes.map((outcome) => outcome.state).sort()).toEqual([
+        "reconciliation-required",
+        "transfer-applied",
+      ]);
+      expect(
+        (yield* Effect.promise(() =>
+          pool.query(
+            `SELECT count(*)::integer AS count FROM cloud_usage_billing_fence
+                WHERE workspace_id = $1 AND state <> 'cleared'`,
+            [workspaceId],
+          ),
+        )).rows[0],
+      ).toEqual({ count: 1 });
+    }),
+  ),
+);
+
+it.effect("holds create and resume through two separate authorization-loss episodes", () =>
+  withPostgres((pool) =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() =>
+        pool.query(
+          `INSERT INTO cloud_thread_lifecycle_attempt (
+             workspace_id, thread_id, attempt_id, idempotency_key, request_fingerprint,
+             environment_id, environment_revision_id, environment_revision_hash, project_id,
+             provider_instance_id, provider_driver, repository_identity, workspace_directory,
+             sandbox_id, provider_handle, worker_id, sealed_bootstrap_ref,
+             state, is_current, created_at, updated_at, completed_at
+           ) VALUES ($1,$2,'runtime-attempt','runtime-key',$3,$4,'runtime-revision',$5,$6,
+             'provider-instance','codex',$7::jsonb,'/workspace/agentsin-cloud',$8,$9,
+             'runtime-worker','sealed://runtime','ready',true,$10,$10,$10)`,
+          [
+            workspaceId,
+            threadId,
+            "e".repeat(64),
+            environmentId,
+            "f".repeat(64),
+            projectId,
+            { canonicalKey: "github.com/jarrodwatts/agentsin-cloud" },
+            sandboxId,
+            "e2b-settlement-sandbox",
+            "2026-08-28T00:00:00.000Z",
+          ],
+        ),
+      );
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_thread_runtime
+              SET state = 'paused', idle_since = NULL, transition_id = 'pause:runtime:1',
+                  transition_kind = 'pause', transition_started_at = $3,
+                  route_fenced_at = $3, credentials_revoked_at = $3,
+                  credentials_scrubbed_at = $3, provider_completed_at = $3, updated_at = $3
+            WHERE workspace_id = $1 AND thread_id = $2`,
+          [workspaceId, threadId, "2026-08-28T00:05:00.000Z"],
+        ),
+      );
+      const first = evidence("auth-loss-one", 1, 9_000, "5");
+      yield* accrue(pool, new Map([[first.evidenceId, first]]), first, "auth-loss-one-v1");
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_wallet_delegated_authorization
+              SET state = 'revoked', updated_at = $2
+            WHERE workspace_id = $1 AND authorization_id = $3`,
+          [workspaceId, "2026-08-28T00:14:00.000Z", authorizationId],
+        ),
+      );
+      const runtime = makeRuntime();
+      const chain = makeChain();
+      const service = settlementService(pool, chain, signer(), runtime.runtime, "settler-auth-one");
+      const blocked = yield* service.settleReady({
+        trigger: "sandbox-paused",
+        workspaceId,
+        threadId,
+      });
+      expect(blocked).toMatchObject({ claimed: 0, billingPaused: 1 });
+      expect(yield* Effect.promise(() => settlementIds(pool))).toHaveLength(0);
+
+      expect(
+        Exit.isFailure(
+          yield* Effect.exit(
+            Effect.tryPromise(() =>
+              pool.query(
+                `UPDATE cloud_thread_runtime
+                    SET state = 'resume_dispatched', generation = generation + 1,
+                        transition_id = 'resume:runtime:2', transition_kind = 'resume',
+                        transition_started_at = $3, updated_at = $3
+                  WHERE workspace_id = $1 AND thread_id = $2`,
+                [workspaceId, threadId, "2026-08-28T00:15:00.000Z"],
+              ),
+            ),
+          ),
+        ),
+      ).toBe(true);
+      expect(
+        Exit.isFailure(
+          yield* Effect.exit(
+            Effect.tryPromise(() =>
+              pool.query(
+                `INSERT INTO cloud_thread_lifecycle_attempt (
+                   workspace_id, thread_id, attempt_id, idempotency_key, request_fingerprint,
+                   environment_id, environment_revision_id, environment_revision_hash, project_id,
+                   provider_instance_id, provider_driver, repository_identity, workspace_directory,
+                   state, is_current, created_at, updated_at
+                 ) VALUES ($1,$2,'blocked-create','blocked-create-key',$3,$4,'revision-2',$5,$6,
+                   'provider-instance','codex',$7::jsonb,'/workspace/agentsin-cloud',
+                   'reserved',false,$8,$8)`,
+                [
+                  workspaceId,
+                  threadId,
+                  "a".repeat(64),
+                  environmentId,
+                  "b".repeat(64),
+                  projectId,
+                  { canonicalKey: "github.com/jarrodwatts/agentsin-cloud" },
+                  "2026-08-28T00:15:00.000Z",
+                ],
+              ),
+            ),
+          ),
+        ),
+      ).toBe(true);
+
+      yield* Effect.promise(() => addAuthorization(pool, "settlement-authorization-2"));
+      chain.setSubmit({
+        status: "applied",
+        providerActivityRef: "turnkey-auth-recovery-one",
+        txHash: `0x${"e".repeat(64)}` as EvmTransactionHash,
+        submittedAt: "2026-08-28T00:15:00.000Z",
+      });
+      const recovered = yield* settlementService(
+        pool,
+        chain,
+        signer(),
+        runtime.runtime,
+        "settler-auth-recover-one",
+      ).retryAuthorization(workspaceId, threadId);
+      expect(recovered).toMatchObject({
+        state: "finalized",
+        authorizationId: "settlement-authorization-2",
+      });
+
+      const second = {
+        ...evidence("auth-loss-two", 1, 19_000, "6"),
+        intervalStart: "2026-08-28T00:05:00.000Z",
+        intervalEnd: "2026-08-28T00:10:00.000Z",
+        observedAt: "2026-08-28T00:11:00.000Z",
+      };
+      yield* accrue(
+        pool,
+        new Map([[second.evidenceId, second]]),
+        second,
+        "auth-loss-two-v1",
+        "2026-08-28T00:11:00.000Z",
+      );
+      yield* Effect.promise(() =>
+        pool.query(
+          `UPDATE cloud_wallet_delegated_authorization
+              SET state = 'revoked', updated_at = $2
+            WHERE workspace_id = $1 AND authorization_id = 'settlement-authorization-2'`,
+          [workspaceId, "2026-08-28T00:16:00.000Z"],
+        ),
+      );
+      expect(
+        yield* settlementService(
+          pool,
+          chain,
+          signer(),
+          runtime.runtime,
+          "settler-auth-two",
+          "2026-08-28T00:16:00.000Z",
+        ).settleReady({ trigger: "sandbox-paused", workspaceId, threadId }),
+      ).toMatchObject({ claimed: 0, billingPaused: 1 });
+      const episodes = yield* Effect.promise(() =>
+        pool.query<{ readonly fence_id: string; readonly episode: number }>(
+          `SELECT fence_id, episode FROM cloud_usage_billing_fence
+            WHERE workspace_id = $1 AND thread_id = $2 ORDER BY episode`,
+          [workspaceId, threadId],
+        ),
+      );
+      expect(episodes.rows.map((row) => row.episode)).toEqual([1, 2, 3]);
+      expect(new Set(episodes.rows.map((row) => row.fence_id)).size).toBe(3);
     }),
   ),
 );

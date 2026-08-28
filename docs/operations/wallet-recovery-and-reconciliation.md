@@ -62,6 +62,9 @@ Recovery completion uses the same wallet-scoped intent. Do not manually clear it
   accruals.
 - A `submission-pending` or `reconciliation-required` settlement is not evidence that no transfer
   occurred. Inspect the original Turnkey activity and Monad transaction identity before any retry.
+- An active billing fence must remain in place while inspection, funding recovery, or authorization
+  rebinding runs. Never clear it manually; successful receipt finalization clears only the exact
+  settlement episode.
 - A `transfer-applied` settlement needs receipt signing/finalization only. Never submit its USDC
   transfer again.
 

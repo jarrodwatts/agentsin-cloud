@@ -2,7 +2,6 @@
 import * as NodeCrypto from "node:crypto";
 
 import type {
-  EvmTransactionHash,
   SettlementId,
   UsageEvidenceSha256,
   UsageSettlementReceipt,
@@ -10,16 +9,21 @@ import type {
   UsageSettlementReceiptSignature,
   WorkspaceId,
 } from "@t3tools/contracts/cloud";
-import { UsageSettlementReceipt as UsageSettlementReceiptSchema } from "@t3tools/contracts/cloud";
+import {
+  EvmTransactionHash,
+  UsageSettlementReceipt as UsageSettlementReceiptSchema,
+} from "@t3tools/contracts/cloud";
 import type { ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import {
   type UsageSettlementAttempt,
   type UsageSettlementRepository,
+  settlementRetryNotBefore,
   UsageSettlementRepositoryError,
 } from "./usageSettlementRepository.ts";
 
@@ -95,11 +99,16 @@ export class SettlementRuntimeBoundaryError extends Schema.TaggedErrorClass<Sett
 
 /** Must durably pause the current runtime; destroying its workspace is forbidden. */
 export interface SettlementRuntimeBoundary {
-  readonly pauseForInsufficientBalance: (request: {
+  readonly pauseForBillingFailure: (request: {
     readonly requestId: string;
-    readonly settlementId: SettlementId;
+    readonly settlementId?: SettlementId;
     readonly workspaceId: WorkspaceId;
     readonly threadId: ThreadId;
+    readonly reason:
+      | "insufficient-balance"
+      | "authorization-unavailable"
+      | "provider-definitive-failure"
+      | "provider-outcome-uncertain";
     readonly requestedAt: string;
   }) => Effect.Effect<{ readonly pausedAt: string }, SettlementRuntimeBoundaryError>;
 }
@@ -127,6 +136,7 @@ export interface UsageSettlementSweepResult {
   readonly pending: number;
   readonly reconciliationRequired: number;
   readonly lowBalancePaused: number;
+  readonly billingPaused: number;
 }
 
 export interface UsageSettlementService {
@@ -142,6 +152,14 @@ export interface UsageSettlementService {
   readonly retryLowBalance: (
     workspaceId: WorkspaceId,
     settlementId: SettlementId,
+  ) => Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError>;
+  readonly retryProviderFailure: (
+    workspaceId: WorkspaceId,
+    settlementId: SettlementId,
+  ) => Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError>;
+  readonly retryAuthorization: (
+    workspaceId: WorkspaceId,
+    threadId: ThreadId,
   ) => Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError>;
 }
 
@@ -169,6 +187,7 @@ export const settlementReceiptPayloadSha256 = (
     .digest("hex") as UsageEvidenceSha256;
 
 const decodeSettlementReceipt = Schema.decodeUnknownSync(UsageSettlementReceiptSchema);
+const decodeTransactionHash = Schema.decodeUnknownSync(EvmTransactionHash);
 
 const serviceError = (
   code: UsageSettlementServiceError["code"],
@@ -195,7 +214,11 @@ const repositoryEffect = <A>(operation: string, run: () => Promise<A>) =>
       ),
   });
 
-const validIso = (value: string) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value);
+const validIso = (value: string) => {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const parsed = DateTime.make(value);
+  return Option.isSome(parsed) && DateTime.formatIso(parsed.value) === value;
+};
 
 const payloadFor = (attempt: UsageSettlementAttempt): UsageSettlementReceiptPayload => {
   const first = attempt.postings[0]!;
@@ -265,6 +288,7 @@ export const makeUsageSettlementService = (options: {
 
   const pauseForLowBalance = (
     initial: UsageSettlementAttempt,
+    providerActivityRef?: string,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> =>
     Effect.gen(function* () {
       const pending =
@@ -274,16 +298,29 @@ export const makeUsageSettlementService = (options: {
               options.repository.markLowBalancePausePending(
                 initial,
                 options.processorId,
+                providerActivityRef,
                 "insufficient-balance",
                 options.now(),
               ),
             );
+      if (pending.state === "low-balance-paused" || pending.state === "reconciliation-required") {
+        return pending;
+      }
+      if (pending.billingFenceId === undefined) {
+        yield* release(pending, "low-balance-fence-missing");
+        return yield* serviceError(
+          "pauseRequired",
+          "pause-insufficient-balance-without-fence",
+          false,
+        );
+      }
       const paused = yield* options.runtime
-        .pauseForInsufficientBalance({
-          requestId: `low-balance:${pending.settlementId}`,
+        .pauseForBillingFailure({
+          requestId: `billing-fence:${pending.billingFenceId}`,
           settlementId: pending.settlementId,
           workspaceId: pending.workspaceId,
           threadId: pending.threadId,
+          reason: "insufficient-balance",
           requestedAt: options.now(),
         })
         .pipe(
@@ -311,43 +348,49 @@ export const makeUsageSettlementService = (options: {
       const unsignedPayload = payloadFor(attempt);
       const payloadSha256 = settlementReceiptPayloadSha256(unsignedPayload);
       const signedAt = options.now();
-      const signature = yield* options.signer
-        .sign({ settlementId: attempt.settlementId, payloadSha256, signedAt })
-        .pipe(
-          Effect.mapError((cause) =>
-            serviceError("signingUnavailable", "sign-settlement-receipt", cause.retryable, cause),
+      const holdFinalization = (failureCode: string) =>
+        repositoryEffect("hold-settlement-finalization", () =>
+          options.repository.markFinalizationRequired(
+            attempt,
+            options.processorId,
+            failureCode,
+            options.now(),
           ),
-          Effect.tapError(() => release(attempt, "receipt-signing-failed")),
         );
+      const signatureResult = yield* Effect.result(
+        options.signer.sign({ settlementId: attempt.settlementId, payloadSha256, signedAt }),
+      );
+      if (Result.isFailure(signatureResult)) {
+        return yield* holdFinalization("receipt-signing-failed");
+      }
+      const signature = signatureResult.success;
       if (signature.payloadHash !== payloadSha256 || signature.signedAt !== signedAt) {
-        yield* release(attempt, "receipt-signature-mismatch");
-        return yield* serviceError(
-          "signingUnavailable",
-          "validate-settlement-receipt-signature",
-          false,
-        );
+        return yield* holdFinalization("receipt-signature-mismatch");
       }
       if (!validIso(signature.signedAt) || signature.signedAt < attempt.transferSubmittedAt) {
-        yield* release(attempt, "receipt-signature-time-invalid");
-        return yield* serviceError(
-          "signingUnavailable",
-          "validate-settlement-receipt-signature-time",
-          false,
-        );
+        return yield* holdFinalization("receipt-signature-time-invalid");
       }
-      const receipt = yield* Effect.try({
-        try: () => receiptFor(attempt, signature),
-        catch: (cause) =>
-          serviceError("signingUnavailable", "validate-settlement-receipt", false, cause),
-      }).pipe(Effect.tapError(() => release(attempt, "receipt-invalid")));
-      return yield* repositoryEffect("finalize-settlement", () =>
-        options.repository.finalize(attempt, options.processorId, receipt, options.now()),
+      const receiptResult = yield* Effect.result(
+        Effect.try({
+          try: () => receiptFor(attempt, signature),
+          catch: (cause) =>
+            serviceError("signingUnavailable", "validate-settlement-receipt", false, cause),
+        }),
       );
+      if (Result.isFailure(receiptResult)) return yield* holdFinalization("receipt-invalid");
+      return yield* repositoryEffect("finalize-settlement", () =>
+        options.repository.finalize(
+          attempt,
+          options.processorId,
+          receiptResult.success,
+          options.now(),
+        ),
+      ).pipe(Effect.catch(() => holdFinalization("receipt-finalization-failed")));
     });
 
   const requestFor = (attempt: UsageSettlementAttempt): MonadSettlementRequest => ({
     settlementId: attempt.settlementId,
-    idempotencyKey: attempt.requestFingerprint,
+    idempotencyKey: attempt.providerIdempotencyKey,
     workspaceId: attempt.workspaceId,
     threadId: attempt.threadId,
     walletId: attempt.walletId,
@@ -360,15 +403,51 @@ export const makeUsageSettlementService = (options: {
       : { providerActivityRef: attempt.providerActivityRef }),
   });
 
-  const observe = (
+  const closeNotApplied = (
+    attempt: UsageSettlementAttempt,
+    providerActivityRef: string | undefined,
+    failureCode: string,
+  ) => {
+    const now = options.now();
+    return repositoryEffect("close-not-applied-provider-attempt", () =>
+      options.repository.closeProviderAttemptNotApplied(
+        attempt,
+        options.processorId,
+        providerActivityRef,
+        failureCode,
+        now,
+        settlementRetryNotBefore(now, attempt.providerAttemptGeneration),
+      ),
+    );
+  };
+
+  const completeObservation = (
     attempt: UsageSettlementAttempt,
     observation: MonadSettlementObservation,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> => {
     switch (observation.status) {
       case "applied":
+        let txHash: EvmTransactionHash;
+        try {
+          txHash = decodeTransactionHash(observation.txHash);
+        } catch {
+          return repositoryEffect("mark-invalid-transfer-hash-reconciliation", () =>
+            options.repository.markReconciliationRequired(
+              attempt,
+              options.processorId,
+              attempt.providerActivityRef === undefined
+                ? observation.providerActivityRef
+                : undefined,
+              "provider-transfer-hash-invalid",
+              options.now(),
+            ),
+          );
+        }
+        const observedAt = options.now();
         if (
           !validIso(observation.submittedAt) ||
           observation.submittedAt < attempt.createdAt ||
+          observation.submittedAt > observedAt ||
           (attempt.providerActivityRef !== undefined &&
             attempt.providerActivityRef !== observation.providerActivityRef)
         ) {
@@ -402,10 +481,14 @@ export const makeUsageSettlementService = (options: {
           options.repository.recordTransfer(
             attempt,
             options.processorId,
-            observation,
+            { ...observation, txHash },
             options.now(),
           ),
-        ).pipe(Effect.flatMap(finalize));
+        ).pipe(
+          Effect.flatMap((recorded) =>
+            recorded.state === "transfer-applied" ? finalize(recorded) : Effect.succeed(recorded),
+          ),
+        );
       case "insufficientBalance":
         if (
           attempt.providerActivityRef !== undefined &&
@@ -421,7 +504,7 @@ export const makeUsageSettlementService = (options: {
             ),
           );
         }
-        return pauseForLowBalance(attempt);
+        return pauseForLowBalance(attempt, observation.providerActivityRef);
       case "unknown":
         return repositoryEffect("mark-settlement-reconciliation", () =>
           options.repository.markReconciliationRequired(
@@ -450,36 +533,51 @@ export const makeUsageSettlementService = (options: {
             ),
           );
         }
-        return options.settlement.submit(requestFor(attempt)).pipe(
-          Effect.mapError((cause) =>
-            serviceError(
-              cause.outcome === "uncertain" ? "reconciliationRequired" : "providerUnavailable",
-              "submit-settlement-transfer",
-              cause.retryable,
-              cause,
-            ),
-          ),
-          Effect.catch((cause) =>
-            cause.code === "reconciliationRequired"
-              ? repositoryEffect("mark-submit-reconciliation", () =>
-                  options.repository.markReconciliationRequired(
-                    attempt,
-                    options.processorId,
-                    undefined,
-                    "provider-submit-uncertain",
-                    options.now(),
-                  ),
-                )
-              : release(attempt, "provider-submit-not-applied").pipe(
-                  Effect.andThen(Effect.fail(cause)),
-                ),
-          ),
-          Effect.flatMap((submitted) =>
-            "state" in submitted ? Effect.succeed(submitted) : observe(attempt, submitted),
-          ),
+        return closeNotApplied(
+          attempt,
+          observation.providerActivityRef,
+          "provider-definitively-not-applied",
         );
     }
   };
+
+  const submitOnce = (attempt: UsageSettlementAttempt) =>
+    options.settlement.submit(requestFor(attempt)).pipe(
+      Effect.mapError((cause) =>
+        serviceError(
+          cause.outcome === "uncertain" ? "reconciliationRequired" : "providerUnavailable",
+          "submit-settlement-transfer",
+          cause.retryable,
+          cause,
+        ),
+      ),
+      Effect.catch((cause) =>
+        cause.code === "reconciliationRequired"
+          ? repositoryEffect("mark-submit-reconciliation", () =>
+              options.repository.markReconciliationRequired(
+                attempt,
+                options.processorId,
+                undefined,
+                "provider-submit-uncertain",
+                options.now(),
+              ),
+            )
+          : closeNotApplied(attempt, undefined, "provider-submit-not-applied"),
+      ),
+      Effect.flatMap((submitted) =>
+        "state" in submitted ? Effect.succeed(submitted) : completeObservation(attempt, submitted),
+      ),
+    );
+
+  const applyInspection = (
+    attempt: UsageSettlementAttempt,
+    observation: MonadSettlementObservation,
+  ) =>
+    observation.status === "notApplied" &&
+    attempt.providerActivityRef === undefined &&
+    observation.providerActivityRef === undefined
+      ? submitOnce(attempt)
+      : completeObservation(attempt, observation);
 
   const process = (
     initial: UsageSettlementAttempt,
@@ -488,12 +586,16 @@ export const makeUsageSettlementService = (options: {
       if (initial.state === "finalized") return initial;
       if (initial.state === "low-balance-pause-pending") return yield* pauseForLowBalance(initial);
       if (initial.state === "transfer-applied") return yield* finalize(initial);
-      const pending =
-        initial.state === "reserved" || initial.state === "low-balance-paused"
-          ? yield* repositoryEffect("mark-settlement-submission-pending", () =>
-              options.repository.setSubmissionPending(initial, options.processorId, options.now()),
-            )
-          : initial;
+      const startsNewProviderGeneration =
+        initial.state === "reserved" ||
+        initial.state === "retry-waiting" ||
+        initial.state === "low-balance-paused";
+      const pending = startsNewProviderGeneration
+        ? yield* repositoryEffect("mark-settlement-submission-pending", () =>
+            options.repository.setSubmissionPending(initial, options.processorId, options.now()),
+          )
+        : initial;
+      if (startsNewProviderGeneration && pending.state !== "submission-pending") return pending;
       const inspected = yield* options.settlement.inspect(requestFor(pending)).pipe(
         Effect.mapError((cause) =>
           serviceError(
@@ -504,22 +606,20 @@ export const makeUsageSettlementService = (options: {
           ),
         ),
         Effect.catch((cause) =>
-          cause.code === "reconciliationRequired"
-            ? repositoryEffect("mark-inspection-reconciliation", () =>
-                options.repository.markReconciliationRequired(
-                  pending,
-                  options.processorId,
-                  undefined,
-                  "provider-inspection-uncertain",
-                  options.now(),
-                ),
-              )
-            : release(pending, "provider-inspection-not-applied").pipe(
-                Effect.andThen(Effect.fail(cause)),
-              ),
+          repositoryEffect("mark-inspection-reconciliation", () =>
+            options.repository.markReconciliationRequired(
+              pending,
+              options.processorId,
+              undefined,
+              cause.code === "reconciliationRequired"
+                ? "provider-inspection-uncertain"
+                : "provider-inspection-failed",
+              options.now(),
+            ),
+          ),
         ),
       );
-      return "state" in inspected ? inspected : yield* observe(pending, inspected);
+      return "state" in inspected ? inspected : yield* applyInspection(pending, inspected);
     });
 
   const summarize = (
@@ -528,14 +628,19 @@ export const makeUsageSettlementService = (options: {
     claimed: attempts.length,
     finalized: attempts.filter((attempt) => attempt.state === "finalized").length,
     pending: attempts.filter((attempt) =>
-      ["reserved", "submission-pending", "transfer-applied", "low-balance-pause-pending"].includes(
-        attempt.state,
-      ),
+      [
+        "reserved",
+        "retry-waiting",
+        "submission-pending",
+        "transfer-applied",
+        "low-balance-pause-pending",
+      ].includes(attempt.state),
     ).length,
     reconciliationRequired: attempts.filter(
       (attempt) => attempt.state === "reconciliation-required",
     ).length,
     lowBalancePaused: attempts.filter((attempt) => attempt.state === "low-balance-paused").length,
+    billingPaused: 0,
   });
 
   const processAll = (attempts: ReadonlyArray<UsageSettlementAttempt>) =>
@@ -557,6 +662,45 @@ export const makeUsageSettlementService = (options: {
         ),
       { concurrency: 4 },
     ).pipe(Effect.map(summarize));
+
+  const pausePendingBillingFences = (now: string, leaseExpiresAt: string, limit: number) =>
+    repositoryEffect("claim-pending-billing-fences", () =>
+      options.repository.claimPendingBillingFences(options.processorId, now, leaseExpiresAt, limit),
+    ).pipe(
+      Effect.flatMap((fences) =>
+        Effect.forEach(
+          fences,
+          (fence) =>
+            Effect.result(
+              options.runtime
+                .pauseForBillingFailure({
+                  requestId: `billing-fence:${fence.fenceId}`,
+                  ...(fence.settlementId === undefined ? {} : { settlementId: fence.settlementId }),
+                  workspaceId: fence.workspaceId,
+                  threadId: fence.threadId,
+                  reason: fence.reason,
+                  requestedAt: now,
+                })
+                .pipe(
+                  Effect.mapError((cause) =>
+                    serviceError("pauseRequired", "pause-billing-fence", cause.retryable, cause),
+                  ),
+                  Effect.flatMap((paused) =>
+                    repositoryEffect("mark-billing-fence-paused", () =>
+                      options.repository.markBillingFencePaused(
+                        fence,
+                        options.processorId,
+                        paused.pausedAt,
+                      ),
+                    ),
+                  ),
+                ),
+            ),
+          { concurrency: 4 },
+        ),
+      ),
+      Effect.map((results) => results.filter(Result.isSuccess).length),
+    );
 
   const leaseWindow = () => {
     const now = options.now();
@@ -604,7 +748,13 @@ export const makeUsageSettlementService = (options: {
             ...(request.threadId === undefined ? {} : { threadId: request.threadId }),
           }),
         );
-        return yield* processAll(attempts);
+        const result = yield* processAll(attempts);
+        const billingPaused = yield* pausePendingBillingFences(
+          now,
+          leaseExpiresAt,
+          request.limit ?? 25,
+        );
+        return { ...result, billingPaused };
       }),
     recoverPending: (limit = 25) =>
       Effect.gen(function* () {
@@ -618,7 +768,9 @@ export const makeUsageSettlementService = (options: {
         const attempts = yield* repositoryEffect("claim-recoverable-settlements", () =>
           options.repository.claimRecoverable(options.processorId, now, leaseExpiresAt, limit),
         );
-        return yield* processAll(attempts);
+        const result = yield* processAll(attempts);
+        const billingPaused = yield* pausePendingBillingFences(now, leaseExpiresAt, limit);
+        return { ...result, billingPaused };
       }),
     retryLowBalance: (workspaceId, settlementId) =>
       Effect.gen(function* () {
@@ -635,6 +787,57 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
+        return yield* process(attempt);
+      }),
+    retryProviderFailure: (workspaceId, settlementId) =>
+      Effect.gen(function* () {
+        const { now, leaseExpiresAt } = yield* Effect.try({
+          try: leaseWindow,
+          catch: (cause) => serviceError("invalidRequest", "settlement-clock", false, cause),
+        });
+        const attempt = yield* repositoryEffect("claim-provider-failure-retry", () =>
+          options.repository.claimProviderFailureRetry(
+            workspaceId,
+            settlementId,
+            options.processorId,
+            now,
+            leaseExpiresAt,
+          ),
+        );
+        return yield* process(attempt);
+      }),
+    retryAuthorization: (workspaceId, threadId) =>
+      Effect.gen(function* () {
+        const { now, leaseExpiresAt } = yield* Effect.try({
+          try: leaseWindow,
+          catch: (cause) => serviceError("invalidRequest", "settlement-clock", false, cause),
+        });
+        const existing = yield* repositoryEffect("claim-authorization-recovery", () =>
+          options.repository.claimAuthorizationRecovery(
+            workspaceId,
+            threadId,
+            options.processorId,
+            now,
+            leaseExpiresAt,
+          ),
+        );
+        if (existing !== undefined) return yield* process(existing);
+        const attempts = yield* repositoryEffect("bind-authorization-recovery", () =>
+          options.repository.claimReady({
+            processorId: options.processorId,
+            now,
+            leaseExpiresAt,
+            limit: 1,
+            trigger: "sandbox-paused",
+            workspaceId,
+            threadId,
+            recoverAuthorizationFence: true,
+          }),
+        );
+        const attempt = attempts[0];
+        if (attempt === undefined) {
+          return yield* serviceError("invalidRequest", "authorization-recovery-not-ready", false);
+        }
         return yield* process(attempt);
       }),
   };

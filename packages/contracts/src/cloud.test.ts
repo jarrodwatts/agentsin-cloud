@@ -29,6 +29,7 @@ import {
   DesktopAuthInitiateRequest,
   DesktopLease,
   EnvironmentRevision,
+  EvmTransactionHash,
   GitHubThreadWorkflowCommand,
   GitHubThreadWorkflowView,
   LedgerEntry,
@@ -108,6 +109,11 @@ describe("desktop auth handoff contracts", () => {
 });
 
 describe("usage settlement receipt contracts", () => {
+  it("canonicalizes Monad transaction hashes to lowercase at decode", () => {
+    const decode = Schema.decodeUnknownSync(EvmTransactionHash);
+    expect(decode(`0x${"Aa".repeat(32)}`)).toBe(`0x${"aa".repeat(32)}`);
+  });
+
   const decodeReceipt = Schema.decodeUnknownSync(UsageSettlementReceipt);
   const posting = {
     accrualId: "accrual-1",
