@@ -3,11 +3,13 @@
 ## Evidence
 
 - Source visual truth path: `/var/folders/f_/85gw8w354kg5vlcsn0ljjzz80000gn/T/codex-clipboard-6d8ed1d9-3a70-46af-8cd5-476d282f9285.png`
-- Final implementation screenshot path: `/private/tmp/agentsin-cloud-e11-final-1440x1024.jpg`
-- Compact implementation screenshot path: `/private/tmp/agentsin-cloud-e11-final-compact-900x760.jpg`
+- Final implementation screenshot path: `/private/tmp/agentsin-cloud-e11-final4-1440x1024.jpg`
+- Compact implementation screenshot path: `/private/tmp/agentsin-cloud-e11-final4-compact-900x760.jpg`
 - Earlier comparison screenshots:
   - `/private/tmp/agentsin-cloud-e11-prefixed-1440x1024.jpg`
   - `/private/tmp/agentsin-cloud-e11-corrected-1440x1024.jpg`
+  - `/private/tmp/agentsin-cloud-e11-final3-1440x1024.jpg`
+  - `/private/tmp/agentsin-cloud-e11-final3-compact-900x760.jpg`
 - Browser-rendered route: active development-only cloud-thread fixture in the in-app Browser.
 - Viewports: `1440 × 1024` CSS px for the canonical layout and `900 × 760` CSS px for the compact layout.
 - Pixel dimensions and density normalization:
@@ -15,7 +17,7 @@
   - Canonical implementation: `1440 × 1024` pixels at a `1440 × 1024` CSS viewport (1 screenshot pixel per CSS pixel).
   - Compact implementation: `900 × 760` pixels at a `900 × 760` CSS viewport (1 screenshot pixel per CSS pixel).
   - The source and implementation have different full-window aspect ratios, so comparison used normalized region proportions and product-state intent rather than false pixel-for-pixel alignment.
-- State: dark theme; active cloud coding thread; E2B running; Codex working; verified checkpoint present; Desktop inspector open; agent owns desktop control; composer ready; `0.18 USDC · Monad` visible.
+- State: dark theme; active cloud coding thread; E2B running; Codex working; verified checkpoint present; canonical Desktop inspector open; agent owns desktop control; composer ready; `0.18 USDC · Monad` visible. The compact evidence intentionally starts with Desktop collapsed.
 
 ## Full-view comparison evidence
 
@@ -80,9 +82,23 @@ The browser/dev-server console stream was checked during navigation, responsive 
   - Replaced unrelated persisted messages only under the exact development fixture gate with a realistic prompt, agent summary, ordered progress events, file-change review, and checkpoint.
   - Filled the fixture desktop surface with a sensible top-focused crop.
 
-### Pass 3 — passed
+### Pass 3 — blocked
 
-- Post-fix evidence: `/private/tmp/agentsin-cloud-e11-final-1440x1024.jpg` and `/private/tmp/agentsin-cloud-e11-final-compact-900x760.jpg`
+- Earlier evidence: `/private/tmp/agentsin-cloud-e11-final3-1440x1024.jpg` and `/private/tmp/agentsin-cloud-e11-final3-compact-900x760.jpg`
+- Findings:
+  - [P1] The selected fixture still mixed persisted repository, branch, and provider identity into the deterministic cloud state, weakening the screenshot's product story.
+  - [P1] A few release-facing labels still used the old product identity.
+  - [P2] The compact header's secondary provider pill overlapped the window controls.
+  - [P2] Entering the fixture on a compact viewport automatically opened Desktop as a sheet instead of collapsing the inspector first.
+- Fixes:
+  - Made the fixture's sidebar row, header, branch, provider, and cloud state deterministic without changing ordinary persisted threads.
+  - Completed the user-facing release and artifact-name audit while retaining technical compatibility identifiers and T3 attribution.
+  - Hid the secondary identity pill below the wide-desktop breakpoint.
+  - Reused the existing compact-right-panel media contract so wide fixture entry opens Desktop and compact entry keeps the focus canvas visible; manual compact opening and exact state restoration remain supported.
+
+### Pass 4 — passed
+
+- Post-fix evidence: `/private/tmp/agentsin-cloud-e11-final4-1440x1024.jpg` and `/private/tmp/agentsin-cloud-e11-final4-compact-900x760.jpg`
 - The source and final canonical implementation were compared together in the same visual input.
 - No actionable P0, P1, or P2 difference remains. The shorter deterministic task naturally leaves more vertical breathing room than the long Cursor transcript; this is acceptable product-content variance, not a layout defect.
 
