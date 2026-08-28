@@ -89,9 +89,9 @@ test("host harness enforces the nested-container boundary without mounts or inhe
 
 test("base-owned probe independently checks identity, caps, namespaces, network, files, and secrets", () => {
   for (const invariant of [
-    "process.getuid",
-    "process.getgid",
-    "process.getgroups",
+    "NodeProcess.getuid",
+    "NodeProcess.getgid",
+    "NodeProcess.getgroups",
     "CapEff",
     "NoNewPrivs",
     "/proc/self/ns/mnt",

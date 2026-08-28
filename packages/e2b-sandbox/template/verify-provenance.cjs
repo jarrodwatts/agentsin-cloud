@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const lock = JSON.parse(fs.readFileSync("/opt/agentsin/image-provenance.lock.json", "utf8"));
@@ -42,11 +43,12 @@ if (packageDigest !== lock.resolvedAptPackagesSha256) {
 }
 
 const packageRoot = path.dirname(require.resolve("node-pty/package.json"));
+const architecture = os.arch();
 const nativeCandidates = [
   "build/Release/pty.node",
   "build/Release/spawn-helper",
-  `prebuilds/linux-${process.arch}/pty.node`,
-  `prebuilds/linux-${process.arch}/spawn-helper`,
+  `prebuilds/linux-${architecture}/pty.node`,
+  `prebuilds/linux-${architecture}/spawn-helper`,
 ];
 const nativeArtifacts = nativeCandidates
   .filter((relative) => fs.existsSync(path.join(packageRoot, relative)))

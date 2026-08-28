@@ -1,33 +1,35 @@
-import { appendFile, readFile, readlink } from "node:fs/promises";
-import { lookup } from "node:dns/promises";
-import net from "node:net";
-import process from "node:process";
+import * as NodeDnsPromises from "node:dns/promises";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeNet from "node:net";
+import * as NodeProcess from "node:process";
 
 const fail = (message) => {
   throw new Error(`Protected container probe failed: ${message}`);
 };
 
-if (process.getuid?.() !== 65_534 || process.getgid?.() !== 65_534) {
+if (NodeProcess.getuid?.() !== 65_534 || NodeProcess.getgid?.() !== 65_534) {
   fail("unexpected uid or gid");
 }
-if (process.getgroups().some((group) => group !== 65_534)) fail("supplementary groups remain");
+if (NodeProcess.getgroups().some((group) => group !== 65_534)) {
+  fail("supplementary groups remain");
+}
 
-const status = await readFile("/proc/self/status", "utf8");
+const status = await NodeFSP.readFile("/proc/self/status", "utf8");
 const field = (name) => new RegExp(`^${name}:\\s+(.+)$`, "mu").exec(status)?.[1];
 if (!/^0+$/u.test(field("CapEff") ?? "")) fail("effective capabilities remain");
 if (field("NoNewPrivs") !== "1") fail("no-new-privileges is disabled");
 
-const forbiddenEnvironment = Object.keys(process.env).filter((name) =>
+const forbiddenEnvironment = Object.keys(NodeProcess.env).filter((name) =>
   /(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|ACTIONS_RUNTIME|GITHUB_)/u.test(name),
 );
 if (forbiddenEnvironment.length > 0) {
   fail(`credential-shaped environment reached the container: ${forbiddenEnvironment.join(",")}`);
 }
 
-const hostSentinel = process.argv[2];
+const hostSentinel = NodeProcess.argv[2];
 if (hostSentinel === undefined || !hostSentinel.startsWith("/")) fail("host sentinel is missing");
 try {
-  await readFile(hostSentinel);
+  await NodeFSP.readFile(hostSentinel);
   fail("host sentinel is readable");
 } catch (error) {
   if (error instanceof Error && error.message.startsWith("Protected container probe failed:")) {
@@ -37,12 +39,12 @@ try {
 }
 
 try {
-  await readFile("/opt/aic/protected-worker-container-probe.mjs", "utf8");
+  await NodeFSP.readFile("/opt/aic/protected-worker-container-probe.mjs", "utf8");
 } catch {
   fail("base-owned probe is unavailable");
 }
 try {
-  await appendFile("/opt/aic/protected-worker-container-probe.mjs", "\n");
+  await NodeFSP.appendFile("/opt/aic/protected-worker-container-probe.mjs", "\n");
   fail("base-owned probe is mutable");
 } catch (error) {
   if (error instanceof Error && error.message.startsWith("Protected container probe failed:")) {
@@ -55,7 +57,7 @@ try {
 
 const connect = () =>
   new Promise((resolve) => {
-    const socket = net.createConnection({ host: "1.1.1.1", port: 53 });
+    const socket = NodeNet.createConnection({ host: "1.1.1.1", port: 53 });
     const finish = (reached) => {
       socket.destroy();
       resolve(reached);
@@ -66,7 +68,7 @@ const connect = () =>
   });
 if (await connect()) fail("external network is reachable");
 try {
-  await lookup("example.com");
+  await NodeDnsPromises.lookup("example.com");
   fail("DNS is reachable");
 } catch (error) {
   if (error instanceof Error && error.message.startsWith("Protected container probe failed:")) {
@@ -75,18 +77,18 @@ try {
 }
 
 const result = {
-  uid: process.getuid(),
-  gid: process.getgid(),
-  groups: process.getgroups(),
+  uid: NodeProcess.getuid(),
+  gid: NodeProcess.getgid(),
+  groups: NodeProcess.getgroups(),
   capEff: field("CapEff"),
   noNewPrivs: field("NoNewPrivs"),
-  mountNamespace: await readlink("/proc/self/ns/mnt"),
-  networkNamespace: await readlink("/proc/self/ns/net"),
-  pidNamespace: await readlink("/proc/self/ns/pid"),
-  ipcNamespace: await readlink("/proc/self/ns/ipc"),
-  utsNamespace: await readlink("/proc/self/ns/uts"),
+  mountNamespace: await NodeFSP.readlink("/proc/self/ns/mnt"),
+  networkNamespace: await NodeFSP.readlink("/proc/self/ns/net"),
+  pidNamespace: await NodeFSP.readlink("/proc/self/ns/pid"),
+  ipcNamespace: await NodeFSP.readlink("/proc/self/ns/ipc"),
+  utsNamespace: await NodeFSP.readlink("/proc/self/ns/uts"),
   hostSentinelDenied: true,
   harnessImmutable: true,
   networkDenied: true,
 };
-process.stdout.write(`${JSON.stringify(result)}\n`);
+NodeProcess.stdout.write(`${JSON.stringify(result)}\n`);
