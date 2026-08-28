@@ -48,7 +48,7 @@
   <path d="M32 28H64" stroke="#FFFFFF" stroke-width="2"/>
 
   <g font-family="-apple-system, BlinkMacSystemFont, sans-serif" fill="#FFFFFF">
-    <text x="32" y="50" font-size="12" font-weight="600" letter-spacing="1.4">T3 CODE</text>
+    <text x="32" y="50" font-size="10.5" font-weight="600" letter-spacing="1.2">AGENTS IN CLOUD</text>
     <text x="32" y="82" font-size="22" font-weight="600" letter-spacing="-0.45">Desktop</text>
     <text x="508" y="50" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="8.5" font-weight="600" letter-spacing="1.2" opacity="0.84">NIGHTLY BUILD</text>
   </g>

@@ -180,6 +180,7 @@ import {
   type CloudDesktopSession,
   useCloudDesktopInspector,
 } from "./cloud/useCloudDesktopInspector";
+import { useDevCloudThreadVisualFixtureSession } from "./cloud/useDevCloudThreadVisualFixtureSession";
 import { CloudThreadStatusBar, CloudThreadTimelineFrame } from "./cloud/CloudThreadTimeline";
 import {
   cloudComposerBlockedReason,
@@ -1791,34 +1792,13 @@ function ChatViewContent(props: ChatViewProps) {
     connection: cloudDesktopConnection,
     threadId,
   });
-  const [visualFixtureController, setVisualFixtureController] = useState<"agent" | "user">("agent");
-  useEffect(() => {
-    if (cloudDesktopVisualFixture === null || activeThreadRef === null) return;
-    const store = useRightPanelStore.getState();
-    const wasAlreadyOpen = store.byThreadKey[activeThreadKey ?? ""]?.surfaces.some(
-      (surface) => surface.kind === "cloud-desktop",
-    );
-    store.open(activeThreadRef, "cloud-desktop");
-    return () => {
-      if (!wasAlreadyOpen) {
-        useRightPanelStore.getState().closeSurface(activeThreadRef, "cloud-desktop");
-      }
-    };
-  }, [activeThreadKey, activeThreadRef, cloudDesktopVisualFixture]);
+  const visualFixtureSession = useDevCloudThreadVisualFixtureSession({
+    environmentId,
+    threadId,
+    fixture: cloudDesktopVisualFixture,
+  });
   const cloudDesktopSession: CloudDesktopSession =
-    cloudDesktopVisualFixture === null
-      ? liveCloudDesktopSession
-      : {
-          snapshot:
-            visualFixtureController === "user"
-              ? cloudDesktopVisualFixture.userControlled
-              : cloudDesktopVisualFixture.agentControlled,
-          takeControl: () => setVisualFixtureController("user"),
-          resumeControl: () => setVisualFixtureController("user"),
-          releaseControl: () => setVisualFixtureController("agent"),
-          retry: () => undefined,
-          sendInput: () => visualFixtureController === "user",
-        };
+    visualFixtureSession ?? liveCloudDesktopSession;
   const activeCloudDesktopTabStatus = cloudDesktopCapability.enabled
     ? cloudDesktopTabStatus(cloudDesktopSession.snapshot)
     : undefined;

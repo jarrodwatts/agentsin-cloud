@@ -20,6 +20,10 @@ describe("Agents in Cloud desktop branding", () => {
   });
 
   it("uses the product name in both macOS installer channels", () => {
+    expect(latestDmg).toContain(">AGENTS IN CLOUD</text>");
+    expect(nightlyDmg).toContain(">AGENTS IN CLOUD</text>");
+    expect(latestDmg).not.toContain(">T3 CODE</text>");
+    expect(nightlyDmg).not.toContain(">T3 CODE</text>");
     expect(latestDmg).toContain("Drag Agents in Cloud to Applications");
     expect(nightlyDmg).toContain("Drag Agents in Cloud to Applications");
   });

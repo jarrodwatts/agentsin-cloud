@@ -9,6 +9,10 @@ const indexHtml = NodeFS.readFileSync(new URL("../index.html", import.meta.url),
 const manifest = JSON.parse(
   NodeFS.readFileSync(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
 ) as { readonly name?: string; readonly short_name?: string };
+const sidebarChrome = NodeFS.readFileSync(
+  new URL("./components/sidebar/SidebarChrome.tsx", import.meta.url),
+  "utf8",
+);
 
 describe("Agents in Cloud web branding", () => {
   it("brands the document before React starts", () => {
@@ -25,5 +29,13 @@ describe("Agents in Cloud web branding", () => {
 
     expect(markup).toContain('aria-label="Agents in Cloud splash screen"');
     expect(markup).toContain('alt="Agents in Cloud"');
+  });
+
+  it("uses the product name and icon-library artwork in the primary sidebar brand", () => {
+    expect(sidebarChrome).toContain('data-product-brand="Agents in Cloud"');
+    expect(sidebarChrome).toContain('aria-label="Agents in Cloud — go to threads"');
+    expect(sidebarChrome).toContain("CloudIcon");
+    expect(sidebarChrome).not.toContain("T3Wordmark");
+    expect(sidebarChrome).not.toContain('aria-label="T3"');
   });
 });

@@ -1,22 +1,116 @@
+import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { act } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import {
+  selectActiveRightPanelSurface,
+  selectSelectedRightPanelSurface,
+  type ThreadRightPanelState,
+  useRightPanelStore,
+} from "../../rightPanelStore";
 import { CloudDesktopInspector } from "./CloudDesktopInspector";
 import {
   CLOUD_THREAD_VISUAL_FIXTURE_QUERY_KEY,
   CLOUD_THREAD_VISUAL_FIXTURE_QUERY_VALUE,
   resolveDevCloudThreadVisualFixture,
 } from "./devCloudThreadVisualFixture";
+import type { CloudDesktopSession } from "./useCloudDesktopInspector";
+import { useDevCloudThreadVisualFixtureSession } from "./useDevCloudThreadVisualFixtureSession";
 
 const input = {
   search: `?${CLOUD_THREAD_VISUAL_FIXTURE_QUERY_KEY}=${CLOUD_THREAD_VISUAL_FIXTURE_QUERY_VALUE}`,
   environmentId: "environment-visual-fixture" as EnvironmentId,
   threadId: "thread-visual-fixture" as ThreadId,
 };
+const threadRef = scopeThreadRef(input.environmentId, input.threadId);
+
+// ReactDOM needs a host, but this focused unit suite has no browser dependency.
+class TestNode {
+  parentNode: TestNode | null = null;
+  childNodes: TestNode[] = [];
+  readonly nodeName: string;
+  readonly tagName: string;
+  readonly namespaceURI = "http://www.w3.org/1999/xhtml";
+  readonly style = {};
+
+  constructor(
+    name: string,
+    readonly ownerDocument: TestNode | null = null,
+    readonly nodeType = 1,
+  ) {
+    this.nodeName = name.toUpperCase();
+    this.tagName = this.nodeName;
+  }
+
+  set textContent(_value: string) {
+    this.childNodes = [];
+  }
+
+  appendChild(child: TestNode) {
+    child.parentNode = this;
+    this.childNodes.push(child);
+    return child;
+  }
+
+  removeChild(child: TestNode) {
+    this.childNodes.splice(this.childNodes.indexOf(child), 1);
+    child.parentNode = null;
+    return child;
+  }
+
+  createElement(name: string) {
+    return new TestNode(name, this);
+  }
+
+  addEventListener() {}
+  removeEventListener() {}
+  setAttribute() {}
+}
+
+function installTestDom() {
+  const document = new TestNode("#document", null, 9);
+  const window = {
+    document,
+    HTMLIFrameElement: TestNode,
+    setInterval: globalThis.setInterval,
+    clearInterval: globalThis.clearInterval,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  vi.stubGlobal("document", document);
+  vi.stubGlobal("window", window);
+  vi.stubGlobal("HTMLIFrameElement", window.HTMLIFrameElement);
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  return document;
+}
+
+let observedSession: CloudDesktopSession | null = null;
+
+function FixtureSessionHarness({
+  fixture,
+}: {
+  fixture: ReturnType<typeof resolveDevCloudThreadVisualFixture>;
+}) {
+  observedSession = useDevCloudThreadVisualFixtureSession({
+    environmentId: input.environmentId,
+    threadId: input.threadId,
+    fixture: fixture?.desktop ?? null,
+  });
+  return null;
+}
+
+beforeEach(() => {
+  observedSession = null;
+  useRightPanelStore.setState({ byThreadKey: {} });
+});
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe("active cloud-thread visual fixture", () => {
@@ -84,5 +178,56 @@ describe("active cloud-thread visual fixture", () => {
     expect(agentMarkup).toContain('src="/assets/agents-in-cloud-desktop-preview.png"');
     expect(userMarkup).toContain("You’re controlling");
     expect(userMarkup).toContain("Release Control");
+  });
+
+  it("restores the exact prior panel state when the fixture is disabled", async () => {
+    const fixture = resolveDevCloudThreadVisualFixture(input);
+    if (fixture === null) throw new Error("fixture was not enabled");
+    const previousPanelState: ThreadRightPanelState = {
+      isOpen: false,
+      activeSurfaceId: "diff",
+      surfaces: [
+        { id: "cloud-desktop", kind: "cloud-desktop" },
+        { id: "diff", kind: "diff" },
+      ],
+    };
+    const threadKey = scopedThreadKey(threadRef);
+    useRightPanelStore.setState({ byThreadKey: { [threadKey]: previousPanelState } });
+    const document = installTestDom();
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(document.createElement("div") as unknown as Element);
+
+    try {
+      await act(() => root.render(<FixtureSessionHarness fixture={fixture} />));
+      expect(
+        selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+      ).toMatchObject({ kind: "cloud-desktop" });
+      expect(observedSession?.snapshot.controller?.controller).toBe("agent");
+
+      await act(() => observedSession?.takeControl());
+      expect(observedSession?.snapshot.controller?.controller).toBe("user");
+
+      const fixtureWithNewIdentity = {
+        ...fixture,
+        desktop: { ...fixture.desktop },
+      };
+      await act(() => root.render(<FixtureSessionHarness fixture={fixtureWithNewIdentity} />));
+      expect(observedSession?.snapshot.controller?.controller).toBe("user");
+
+      await act(() => observedSession?.releaseControl());
+      expect(observedSession?.snapshot.controller?.controller).toBe("agent");
+
+      await act(() => root.render(<FixtureSessionHarness fixture={null} />));
+      expect(observedSession).toBeNull();
+      expect(useRightPanelStore.getState().byThreadKey[threadKey]).toEqual(previousPanelState);
+      expect(
+        selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+      ).toBeNull();
+      expect(
+        selectSelectedRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+      ).toMatchObject({ kind: "diff" });
+    } finally {
+      await act(() => root.unmount());
+    }
   });
 });
