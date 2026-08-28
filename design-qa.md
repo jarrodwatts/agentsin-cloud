@@ -39,7 +39,7 @@ Separate crops were not required because the original-detail canonical compariso
 - Spacing and layout rhythm: the three-column proportions, hairline dividers, card padding, radii, and vertical grouping match the selected focus-canvas direction. Compact behavior collapses the inspector first and retains the sidebar.
 - Colors and visual tokens: graphite surfaces, restrained borders, muted text, emerald healthy state, and violet action/checkpoint accents are coherent with the liquid-glass product direction and do not overpower the work surface.
 - Image quality and asset fidelity: the supplied desktop raster remains sharp. It now fills the fixture's landscape desktop surface with a top-biased crop; production live frames continue to use non-cropping `object-contain` behavior.
-- Copy and content: product branding consistently says Agents in Cloud. Fixture copy is self-contained, realistic, and reports a coherent cloud coding task without leaking setup instructions into the product UI.
+- Copy and content: the focus-canvas product branding consistently says Agents in Cloud. A later source review found one SSH prompt and two release paths outside the captured fixture that still referenced upstream T3 surfaces; those are recorded and corrected below.
 - Icons and controls: existing Lucide icons are consistently sized and aligned. Take Control, Release Control, panel toggle, and responsive panel behavior were exercised.
 - Accessibility: semantic regions and controls expose useful names; the controller owner is always stated in text; keyboard-focus styling remains present; existing reduced-motion and reduced-transparency behavior is preserved.
 
@@ -96,15 +96,31 @@ The browser/dev-server stream was restarted after the final source change, then 
   - Hid the secondary identity pill below the wide-desktop breakpoint.
   - Reused the existing compact-right-panel media contract so wide fixture entry opens Desktop and compact entry keeps the focus canvas visible; manual compact opening and exact state restoration remain supported.
 
-### Pass 4 — passed
+### Pass 4 — visual comparison passed; source review remained open
 
 - Post-fix evidence: `/private/tmp/agentsin-cloud-e11-final4-1440x1024.jpg` and `/private/tmp/agentsin-cloud-e11-final4-compact-900x760.jpg`
 - The source and final canonical implementation were compared together in the same visual input.
 - No actionable P0, P1, or P2 difference remains. The shorter deterministic task naturally leaves more vertical breathing room than the long Cursor transcript; this is acceptable product-content variance, not a layout defect.
 
+### Pass 5 — blocked by final source review
+
+- Findings outside the captured focus-canvas state:
+  - [P1] The mandatory AUR job still fetched `pingdotgg/t3code` releases and expected `T3-Code-*` AppImages after desktop artifacts had moved to `Agents-in-Cloud-*`.
+  - [P1] Desktop update `Read more` links still opened upstream T3 release tags instead of the Agents in Cloud release that supplied the update.
+  - [P2] The SSH password dialog mixed `T3 needs` with the Agents in Cloud storage disclaimer.
+- Fixes:
+  - Pointed the compatibility-named AUR packages and release script exclusively at `jarrodwatts/agentsin-cloud` and `Agents-in-Cloud-*` assets while retaining the `t3code` package, launcher, protocol, and install identifiers.
+  - Pointed desktop release details and their toast coverage at the Agents in Cloud release tags.
+  - Made the SSH prompt consistently identify Agents in Cloud.
+
+### Pass 6 — source remediation verified without new visual evidence
+
+- No new screenshot was captured because these fixes affect release automation, an external release link destination, and an SSH prompt outside the canonical focus-canvas state.
+- Focused AUR/release, desktop update, web, desktop-build, typecheck, lint, format, and diff checks were rerun after the source changes.
+
 ## Findings
 
-No actionable P0, P1, or P2 findings remain.
+No actionable focus-canvas visual differences remain, and the final source-review blockers are corrected. The existing screenshots remain the visual evidence; Pass 6 does not claim a new browser comparison.
 
 ## Follow-up polish
 
@@ -121,4 +137,4 @@ No actionable P0, P1, or P2 findings remain.
 - [x] Source and final screenshot compared together.
 - [x] Browser console checked.
 
-final result: passed
+final result: visual comparison passed; final source-review blockers addressed

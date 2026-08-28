@@ -5,7 +5,7 @@ pkgver=0.0.34_nightly.20260814.1095
 pkgrel=1
 pkgdesc='Nightly desktop control surface for local coding agents'
 arch=('x86_64')
-url='https://github.com/pingdotgg/t3code'
+url='https://github.com/jarrodwatts/agentsin-cloud'
 license=('MIT')
 depends=(
   'alsa-lib'
@@ -44,10 +44,10 @@ conflicts=('t3code-nightly' 't3code')
 options=('!debug' '!strip')
 
 _upstream_version="${pkgver/_nightly./-nightly.}"
-_appimage="T3-Code-${_upstream_version}-x86_64.AppImage"
+_appimage="Agents-in-Cloud-${_upstream_version}-x86_64.AppImage"
 source=(
-  "$_appimage::https://github.com/pingdotgg/t3code/releases/download/v${_upstream_version}/$_appimage"
-  "${pkgname}-${pkgver}-LICENSE::https://raw.githubusercontent.com/pingdotgg/t3code/v${_upstream_version}/LICENSE"
+  "$_appimage::https://github.com/jarrodwatts/agentsin-cloud/releases/download/v${_upstream_version}/$_appimage"
+  "${pkgname}-${pkgver}-LICENSE::https://raw.githubusercontent.com/jarrodwatts/agentsin-cloud/v${_upstream_version}/LICENSE"
 )
 sha256sums=(
   'c4dea5bba9ed0b51b2f60f2d4a4867e61d62b57c50ea66f2792a73112e054566' # AppImage
@@ -88,7 +88,7 @@ EOF
 
   install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/t3code.desktop" <<'EOF'
 [Desktop Entry]
-Name=T3 Code Nightly
+Name=Agents in Cloud Nightly
 Comment=Nightly desktop control surface for local coding agents
 Exec=t3code-nightly %U
 TryExec=t3code-nightly
