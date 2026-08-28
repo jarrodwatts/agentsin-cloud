@@ -1825,12 +1825,26 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         );
       }
       const authorizationActive = await authorizationIsActive(client, current, now);
+      const workspaceWide = !authorizationActive || failureCode.startsWith("wallet-policy-");
+      if (workspaceWide) {
+        await client.query(
+          `UPDATE cloud_usage_billing_fence
+              SET state = 'cleared', cleared_at = $4::timestamptz,
+                  processing_owner = NULL, processing_lease_expires_at = NULL,
+                  updated_at = $4::timestamptz
+            WHERE workspace_id = $1 AND thread_id = $2 AND settlement_id = $3
+              AND workspace_fence_id IS NULL
+              AND reason IN ('provider-outcome-uncertain', 'provider-definitive-failure')
+              AND state = 'paused'`,
+          [current.workspaceId, current.threadId, current.settlementId, now],
+        );
+      }
       await ensureBillingFence(client, {
         workspaceId: current.workspaceId,
         threadId: current.threadId,
         settlementId: current.settlementId,
         reason: authorizationActive ? "provider-definitive-failure" : "authorization-unavailable",
-        workspaceWide: !authorizationActive || failureCode.startsWith("wallet-policy-"),
+        workspaceWide,
         processorId,
         leaseExpiresAt: current.processingLeaseExpiresAt ?? nextSubmitNotBefore,
         now,
