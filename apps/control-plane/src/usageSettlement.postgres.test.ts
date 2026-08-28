@@ -1470,17 +1470,23 @@ it.effect("rebinds only after an uncertain transfer is definitively not applied"
         authorizationGeneration: 1,
         providerAttemptGeneration: 2,
       });
-      const blockedGeneration = yield* settlementService(
-        pool,
-        chain,
-        signer(),
-        runtime.runtime,
-        "settler-rebind-expired-generation",
-        "2026-08-28T00:15:10.000Z",
-      ).retryProviderFailure(workspaceId, settlementId);
-      expect(blockedGeneration).toMatchObject({
-        state: "reserved",
-        failureCode: "authorization-unavailable",
+      const wrongRecoveryCause = yield* Effect.exit(
+        settlementService(
+          pool,
+          chain,
+          signer(),
+          runtime.runtime,
+          "settler-rebind-expired-generation",
+          "2026-08-28T00:15:10.000Z",
+        ).retryProviderFailure(workspaceId, settlementId),
+      );
+      expect(Exit.isFailure(wrongRecoveryCause)).toBe(true);
+      expect(
+        yield* Effect.promise(() =>
+          makePostgresUsageSettlementRepository(pool).get(workspaceId, settlementId),
+        ),
+      ).toMatchObject({
+        state: "retry-waiting",
         providerAttemptGeneration: 2,
       });
       expect(
