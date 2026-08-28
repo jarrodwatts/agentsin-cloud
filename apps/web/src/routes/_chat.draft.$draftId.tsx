@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 import ChatView from "../components/ChatView";
 import {
@@ -39,7 +39,7 @@ function DraftChatThreadRouteView() {
     serverThreadStarted,
     backgroundSubmissionPending,
   });
-  const visualFixtureSearch = typeof window === "undefined" ? "" : window.location.search;
+  const visualFixtureSearch = useLocation({ select: (location) => location.searchStr });
   const visualFixtureEnvironmentId = draftSession?.environmentId ?? null;
   const visualFixtureThreadId = draftSession?.threadId ?? null;
   const visualFixture = useMemo(

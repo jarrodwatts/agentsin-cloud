@@ -16,6 +16,12 @@ import {
   shouldRenderDevCloudThreadFocusCanvas,
 } from "./DevCloudThreadFocusCanvas";
 import {
+  DevCloudThreadBranchIdentity,
+  DevCloudThreadComposerIdentity,
+  DevCloudThreadHeaderIdentity,
+  DevCloudThreadSidebarTitle,
+} from "./DevCloudThreadPresentation";
+import {
   CLOUD_THREAD_VISUAL_FIXTURE_QUERY_KEY,
   CLOUD_THREAD_VISUAL_FIXTURE_QUERY_VALUE,
   resolveDevCloudThreadVisualFixture,
@@ -160,10 +166,45 @@ describe("active cloud-thread visual fixture", () => {
       composerState: "ready",
     });
     expect(fixture.focusCanvas).toMatchObject({
+      presentation: {
+        title: "Fix checkout race",
+        workspaceLabel: "Checkout service",
+        environmentLabel: "Relay managed · E2B",
+        providerLabel: "Codex",
+        modelLabel: "GPT-5.6 Codex",
+        runtimeLabel: "E2B Cloud",
+        branch: "agents/fix-checkout-race-a12f",
+      },
       userRequest:
         "Fix the checkout race, verify it with focused tests, and push a safe checkpoint.",
       checkpoint: { sha: "8c1f2ab", label: "Verified checkpoint pushed" },
     });
+  });
+
+  it("replaces stale persisted identity across header, sidebar, and composer", () => {
+    const fixture = resolveDevCloudThreadVisualFixture(input);
+    if (fixture === null) throw new Error("fixture was not enabled");
+    const presentation = fixture.focusCanvas.presentation;
+    const markup = renderToStaticMarkup(
+      <>
+        <DevCloudThreadHeaderIdentity presentation={presentation} />
+        <DevCloudThreadSidebarTitle presentation={presentation} />
+        <DevCloudThreadComposerIdentity presentation={presentation} />
+        <DevCloudThreadBranchIdentity presentation={presentation} />
+      </>,
+    );
+
+    expect(markup).toContain("Fix checkout race");
+    expect(markup).toContain("Checkout service");
+    expect(markup).toContain("Relay managed · E2B");
+    expect(markup).toContain("Codex");
+    expect(markup).toContain("GPT-5.6 Codex");
+    expect(markup).toContain("E2B Cloud");
+    expect(markup).toContain("agents/fix-checkout-race-a12f");
+    expect(markup).not.toContain("Summarize Current Branch");
+    expect(markup).not.toContain("Claude Fable 5");
+    expect(markup).not.toContain("Local checkout");
+    expect(markup).not.toContain("codex/3-branding-fixture");
   });
 
   it("renders a deterministic focus canvas instead of persisted thread content", () => {

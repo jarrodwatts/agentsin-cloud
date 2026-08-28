@@ -188,6 +188,7 @@ import {
   DevCloudThreadFocusCanvas,
   shouldRenderDevCloudThreadFocusCanvas,
 } from "./cloud/DevCloudThreadFocusCanvas";
+import { DevCloudThreadHeaderIdentity } from "./cloud/DevCloudThreadPresentation";
 import { CloudThreadStatusBar, CloudThreadTimelineFrame } from "./cloud/CloudThreadTimeline";
 import {
   cloudComposerBlockedReason,
@@ -1354,6 +1355,7 @@ function ChatViewContent(props: ChatViewProps) {
   )
     ? devCloudThreadFocusCanvas
     : null;
+  const activeDevCloudThreadPresentation = activeDevCloudThreadFocusCanvas?.presentation ?? null;
   const cloudComposerDisabledReason = cloudThreadCapability.enabled
     ? cloudThreadCapability.view.phase === "loading"
       ? "Restoring cloud thread"
@@ -2981,6 +2983,8 @@ function ChatViewContent(props: ChatViewProps) {
     isGitRepo,
     showEnvironmentIndicator: showComposerEnvironmentIndicator,
   });
+  const displayComposerContextStrip =
+    activeDevCloudThreadPresentation === null && showComposerContextStrip;
   const initialDiffPanelGitScope =
     gitStatusQuery.data?.hasWorkingTreeChanges === true ? "unstaged" : "branch";
   const diffPanelGitStatusResolutionKey = gitStatusQuery.data ? "resolved" : "pending";
@@ -7078,34 +7082,38 @@ function ChatViewContent(props: ChatViewProps) {
           data-app-shell-header
         >
           {!rightPanelOpen ? panelLayoutControls : null}
-          <ChatHeader
-            {...(!supportsPullRequests || activeProjectRepository === null
-              ? {}
-              : { onOpenPullRequest: openProjectPullRequest })}
-            activeThreadEnvironmentId={activeThread.environmentId}
-            activeThreadId={activeThread.id}
-            {...(routeKind === "draft" && draftId ? { draftId } : {})}
-            activeThreadTitle={activeThread.title}
-            isServerThread={isServerThread}
-            changeRequest={activeThreadChangeRequest}
-            activeProjectName={activeProject?.title}
-            activeProjectCwd={activeProject?.workspaceRoot ?? null}
-            activeProjectFaviconPath={activeProject?.faviconPath ?? null}
-            openInCwd={gitCwd}
-            activeProjectScripts={activeProject?.scripts}
-            preferredScriptId={
-              activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-            }
-            keybindings={keybindings}
-            availableEditors={availableEditors}
-            rightPanelOpen={rightPanelOpen}
-            gitCwd={gitCwd}
-            onNewThreadInProject={handleNewThreadInActiveProject}
-            onRunProjectScript={runProjectScript}
-            onAddProjectScript={saveProjectScript}
-            onUpdateProjectScript={updateProjectScript}
-            onDeleteProjectScript={deleteProjectScript}
-          />
+          {activeDevCloudThreadPresentation !== null ? (
+            <DevCloudThreadHeaderIdentity presentation={activeDevCloudThreadPresentation} />
+          ) : (
+            <ChatHeader
+              {...(!supportsPullRequests || activeProjectRepository === null
+                ? {}
+                : { onOpenPullRequest: openProjectPullRequest })}
+              activeThreadEnvironmentId={activeThread.environmentId}
+              activeThreadId={activeThread.id}
+              {...(routeKind === "draft" && draftId ? { draftId } : {})}
+              activeThreadTitle={activeThread.title}
+              isServerThread={isServerThread}
+              changeRequest={activeThreadChangeRequest}
+              activeProjectName={activeProject?.title}
+              activeProjectCwd={activeProject?.workspaceRoot ?? null}
+              activeProjectFaviconPath={activeProject?.faviconPath ?? null}
+              openInCwd={gitCwd}
+              activeProjectScripts={activeProject?.scripts}
+              preferredScriptId={
+                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+              }
+              keybindings={keybindings}
+              availableEditors={availableEditors}
+              rightPanelOpen={rightPanelOpen}
+              gitCwd={gitCwd}
+              onNewThreadInProject={handleNewThreadInActiveProject}
+              onRunProjectScript={runProjectScript}
+              onAddProjectScript={saveProjectScript}
+              onUpdateProjectScript={updateProjectScript}
+              onDeleteProjectScript={deleteProjectScript}
+            />
+          )}
         </WorkspacePageHeader>
 
         <ThreadErrorBanner
@@ -7252,7 +7260,7 @@ function ChatViewContent(props: ChatViewProps) {
                       className={cn(
                         "chat-composer-glass-shell relative mx-auto w-full max-w-3xl",
                         externalComposerDrawerAttached && "chat-composer-glass-shell-attached",
-                        showComposerContextStrip && "chat-composer-glass-shell-with-context",
+                        displayComposerContextStrip && "chat-composer-glass-shell-with-context",
                       )}
                     >
                       <div className="chat-composer-glass-host relative z-10 w-full rounded-[22px]">
@@ -7317,6 +7325,7 @@ function ChatViewContent(props: ChatViewProps) {
                             activeTaskSteps={activeComposerTaskSteps}
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
+                            devCloudThreadPresentation={activeDevCloudThreadPresentation}
                             lockedProvider={lockedProvider}
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={
@@ -7366,7 +7375,7 @@ function ChatViewContent(props: ChatViewProps) {
                           data-terminal-open={terminalUiState.terminalOpen ? "true" : undefined}
                           className="relative z-0"
                         >
-                          {showComposerContextStrip && (
+                          {displayComposerContextStrip && (
                             <div className="pointer-events-auto">
                               <BranchToolbar
                                 environmentId={activeThread.environmentId}

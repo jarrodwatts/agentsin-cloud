@@ -37,6 +37,7 @@ export interface CloudDesktopVisualFixture {
 }
 
 export interface DevCloudThreadFocusCanvasFixture {
+  readonly presentation: DevCloudThreadPresentationFixture;
   readonly userRequest: string;
   readonly agentSummary: string;
   readonly files: ReadonlyArray<{
@@ -48,6 +49,16 @@ export interface DevCloudThreadFocusCanvasFixture {
     readonly sha: string;
     readonly label: string;
   };
+}
+
+export interface DevCloudThreadPresentationFixture {
+  readonly title: string;
+  readonly workspaceLabel: string;
+  readonly environmentLabel: string;
+  readonly providerLabel: string;
+  readonly modelLabel: string;
+  readonly runtimeLabel: string;
+  readonly branch: string;
 }
 
 export interface DevCloudThreadVisualFixture {
@@ -195,6 +206,15 @@ export function resolveDevCloudThreadVisualFixture(input: {
   return {
     desktop: desktopSnapshots(input),
     focusCanvas: {
+      presentation: {
+        title: "Fix checkout race",
+        workspaceLabel: "Checkout service",
+        environmentLabel: "Relay managed · E2B",
+        providerLabel: "Codex",
+        modelLabel: "GPT-5.6 Codex",
+        runtimeLabel: "E2B Cloud",
+        branch: "agents/fix-checkout-race-a12f",
+      },
       userRequest:
         "Fix the checkout race, verify it with focused tests, and push a safe checkpoint.",
       agentSummary:

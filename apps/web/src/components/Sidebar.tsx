@@ -35,6 +35,7 @@ import type { TimestampFormat } from "@t3tools/contracts/settings";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
+  BotIcon,
   CheckIcon,
   ChevronDownIcon,
   CircleAlertIcon,
@@ -66,7 +67,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { useParams, useRouter } from "@tanstack/react-router";
+import { useLocation, useParams, useRouter } from "@tanstack/react-router";
 
 import {
   isAtomCommandInterrupted,
@@ -189,6 +190,12 @@ import {
   type ComposerThreadDraftState,
   type DraftSessionState,
 } from "../composerDraftStore";
+import type { DevCloudThreadPresentationFixture } from "./cloud/devCloudThreadVisualFixture";
+import { resolveDevCloudThreadVisualFixture } from "./cloud/devCloudThreadVisualFixture";
+import {
+  DevCloudThreadBranchIdentity,
+  DevCloudThreadSidebarTitle,
+} from "./cloud/DevCloudThreadPresentation";
 
 // Settled-tail paging: recent history is the common lookup; the deep tail
 // stays behind an explicit Show more.
@@ -269,6 +276,7 @@ function SidebarThreadTooltip({
   branchMismatch,
   terminalStatus,
   terminalProcessCount,
+  devCloudThreadPresentation,
 }: {
   thread: SidebarThreadSummary;
   projectTitle: string | null;
@@ -285,8 +293,13 @@ function SidebarThreadTooltip({
   } | null;
   terminalStatus: TerminalStatusIndicator | null;
   terminalProcessCount: number;
+  devCloudThreadPresentation?: DevCloudThreadPresentationFixture | null;
 }) {
   const driverKind = providerEntry?.driverKind ?? null;
+  const displayTitle = devCloudThreadPresentation?.title ?? thread.title;
+  const displayProjectTitle = devCloudThreadPresentation?.workspaceLabel ?? projectTitle;
+  const displayEnvironmentLabel = devCloudThreadPresentation?.environmentLabel ?? environmentLabel;
+  const displayBranch = devCloudThreadPresentation?.branch ?? thread.branch;
   return (
     <TooltipPopup
       side="right"
@@ -297,10 +310,10 @@ function SidebarThreadTooltip({
     >
       <div className="flex min-w-0 max-w-80 flex-col gap-2 p-[var(--floating-content-inset)]">
         <div className="min-w-0 truncate text-xs leading-none font-medium text-foreground">
-          {thread.title}
+          {displayTitle}
         </div>
         <div className="grid gap-1.5 pl-0.5 text-xs text-muted-foreground">
-          {projectTitle ? (
+          {displayProjectTitle ? (
             <div className="flex min-w-0 items-center gap-2">
               <ProjectFavicon
                 environmentId={thread.environmentId}
@@ -308,19 +321,25 @@ function SidebarThreadTooltip({
                 faviconPath={projectFaviconPath}
                 className="size-3 shrink-0 stroke-muted-foreground"
               />
-              <div className="min-w-0 truncate text-foreground/75">{projectTitle}</div>
+              <div className="min-w-0 truncate text-foreground/75">{displayProjectTitle}</div>
             </div>
           ) : null}
-          {environmentLabel ? (
+          {displayEnvironmentLabel ? (
             <div className="flex min-w-0 items-center gap-2">
               <ServerIcon className="size-3 shrink-0 stroke-muted-foreground" />
-              <div className="min-w-0 truncate text-foreground/75">{environmentLabel}</div>
+              <div className="min-w-0 truncate text-foreground/75">{displayEnvironmentLabel}</div>
             </div>
           ) : null}
-          {thread.branch ? (
+          {displayBranch ? (
             <div className="flex min-w-0 items-center gap-2">
               <GitBranchIcon className="size-3 shrink-0 stroke-muted-foreground" />
-              <div className="min-w-0 truncate text-foreground/75">{thread.branch}</div>
+              <div className="min-w-0 truncate text-foreground/75">
+                {devCloudThreadPresentation ? (
+                  <DevCloudThreadBranchIdentity presentation={devCloudThreadPresentation} />
+                ) : (
+                  displayBranch
+                )}
+              </div>
             </div>
           ) : null}
           {branchMismatch ? (
@@ -331,7 +350,14 @@ function SidebarThreadTooltip({
               </div>
             </div>
           ) : null}
-          {driverKind ? (
+          {devCloudThreadPresentation ? (
+            <div className="flex min-w-0 items-center gap-2">
+              <BotIcon aria-hidden className="size-3 shrink-0 stroke-muted-foreground" />
+              <div className="min-w-0 truncate text-foreground/75">
+                {devCloudThreadPresentation.modelLabel} · {devCloudThreadPresentation.providerLabel}
+              </div>
+            </div>
+          ) : driverKind ? (
             <div className="flex min-w-0 items-center gap-2">
               <ProviderInstanceIcon
                 driverKind={driverKind}
@@ -363,7 +389,7 @@ function SidebarThreadTooltip({
               </div>
             </div>
           ) : null}
-          {thread.session?.lastError ? (
+          {devCloudThreadPresentation == null && thread.session?.lastError ? (
             <div className="flex min-w-0 items-center gap-2 text-red-600 dark:text-red-400">
               <CircleAlertIcon className="size-3 shrink-0 stroke-current" />
               <div className="min-w-0 truncate">Error occurred</div>
@@ -744,6 +770,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   onUnpin: (threadRef: ScopedThreadRef) => void;
   onAcknowledgeWoke: (threadRef: ScopedThreadRef, visitedAt: string) => void;
   changeRequestSnapshot: ThreadChangeRequestSnapshot | null;
+  devCloudThreadPresentation?: DevCloudThreadPresentationFixture | null;
   onChangeRequestSnapshot: (
     threadKey: string,
     snapshot: ThreadChangeRequestSnapshot | null,
@@ -787,6 +814,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   });
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
   const terminalProcessCount = runningTerminalIds.length;
+  const devCloudThreadPresentation = props.devCloudThreadPresentation ?? null;
 
   const gitCwd = thread.worktreePath ?? props.projectCwd;
   const linkedPullRequestStatus = useLinkedThreadPullRequest(
@@ -814,7 +842,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   // Same semantics as the legacy sidebar (never-visited counts as read):
   // switching sidebars must not light up every historical thread as unread.
   const isUnread = hasUnseenCompletion({ ...thread, lastVisitedAt });
-  const status = resolveSidebarThreadStatus(thread);
+  const status =
+    devCloudThreadPresentation === null ? resolveSidebarThreadStatus(thread) : "working";
   // A woken thread reappears at its original position (the sort is
   // deliberately static), so the pill has to carry the weight. Snoozing is
   // an explicit act, so the pill clears only when the user re-engages:
@@ -898,12 +927,15 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   : null;
   const isWokeStatus = topStatus?.icon === "woke";
 
-  const branchMismatch = resolveLocalCheckoutBranchMismatch({
-    effectiveEnvMode: thread.worktreePath === null ? "local" : "worktree",
-    activeWorktreePath: thread.worktreePath,
-    activeThreadBranch: thread.branch,
-    currentGitBranch: gitStatus.data?.refName ?? null,
-  });
+  const branchMismatch =
+    devCloudThreadPresentation === null
+      ? resolveLocalCheckoutBranchMismatch({
+          effectiveEnvMode: thread.worktreePath === null ? "local" : "worktree",
+          activeWorktreePath: thread.worktreePath,
+          activeThreadBranch: thread.branch,
+          currentGitBranch: gitStatus.data?.refName ?? null,
+        })
+      : null;
   const prProvider = resolveDisplayedThreadPrProvider({
     threadBranch: thread.branch,
     gitStatus: gitStatus.data,
@@ -966,6 +998,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       branchMismatch={branchMismatch}
       terminalStatus={terminalStatus}
       terminalProcessCount={terminalProcessCount}
+      devCloudThreadPresentation={devCloudThreadPresentation}
     />
   );
 
@@ -1164,7 +1197,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
         isRegeneratingTitle && "opacity-[0.55]",
       )}
     >
-      {thread.title}
+      {devCloudThreadPresentation === null ? (
+        thread.title
+      ) : (
+        <DevCloudThreadSidebarTitle presentation={devCloudThreadPresentation} />
+      )}
     </span>
   );
 
@@ -1835,6 +1872,20 @@ export default function Sidebar() {
     [routeDraftThread, routeTarget],
   );
   const routeThreadKey = routeThreadRef ? scopedThreadKey(routeThreadRef) : null;
+  const visualFixtureSearch = useLocation({ select: (location) => location.searchStr });
+  const visualFixtureEnvironmentId = routeThreadRef?.environmentId ?? null;
+  const visualFixtureThreadId = routeThreadRef?.threadId ?? null;
+  const devCloudThreadPresentation = useMemo(
+    () =>
+      visualFixtureEnvironmentId === null || visualFixtureThreadId === null
+        ? null
+        : (resolveDevCloudThreadVisualFixture({
+            search: visualFixtureSearch,
+            environmentId: visualFixtureEnvironmentId,
+            threadId: visualFixtureThreadId,
+          })?.focusCanvas.presentation ?? null),
+    [visualFixtureEnvironmentId, visualFixtureSearch, visualFixtureThreadId],
+  );
   const routeTargetRef = useRef(routeTarget);
   routeTargetRef.current = routeTarget;
   // Post-settle navigation validates against the CURRENT route, not the one
@@ -3761,6 +3812,9 @@ export default function Sidebar() {
                         onUnpin={attemptUnpin}
                         onAcknowledgeWoke={acknowledgeWoke}
                         changeRequestSnapshot={changeRequestSnapshotByKey.get(threadKey) ?? null}
+                        devCloudThreadPresentation={
+                          routeThreadKey === threadKey ? devCloudThreadPresentation : null
+                        }
                         onChangeRequestSnapshot={setThreadChangeRequestSnapshot}
                       />
                     );

@@ -253,8 +253,18 @@ try {
   );
   assertContains(
     nightlyReleaseMetadata,
-    "name=T3 Code Nightly 9.9.10-nightly.20260413.321 (abcdef123456)",
+    "name=Agents in Cloud Nightly 9.9.10-nightly.20260413.321 (abcdef123456)",
     "Expected nightly metadata to include the short commit SHA in the release name.",
+  );
+
+  const releaseWorkflow = NodeFS.readFileSync(
+    NodePath.resolve(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+  assertContains(
+    releaseWorkflow,
+    'echo "name=Agents in Cloud v$version"',
+    "Expected stable release metadata to use the Agents in Cloud product name.",
   );
 
   const { arm64Path, x64Path } = writeMacManifestFixtures(tempRoot);

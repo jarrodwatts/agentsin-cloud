@@ -137,6 +137,8 @@ import {
   submitComposerDraft,
 } from "./composerSubmission";
 import { ComposerPromptLengthValidation } from "./ComposerPromptLengthValidation";
+import { DevCloudThreadComposerIdentity } from "../cloud/DevCloudThreadPresentation";
+import type { DevCloudThreadPresentationFixture } from "../cloud/devCloudThreadVisualFixture";
 
 type ComposerCommandMenuPosition = {
   bottom: number;
@@ -608,6 +610,8 @@ export interface ChatComposerProps {
   // Mode
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
+  /** Development-only fixed labels for the deterministic cloud visual fixture. */
+  devCloudThreadPresentation?: DevCloudThreadPresentationFixture | null;
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
@@ -706,6 +710,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activeTaskSteps,
     runtimeMode,
     interactionMode,
+    devCloudThreadPresentation = null,
     lockedProvider,
     providerStatuses,
     activeProjectDefaultModelSelection,
@@ -3473,7 +3478,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 )}
               >
                 <div className="-m-1 -ms-3.5 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 ps-3.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                  {noProviderAvailable ? (
+                  {devCloudThreadPresentation !== null ? (
+                    <DevCloudThreadComposerIdentity presentation={devCloudThreadPresentation} />
+                  ) : noProviderAvailable ? (
                     <Button
                       type="button"
                       size="sm"
@@ -3512,7 +3519,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     />
                   )}
 
-                  {isComposerFooterCompact ? (
+                  {devCloudThreadPresentation !== null ? null : isComposerFooterCompact ? (
                     <CompactComposerControlsMenu
                       interactionMode={interactionMode}
                       runtimeMode={runtimeMode}
@@ -3557,8 +3564,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   {showMobilePendingAnswerActions ? null : inlineStashBadge}
                   <ComposerFooterPrimaryActions
                     compact={isComposerPrimaryActionsCompact}
-                    activeContextWindow={activeContextWindow}
-                    activeThreadModelDisplayName={activeThreadModelDisplayName}
+                    activeContextWindow={
+                      devCloudThreadPresentation === null ? activeContextWindow : null
+                    }
+                    activeThreadModelDisplayName={
+                      devCloudThreadPresentation === null ? activeThreadModelDisplayName : null
+                    }
                     pendingAction={pendingPrimaryAction}
                     isRunning={phase === "running"}
                     showPlanFollowUpPrompt={
