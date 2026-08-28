@@ -54,7 +54,7 @@ Separate crops were not required because the original-detail canonical compariso
 
 ## Console errors checked
 
-The browser/dev-server console stream was checked during navigation, responsive resizing, fixture hot reload, and control transfer. No runtime error was emitted by the completed fixture. One pre-existing LegendList performance warning about explicitly setting `recycleItems` was observed; it does not affect this slice's function or visual result.
+The browser/dev-server stream was restarted after the final source change, then checked during fresh fixture navigation, responsive resizing, cleanup, and control transfer. The completed fixture emitted no runtime error. An earlier development-only hot reload that changed a hook signature produced React's transient hook-order reset warning; a full reload and the fresh-server verification cleared it. One pre-existing LegendList performance warning about explicitly setting `recycleItems` was observed; it does not affect this slice's function or visual result.
 
 ## Comparison history
 
