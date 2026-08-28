@@ -27,6 +27,7 @@ import {
 } from "./ephemeralCoordination.ts";
 import { makeRequestHandler, type AuthInstance } from "./http.ts";
 import { makeInspectorBridge, type InspectorInputAuthorizer } from "./inspectorBridge.ts";
+import { currentOnrampProductionPolicyLayer, OnrampProductionPolicy } from "./onrampPolicy.ts";
 import {
   layer as threadEventStoreLayer,
   ThreadEventStore,
@@ -389,6 +390,7 @@ export const runtimeLayer = Layer.mergeAll(
   persistenceLayer,
   valkeyProductionLayer,
   artifactStorageLayer,
+  currentOnrampProductionPolicyLayer,
 ).pipe(Layer.provideMerge(controlPlaneConfigLayer));
 
 export interface ControlPlaneApplicationDependencies {
@@ -516,6 +518,7 @@ export const makeProgram = (production: HostedProductionDependencies) =>
     const workspaces = yield* WorkspaceRepository;
     const threadEvents = yield* ThreadEventStore;
     const artifactStorage = yield* ArtifactStorage;
+    yield* OnrampProductionPolicy;
     const artifactOutbox = makeArtifactOutboxProcessor({
       repository: makePostgresArtifactRepository(database),
       storage: artifactStorage,

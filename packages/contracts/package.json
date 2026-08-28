@@ -15,6 +15,10 @@
       "types": "./src/cloud.ts",
       "import": "./src/cloud.ts"
     },
+    "./onramp": {
+      "types": "./src/onramp.ts",
+      "import": "./src/onramp.ts"
+    },
     "./worker": {
       "types": "./src/worker.ts",
       "import": "./src/worker.ts"
