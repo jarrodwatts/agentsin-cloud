@@ -463,6 +463,32 @@ BEGIN
      NEW.recovery_settlement_id IS DISTINCT FROM OLD.recovery_settlement_id THEN
     RAISE EXCEPTION 'usage billing fence recovery settlement is immutable once bound';
   END IF;
+  IF OLD.workspace_fence_id IS NOT NULL AND
+     NEW.workspace_fence_id IS DISTINCT FROM OLD.workspace_fence_id THEN
+    RAISE EXCEPTION 'usage billing fence workspace link is immutable once bound';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION agentsin_cloud_protect_usage_workspace_billing_fence()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.state = 'cleared' THEN
+    RAISE EXCEPTION 'cleared workspace billing fence is immutable';
+  END IF;
+  IF ROW(
+    OLD.workspace_id, OLD.fence_id, OLD.episode, OLD.source_thread_id,
+    OLD.reason, OLD.created_at
+  ) IS DISTINCT FROM ROW(
+    NEW.workspace_id, NEW.fence_id, NEW.episode, NEW.source_thread_id,
+    NEW.reason, NEW.created_at
+  ) THEN
+    RAISE EXCEPTION 'workspace billing fence identity is immutable';
+  END IF;
+  IF OLD.settlement_id IS NOT NULL AND NEW.settlement_id IS DISTINCT FROM OLD.settlement_id THEN
+    RAISE EXCEPTION 'workspace billing fence settlement is immutable once bound';
+  END IF;
   RETURN NEW;
 END;
 $$;
@@ -509,6 +535,12 @@ DROP TRIGGER IF EXISTS cloud_usage_billing_fence_protected
 CREATE TRIGGER cloud_usage_billing_fence_protected
   BEFORE UPDATE OR DELETE ON cloud_usage_billing_fence
   FOR EACH ROW EXECUTE FUNCTION agentsin_cloud_protect_usage_billing_fence();
+
+DROP TRIGGER IF EXISTS cloud_usage_workspace_billing_fence_protected
+  ON cloud_usage_workspace_billing_fence;
+CREATE TRIGGER cloud_usage_workspace_billing_fence_protected
+  BEFORE UPDATE OR DELETE ON cloud_usage_workspace_billing_fence
+  FOR EACH ROW EXECUTE FUNCTION agentsin_cloud_protect_usage_workspace_billing_fence();
 
 DROP TRIGGER IF EXISTS cloud_usage_billing_fence_event_immutable
   ON cloud_usage_billing_fence_event;

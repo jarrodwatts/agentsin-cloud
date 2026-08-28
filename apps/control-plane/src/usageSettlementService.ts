@@ -52,6 +52,12 @@ export type MonadSettlementObservation =
       readonly providerActivityRef?: string;
     }
   | {
+      /** A definitive Turnkey policy rejection that applies to the delegated wallet, not one thread. */
+      readonly status: "walletPolicyDenied";
+      readonly reason: "daily-limit" | "delegated-policy";
+      readonly providerActivityRef?: string;
+    }
+  | {
       readonly status: "insufficientBalance";
       readonly providerActivityRef?: string;
     }
@@ -336,6 +342,7 @@ export const makeUsageSettlementService = (options: {
 
   const finalize = (
     attempt: UsageSettlementAttempt,
+    clearWorkspaceFence: boolean,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> =>
     Effect.gen(function* () {
       if (attempt.txHash === undefined || attempt.transferSubmittedAt === undefined) {
@@ -384,6 +391,7 @@ export const makeUsageSettlementService = (options: {
           options.processorId,
           receiptResult.success,
           options.now(),
+          clearWorkspaceFence,
         ),
       ).pipe(Effect.catch(() => holdFinalization("receipt-finalization-failed")));
     });
@@ -424,6 +432,7 @@ export const makeUsageSettlementService = (options: {
   const completeObservation = (
     attempt: UsageSettlementAttempt,
     observation: MonadSettlementObservation,
+    clearWorkspaceFence: boolean,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> => {
     switch (observation.status) {
       case "applied":
@@ -486,7 +495,9 @@ export const makeUsageSettlementService = (options: {
           ),
         ).pipe(
           Effect.flatMap((recorded) =>
-            recorded.state === "transfer-applied" ? finalize(recorded) : Effect.succeed(recorded),
+            recorded.state === "transfer-applied"
+              ? finalize(recorded, clearWorkspaceFence)
+              : Effect.succeed(recorded),
           ),
         );
       case "insufficientBalance":
@@ -538,10 +549,30 @@ export const makeUsageSettlementService = (options: {
           observation.providerActivityRef,
           "provider-definitively-not-applied",
         );
+      case "walletPolicyDenied":
+        if (
+          attempt.providerActivityRef !== undefined &&
+          observation.providerActivityRef !== attempt.providerActivityRef
+        ) {
+          return repositoryEffect("mark-wallet-policy-activity-conflict", () =>
+            options.repository.markReconciliationRequired(
+              attempt,
+              options.processorId,
+              undefined,
+              "provider-activity-identity-mismatch",
+              options.now(),
+            ),
+          );
+        }
+        return closeNotApplied(
+          attempt,
+          observation.providerActivityRef,
+          `wallet-policy-${observation.reason}`,
+        );
     }
   };
 
-  const submitOnce = (attempt: UsageSettlementAttempt) =>
+  const submitOnce = (attempt: UsageSettlementAttempt, clearWorkspaceFence: boolean) =>
     options.settlement.submit(requestFor(attempt)).pipe(
       Effect.mapError((cause) =>
         serviceError(
@@ -565,27 +596,33 @@ export const makeUsageSettlementService = (options: {
           : closeNotApplied(attempt, undefined, "provider-submit-not-applied"),
       ),
       Effect.flatMap((submitted) =>
-        "state" in submitted ? Effect.succeed(submitted) : completeObservation(attempt, submitted),
+        "state" in submitted
+          ? Effect.succeed(submitted)
+          : completeObservation(attempt, submitted, clearWorkspaceFence),
       ),
     );
 
   const applyInspection = (
     attempt: UsageSettlementAttempt,
     observation: MonadSettlementObservation,
+    clearWorkspaceFence: boolean,
   ) =>
     observation.status === "notApplied" &&
     attempt.providerActivityRef === undefined &&
     observation.providerActivityRef === undefined
-      ? submitOnce(attempt)
-      : completeObservation(attempt, observation);
+      ? submitOnce(attempt, clearWorkspaceFence)
+      : completeObservation(attempt, observation, clearWorkspaceFence);
 
   const process = (
     initial: UsageSettlementAttempt,
+    clearWorkspaceFence = false,
   ): Effect.Effect<UsageSettlementAttempt, UsageSettlementServiceError> =>
     Effect.gen(function* () {
       if (initial.state === "finalized") return initial;
       if (initial.state === "low-balance-pause-pending") return yield* pauseForLowBalance(initial);
-      if (initial.state === "transfer-applied") return yield* finalize(initial);
+      if (initial.state === "transfer-applied") {
+        return yield* finalize(initial, clearWorkspaceFence);
+      }
       const startsNewProviderGeneration =
         initial.state === "reserved" ||
         initial.state === "retry-waiting" ||
@@ -619,7 +656,9 @@ export const makeUsageSettlementService = (options: {
           ),
         ),
       );
-      return "state" in inspected ? inspected : yield* applyInspection(pending, inspected);
+      return "state" in inspected
+        ? inspected
+        : yield* applyInspection(pending, inspected, clearWorkspaceFence);
     });
 
   const summarize = (
@@ -787,7 +826,7 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        return yield* process(attempt);
+        return yield* process(attempt, true);
       }),
     retryProviderFailure: (workspaceId, settlementId) =>
       Effect.gen(function* () {
@@ -804,7 +843,7 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        return yield* process(attempt);
+        return yield* process(attempt, true);
       }),
     retryAuthorization: (workspaceId, threadId) =>
       Effect.gen(function* () {
@@ -821,7 +860,7 @@ export const makeUsageSettlementService = (options: {
             leaseExpiresAt,
           ),
         );
-        if (existing !== undefined) return yield* process(existing);
+        if (existing !== undefined) return yield* process(existing, true);
         const attempts = yield* repositoryEffect("bind-authorization-recovery", () =>
           options.repository.claimReady({
             processorId: options.processorId,
@@ -838,7 +877,7 @@ export const makeUsageSettlementService = (options: {
         if (attempt === undefined) {
           return yield* serviceError("invalidRequest", "authorization-recovery-not-ready", false);
         }
-        return yield* process(attempt);
+        return yield* process(attempt, true);
       }),
   };
 };

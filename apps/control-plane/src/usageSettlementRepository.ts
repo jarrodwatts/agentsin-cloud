@@ -72,6 +72,7 @@ export interface UsageBillingFence {
   readonly fenceId: string;
   readonly workspaceId: WorkspaceId;
   readonly threadId: ThreadId;
+  readonly workspaceFenceId?: string;
   readonly settlementId?: SettlementId;
   readonly reason:
     | "insufficient-balance"
@@ -172,6 +173,7 @@ export interface UsageSettlementRepository {
     processorId: string,
     receipt: UsageSettlementReceipt,
     now: string,
+    clearWorkspaceFence: boolean,
   ) => Promise<UsageSettlementAttempt>;
   readonly releaseLease: (
     attempt: UsageSettlementAttempt,
@@ -287,6 +289,7 @@ interface BillingFenceRow extends QueryResultRow {
   readonly workspace_id: string;
   readonly thread_id: string;
   readonly fence_id: string;
+  readonly workspace_fence_id: string | null;
   readonly settlement_id: string | null;
   readonly reason: UsageBillingFence["reason"];
   readonly state: UsageBillingFence["state"];
@@ -521,7 +524,7 @@ const postingColumns = `item.accrual_id, item.sample_id, item.environment_id, it
   item.total_delta_micro_usdc::text`;
 
 const billingFenceColumns = `fence.workspace_id::text, fence.thread_id, fence.fence_id,
-  fence.settlement_id, fence.reason, fence.state, fence.processing_owner,
+  fence.workspace_fence_id, fence.settlement_id, fence.reason, fence.state, fence.processing_owner,
   CASE WHEN fence.processing_lease_expires_at IS NULL THEN NULL ELSE
     to_char(fence.processing_lease_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
   END AS processing_lease_expires_at,
@@ -538,6 +541,7 @@ const billingFenceFromRow = (row: BillingFenceRow): UsageBillingFence => ({
   fenceId: row.fence_id,
   workspaceId: row.workspace_id as WorkspaceId,
   threadId: row.thread_id as ThreadId,
+  ...(row.workspace_fence_id === null ? {} : { workspaceFenceId: row.workspace_fence_id }),
   ...(row.settlement_id === null ? {} : { settlementId: row.settlement_id as SettlementId }),
   reason: row.reason,
   state: row.state,
@@ -551,22 +555,38 @@ const billingFenceFromRow = (row: BillingFenceRow): UsageBillingFence => ({
   ...(row.cleared_at === null ? {} : { clearedAt: row.cleared_at }),
 });
 
-const ensureBillingFence = async (
+interface BillingFenceInput {
+  readonly workspaceId: WorkspaceId;
+  readonly threadId: ThreadId;
+  readonly settlementId?: SettlementId;
+  readonly reason: UsageBillingFence["reason"];
+  readonly processorId: string;
+  readonly leaseExpiresAt: string;
+  readonly now: string;
+  /** Only trusted wallet-policy classifications may widen a provider failure to the workspace. */
+  readonly workspaceWide?: boolean;
+}
+
+interface WorkspaceBillingFenceRow extends QueryResultRow {
+  readonly fence_id: string;
+  readonly source_thread_id: string;
+  readonly settlement_id: string | null;
+  readonly reason: Exclude<UsageBillingFence["reason"], "provider-outcome-uncertain">;
+}
+
+const lockWorkspaceBillingGate = (client: PoolClient, workspaceId: WorkspaceId) =>
+  client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+    "agents-in-cloud/workspace-billing-gate/v1",
+    workspaceId,
+  ]);
+
+const ensureThreadBillingFence = async (
   client: PoolClient,
-  input: {
-    readonly workspaceId: WorkspaceId;
-    readonly threadId: ThreadId;
-    readonly settlementId?: SettlementId;
-    readonly reason: UsageBillingFence["reason"];
-    readonly processorId: string;
-    readonly leaseExpiresAt: string;
-    readonly now: string;
+  input: BillingFenceInput & {
+    readonly workspaceFenceId?: string;
+    readonly mayLinkExisting?: boolean;
   },
 ) => {
-  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
-    "agents-in-cloud/workspace-billing-gate/v1",
-    input.workspaceId,
-  ]);
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
     "agents-in-cloud/usage-billing-fence/v1",
     `${input.workspaceId}:${input.threadId}`,
@@ -574,10 +594,13 @@ const ensureBillingFence = async (
   const active = await client.query<{
     readonly fence_id: string;
     readonly episode: number;
+    readonly workspace_fence_id: string | null;
     readonly settlement_id: string | null;
     readonly recovery_settlement_id: string | null;
+    readonly reason: UsageBillingFence["reason"];
   }>(
-    `SELECT fence_id, episode, settlement_id, recovery_settlement_id
+    `SELECT fence_id, episode, workspace_fence_id, settlement_id,
+            recovery_settlement_id, reason
        FROM cloud_usage_billing_fence
       WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared' FOR UPDATE`,
     [input.workspaceId, input.threadId],
@@ -603,14 +626,16 @@ const ensureBillingFence = async (
   if (existing === undefined) {
     await client.query(
       `INSERT INTO cloud_usage_billing_fence (
-         workspace_id, thread_id, fence_id, episode, settlement_id, reason, state,
+         workspace_id, thread_id, fence_id, episode, workspace_fence_id,
+         settlement_id, reason, state,
          processing_owner, processing_lease_expires_at, created_at, updated_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,'pause-pending',$7,$8::timestamptz,$9::timestamptz,$9::timestamptz)`,
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,'pause-pending',$8,$9::timestamptz,$10::timestamptz,$10::timestamptz)`,
       [
         input.workspaceId,
         input.threadId,
         fenceId,
         episode,
+        input.workspaceFenceId ?? null,
         input.settlementId ?? null,
         input.reason,
         input.processorId,
@@ -619,6 +644,13 @@ const ensureBillingFence = async (
       ],
     );
   } else {
+    const workspaceLinkCompatible =
+      input.workspaceFenceId === undefined ||
+      existing.workspace_fence_id === input.workspaceFenceId ||
+      (existing.workspace_fence_id === null &&
+        input.mayLinkExisting === true &&
+        existing.reason !== "provider-outcome-uncertain");
+    if (!workspaceLinkCompatible) return;
     const boundSettlementId = existing.settlement_id ?? existing.recovery_settlement_id;
     if (
       input.settlementId !== undefined &&
@@ -633,15 +665,17 @@ const ensureBillingFence = async (
     await client.query(
       `UPDATE cloud_usage_billing_fence
           SET reason = $4,
+              workspace_fence_id = COALESCE(workspace_fence_id, $5),
               recovery_settlement_id = COALESCE(recovery_settlement_id,
-                CASE WHEN settlement_id IS NULL THEN $5 ELSE NULL END),
-              updated_at = $6::timestamptz
+                CASE WHEN settlement_id IS NULL THEN $6 ELSE NULL END),
+              updated_at = $7::timestamptz
         WHERE workspace_id = $1 AND thread_id = $2 AND fence_id = $3`,
       [
         input.workspaceId,
         input.threadId,
         existing.fence_id,
         input.reason,
+        input.workspaceFenceId ?? null,
         input.settlementId ?? null,
         input.now,
       ],
@@ -662,6 +696,95 @@ const ensureBillingFence = async (
       input.now,
     ],
   );
+};
+
+const ensureWorkspaceBillingFence = async (client: PoolClient, input: BillingFenceInput) => {
+  const active = await client.query<WorkspaceBillingFenceRow>(
+    `SELECT fence_id, source_thread_id, settlement_id, reason
+       FROM cloud_usage_workspace_billing_fence
+      WHERE workspace_id = $1 AND state = 'active' FOR UPDATE`,
+    [input.workspaceId],
+  );
+  let workspaceFence = active.rows[0];
+  if (workspaceFence === undefined) {
+    const episode = Number(
+      (
+        await client.query<{ readonly episode: string }>(
+          `SELECT (COALESCE(max(episode), 0) + 1)::text AS episode
+             FROM cloud_usage_workspace_billing_fence WHERE workspace_id = $1`,
+          [input.workspaceId],
+        )
+      ).rows[0]!.episode,
+    );
+    const fenceId = `workspace-billing-fence-${digest(
+      "agents-in-cloud/usage-workspace-billing-fence/v1",
+      { workspaceId: input.workspaceId, episode },
+    ).slice(0, 48)}`;
+    await client.query(
+      `INSERT INTO cloud_usage_workspace_billing_fence (
+         workspace_id, fence_id, episode, source_thread_id, settlement_id,
+         reason, state, created_at, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,'active',$7::timestamptz,$7::timestamptz)`,
+      [
+        input.workspaceId,
+        fenceId,
+        episode,
+        input.threadId,
+        input.settlementId ?? null,
+        input.reason,
+        input.now,
+      ],
+    );
+    workspaceFence = {
+      fence_id: fenceId,
+      source_thread_id: input.threadId,
+      settlement_id: input.settlementId ?? null,
+      reason: input.reason as WorkspaceBillingFenceRow["reason"],
+    };
+  } else if (
+    workspaceFence.source_thread_id === input.threadId &&
+    workspaceFence.settlement_id === null &&
+    input.settlementId !== undefined
+  ) {
+    await client.query(
+      `UPDATE cloud_usage_workspace_billing_fence
+          SET settlement_id = $3, updated_at = $4::timestamptz
+        WHERE workspace_id = $1 AND fence_id = $2 AND state = 'active'`,
+      [input.workspaceId, workspaceFence.fence_id, input.settlementId, input.now],
+    );
+    workspaceFence = { ...workspaceFence, settlement_id: input.settlementId };
+  }
+
+  const threads = await client.query<{ readonly thread_id: string }>(
+    `SELECT thread_id FROM cloud_thread WHERE workspace_id = $1 ORDER BY thread_id FOR SHARE`,
+    [input.workspaceId],
+  );
+  for (const thread of threads.rows) {
+    const isSource = thread.thread_id === workspaceFence.source_thread_id;
+    await ensureThreadBillingFence(client, {
+      ...input,
+      threadId: thread.thread_id as ThreadId,
+      reason: workspaceFence.reason,
+      workspaceFenceId: workspaceFence.fence_id,
+      mayLinkExisting: isSource,
+      ...(isSource && workspaceFence.settlement_id !== null
+        ? { settlementId: workspaceFence.settlement_id as SettlementId }
+        : {}),
+    });
+  }
+};
+
+const ensureBillingFence = async (client: PoolClient, input: BillingFenceInput) => {
+  await lockWorkspaceBillingGate(client, input.workspaceId);
+  const workspaceWide =
+    input.workspaceWide === true ||
+    input.reason === "authorization-unavailable" ||
+    input.reason === "insufficient-balance";
+  if (workspaceWide && input.reason !== "provider-outcome-uncertain") {
+    await ensureWorkspaceBillingFence(client, input);
+    return;
+  }
+  await ensureThreadBillingFence(client, input);
 };
 
 const bindAuthorizationFenceToSettlement = async (
@@ -1255,6 +1378,14 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
                  AND fence.thread_id = cloud_usage_settlement_attempt.thread_id
                  AND fence.settlement_id = cloud_usage_settlement_attempt.settlement_id
                  AND fence.state = 'paused'
+                 AND (
+                   fence.workspace_fence_id IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM cloud_usage_billing_fence sibling
+                      WHERE sibling.workspace_id = fence.workspace_id
+                        AND sibling.workspace_fence_id = fence.workspace_fence_id
+                        AND sibling.state <> 'cleared' AND sibling.state <> 'paused'
+                   )
+                 )
             )`,
         [workspaceId, settlementId, processorId, leaseExpiresAt, now],
       );
@@ -1584,6 +1715,7 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         threadId: current.threadId,
         settlementId: current.settlementId,
         reason: authorizationActive ? "provider-definitive-failure" : "authorization-unavailable",
+        workspaceWide: !authorizationActive || failureCode.startsWith("wallet-policy-"),
         processorId,
         leaseExpiresAt: current.processingLeaseExpiresAt ?? nextSubmitNotBefore,
         now,
@@ -1721,9 +1853,53 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
       }
       return requireAttempt(client, paused.workspaceId, paused.settlementId);
     }),
-  finalize: (attempt, processorId, receipt, now) =>
+  finalize: (attempt, processorId, receipt, now, clearWorkspaceFence) =>
     transaction(pool, async (client) => {
       const current = await requireAttempt(client, attempt.workspaceId, attempt.settlementId);
+      await lockWorkspaceBillingGate(client, current.workspaceId);
+      const workspaceFenceResult = await client.query<{ readonly fence_id: string }>(
+        `SELECT fence_id
+           FROM cloud_usage_workspace_billing_fence
+          WHERE workspace_id = $1 AND source_thread_id = $2 AND settlement_id = $3
+            AND state = 'active' FOR UPDATE`,
+        [current.workspaceId, current.threadId, current.settlementId],
+      );
+      const workspaceFenceId = workspaceFenceResult.rows[0]?.fence_id;
+      if (workspaceFenceId !== undefined && !clearWorkspaceFence) {
+        throw new UsageSettlementRepositoryError(
+          "conflict",
+          "workspace billing hold requires an explicit authorized recovery",
+        );
+      }
+      if (workspaceFenceId !== undefined) {
+        const linked = await client.query<{
+          readonly linked_count: string;
+          readonly pending_count: string;
+          readonly source_count: string;
+        }>(
+          `SELECT count(*)::text AS linked_count,
+                  count(*) FILTER (WHERE state <> 'paused')::text AS pending_count,
+                  count(*) FILTER (
+                    WHERE thread_id = $3
+                      AND (settlement_id = $4 OR recovery_settlement_id = $4)
+                      AND state = 'paused'
+                  )::text AS source_count
+             FROM cloud_usage_billing_fence
+            WHERE workspace_id = $1 AND workspace_fence_id = $2 AND state <> 'cleared'`,
+          [current.workspaceId, workspaceFenceId, current.threadId, current.settlementId],
+        );
+        const linkedState = linked.rows[0]!;
+        if (
+          linkedState.linked_count === "0" ||
+          linkedState.pending_count !== "0" ||
+          linkedState.source_count !== "1"
+        ) {
+          throw new UsageSettlementRepositoryError(
+            "conflict",
+            "every linked workspace billing fence must be durably paused before recovery",
+          );
+        }
+      }
       const verifiedReceipt = decodeReceipt(receipt);
       if (
         current.state !== "transfer-applied" ||
@@ -1778,15 +1954,39 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
         [now],
         ["transfer-applied"],
       );
-      await client.query(
-        `UPDATE cloud_usage_billing_fence
-            SET state = 'cleared', cleared_at = $3::timestamptz,
-                processing_owner = NULL, processing_lease_expires_at = NULL,
-                updated_at = $3::timestamptz
-          WHERE workspace_id = $1 AND thread_id = $2 AND state = 'paused'
-            AND settlement_id = $4`,
-        [current.workspaceId, current.threadId, now, current.settlementId],
-      );
+      if (workspaceFenceId === undefined) {
+        await client.query(
+          `UPDATE cloud_usage_billing_fence
+              SET state = 'cleared', cleared_at = $3::timestamptz,
+                  processing_owner = NULL, processing_lease_expires_at = NULL,
+                  updated_at = $3::timestamptz
+            WHERE workspace_id = $1 AND thread_id = $2 AND state = 'paused'
+              AND settlement_id = $4`,
+          [current.workspaceId, current.threadId, now, current.settlementId],
+        );
+      } else {
+        await client.query(
+          `UPDATE cloud_usage_billing_fence
+              SET state = 'cleared', cleared_at = $3::timestamptz,
+                  processing_owner = NULL, processing_lease_expires_at = NULL,
+                  updated_at = $3::timestamptz
+            WHERE workspace_id = $1 AND workspace_fence_id = $2 AND state = 'paused'`,
+          [current.workspaceId, workspaceFenceId, now],
+        );
+        const clearedWorkspace = await client.query(
+          `UPDATE cloud_usage_workspace_billing_fence
+              SET state = 'cleared', cleared_at = $3::timestamptz,
+                  updated_at = $3::timestamptz
+            WHERE workspace_id = $1 AND fence_id = $2 AND state = 'active'`,
+          [current.workspaceId, workspaceFenceId, now],
+        );
+        if (clearedWorkspace.rowCount !== 1) {
+          throw new UsageSettlementRepositoryError(
+            "conflict",
+            "workspace billing hold changed during recovery",
+          );
+        }
+      }
       const activeFence = await client.query(
         `SELECT 1 FROM cloud_usage_billing_fence
           WHERE workspace_id = $1 AND thread_id = $2 AND state <> 'cleared' LIMIT 1`,
@@ -1898,7 +2098,16 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
       const fence = await client.query(
         `SELECT 1 FROM cloud_usage_billing_fence
           WHERE workspace_id = $1 AND thread_id = $2 AND settlement_id = $3
-            AND state = 'paused' FOR SHARE`,
+            AND state = 'paused'
+            AND (
+              workspace_fence_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM cloud_usage_billing_fence sibling
+                 WHERE sibling.workspace_id = cloud_usage_billing_fence.workspace_id
+                   AND sibling.workspace_fence_id = cloud_usage_billing_fence.workspace_fence_id
+                   AND sibling.state <> 'cleared' AND sibling.state <> 'paused'
+              )
+            )
+          FOR SHARE`,
         [workspaceId, attemptRow.thread_id, settlementId],
       );
       if (fence.rowCount !== 1) {
@@ -1927,6 +2136,14 @@ export const makePostgresUsageSettlementRepository = (pool: Pool): UsageSettleme
            FROM cloud_usage_billing_fence
           WHERE workspace_id = $1 AND thread_id = $2
             AND reason = 'authorization-unavailable' AND state = 'paused'
+            AND (
+              workspace_fence_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM cloud_usage_billing_fence sibling
+                 WHERE sibling.workspace_id = cloud_usage_billing_fence.workspace_id
+                   AND sibling.workspace_fence_id = cloud_usage_billing_fence.workspace_fence_id
+                   AND sibling.state <> 'cleared' AND sibling.state <> 'paused'
+              )
+            )
           FOR UPDATE`,
         [workspaceId, threadId],
       );

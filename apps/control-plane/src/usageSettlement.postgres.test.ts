@@ -283,12 +283,13 @@ const signer = (fails = false): SettlementReceiptSigner => ({
 const makeRuntime = () => {
   let pauses = 0;
   let fails = false;
+  const failedThreadIds = new Set<string>();
   const requestIds: Array<string> = [];
   const runtime: SettlementRuntimeBoundary = {
     pauseForBillingFailure: (request) => {
       pauses += 1;
       requestIds.push(request.requestId);
-      return fails
+      return fails || failedThreadIds.has(request.threadId)
         ? Effect.fail(
             new SettlementRuntimeBoundaryError({ code: "runtime-unavailable", retryable: true }),
           )
@@ -301,6 +302,10 @@ const makeRuntime = () => {
     requestIds: () => requestIds,
     setFail: (value: boolean) => {
       fails = value;
+    },
+    setThreadFail: (failedThreadId: ThreadId, value: boolean) => {
+      if (value) failedThreadIds.add(failedThreadId);
+      else failedThreadIds.delete(failedThreadId);
     },
   };
 };
@@ -802,6 +807,212 @@ it.effect("durably pauses on low balance and resumes only after an explicit fund
       expect(chain.submits()).toBe(3);
     }),
   ),
+);
+
+it.effect(
+  "holds every workspace thread until an explicit low-balance recovery pauses all siblings",
+  () =>
+    withPostgres((pool) =>
+      Effect.gen(function* () {
+        const siblingThreadId = "settlement-thread-sibling" as ThreadId;
+        const otherWorkspaceId = "88888888-8888-4888-8888-888888888888" as WorkspaceId;
+        const otherThreadId = "settlement-thread-other-workspace" as ThreadId;
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_thread (workspace_id, thread_id, environment_id)
+             VALUES ($1,$2,$3)`,
+            [workspaceId, siblingThreadId, "settlement-environment-sibling"],
+          ),
+        );
+        yield* Effect.promise(() =>
+          pool.query("INSERT INTO workspace (id, owner_user_id, name) VALUES ($1,$2,$3)", [
+            otherWorkspaceId,
+            "settlement-owner",
+            "Other settlement workspace",
+          ]),
+        );
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_thread (workspace_id, thread_id, environment_id)
+             VALUES ($1,$2,$3)`,
+            [otherWorkspaceId, otherThreadId, "settlement-environment-other"],
+          ),
+        );
+
+        const first = evidence("workspace-low-balance", 1, 4_250, "d");
+        yield* accrue(
+          pool,
+          new Map([[first.evidenceId, first]]),
+          first,
+          "workspace-low-balance-v1",
+        );
+        const chain = makeChain();
+        chain.setSubmit({ status: "insufficientBalance" });
+        const runtime = makeRuntime();
+        runtime.setThreadFail(siblingThreadId, true);
+        const service = settlementService(
+          pool,
+          chain,
+          signer(),
+          runtime.runtime,
+          "settler-workspace-low",
+        );
+        expect(
+          yield* service.settleReady({ trigger: "sandbox-paused", workspaceId, threadId }),
+        ).toMatchObject({ lowBalancePaused: 1, billingPaused: 0 });
+
+        const settlementId = yield* Effect.promise(() => onlySettlementId(pool));
+        const activeWorkspaceFence = yield* Effect.promise(() =>
+          pool.query<{ readonly fence_id: string; readonly episode: number }>(
+            `SELECT fence_id, episode FROM cloud_usage_workspace_billing_fence
+              WHERE workspace_id = $1 AND state = 'active'`,
+            [workspaceId],
+          ),
+        );
+        expect(activeWorkspaceFence.rows).toHaveLength(1);
+        expect(activeWorkspaceFence.rows[0]!.episode).toBe(1);
+        const linked = yield* Effect.promise(() =>
+          pool.query<{
+            readonly thread_id: string;
+            readonly state: string;
+            readonly workspace_fence_id: string | null;
+          }>(
+            `SELECT thread_id, state, workspace_fence_id FROM cloud_usage_billing_fence
+              WHERE workspace_id = $1 AND state <> 'cleared' ORDER BY thread_id`,
+            [workspaceId],
+          ),
+        );
+        expect(linked.rows).toEqual([
+          {
+            thread_id: threadId,
+            state: "paused",
+            workspace_fence_id: activeWorkspaceFence.rows[0]!.fence_id,
+          },
+          {
+            thread_id: siblingThreadId,
+            state: "pause-pending",
+            workspace_fence_id: activeWorkspaceFence.rows[0]!.fence_id,
+          },
+        ]);
+        expect(
+          (yield* Effect.promise(() =>
+            pool.query(
+              `SELECT 1 FROM cloud_usage_billing_fence
+                  WHERE workspace_id = $1 AND state <> 'cleared'`,
+              [otherWorkspaceId],
+            ),
+          )).rowCount,
+        ).toBe(0);
+
+        expect(
+          Exit.isFailure(
+            yield* Effect.exit(
+              settlementService(
+                pool,
+                chain,
+                signer(),
+                runtime.runtime,
+                "settler-premature-recovery",
+                "2026-08-28T00:15:01.000Z",
+              ).retryLowBalance(workspaceId, settlementId),
+            ),
+          ),
+        ).toBe(true);
+        expect(chain.submits()).toBe(1);
+        expect(
+          (yield* Effect.promise(() =>
+            makePostgresUsageSettlementRepository(pool).get(workspaceId, settlementId),
+          ))?.state,
+        ).toBe("low-balance-paused");
+
+        expect(
+          Exit.isFailure(
+            yield* Effect.exit(
+              Effect.tryPromise(() =>
+                pool.query(
+                  `INSERT INTO cloud_thread_lifecycle_attempt (
+                     workspace_id, thread_id, attempt_id, idempotency_key, request_fingerprint,
+                     environment_id, environment_revision_id, environment_revision_hash,
+                     project_id, provider_instance_id, provider_driver, repository_identity,
+                     workspace_directory, state, is_current, created_at, updated_at
+                   ) VALUES ($1,$2,'blocked-sibling-create','blocked-sibling-key',$3,$4,
+                     'sibling-revision',$5,$6,'provider-instance','codex',$7::jsonb,
+                     '/workspace/agentsin-cloud','reserved',true,$8,$8)`,
+                  [
+                    workspaceId,
+                    siblingThreadId,
+                    "a".repeat(64),
+                    "settlement-environment-sibling",
+                    "b".repeat(64),
+                    projectId,
+                    { canonicalKey: "github.com/jarrodwatts/agentsin-cloud" },
+                    "2026-08-28T00:15:01.000Z",
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ).toBe(true);
+        yield* Effect.promise(() =>
+          pool.query(
+            `INSERT INTO cloud_thread_lifecycle_attempt (
+               workspace_id, thread_id, attempt_id, idempotency_key, request_fingerprint,
+               environment_id, environment_revision_id, environment_revision_hash,
+               project_id, provider_instance_id, provider_driver, repository_identity,
+               workspace_directory, state, is_current, created_at, updated_at
+             ) VALUES ($1,$2,'other-workspace-create','other-workspace-key',$3,$4,
+               'other-revision',$5,$6,'provider-instance','codex',$7::jsonb,
+               '/workspace/agentsin-cloud','reserved',true,$8,$8)`,
+            [
+              otherWorkspaceId,
+              otherThreadId,
+              "c".repeat(64),
+              "settlement-environment-other",
+              "d".repeat(64),
+              projectId,
+              { canonicalKey: "github.com/jarrodwatts/agentsin-cloud" },
+              "2026-08-28T00:15:01.000Z",
+            ],
+          ),
+        );
+
+        runtime.setThreadFail(siblingThreadId, false);
+        expect((yield* service.recoverPending()).billingPaused).toBe(1);
+        chain.setSubmit({
+          status: "applied",
+          providerActivityRef: "turnkey-workspace-funded",
+          txHash: `0x${"d".repeat(64)}` as EvmTransactionHash,
+          submittedAt: "2026-08-28T00:15:02.000Z",
+        });
+        const funded = yield* settlementService(
+          pool,
+          chain,
+          signer(),
+          runtime.runtime,
+          "settler-workspace-funded",
+          "2026-08-28T00:15:03.000Z",
+        ).retryLowBalance(workspaceId, settlementId);
+        expect(funded.state).toBe("finalized");
+        expect(
+          (yield* Effect.promise(() =>
+            pool.query(
+              `SELECT 1 FROM cloud_usage_workspace_billing_fence
+                  WHERE workspace_id = $1 AND state = 'active'`,
+              [workspaceId],
+            ),
+          )).rowCount,
+        ).toBe(0);
+        expect(
+          (yield* Effect.promise(() =>
+            pool.query(
+              `SELECT 1 FROM cloud_usage_billing_fence
+                  WHERE workspace_id = $1 AND state <> 'cleared'`,
+              [workspaceId],
+            ),
+          )).rowCount,
+        ).toBe(0);
+      }),
+    ),
 );
 
 it.effect("keeps a failed low-balance pause durable and retries only the pause boundary", () =>
