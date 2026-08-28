@@ -16,6 +16,12 @@ it("fences legacy leases and makes operation uniqueness route-aware", () => {
   expect(migration).toContain("DROP CONSTRAINT %I");
   expect(migration).toContain("UNIQUE (workspace_id, sandbox_id, operation_id, route_generation)");
   expect(migration).toContain("github_worker_token_lease_route_binding_required");
-  expect(migration.match(/IF NOT EXISTS \(/gu)).toHaveLength(2);
   expect(migration).toContain("conrelid = 'github_worker_token_lease'::regclass");
+  expect(migration.match(/IF FOUND THEN/gu)).toHaveLength(2);
+  expect(migration).toContain("contype::text");
+  expect(migration).toContain("convalidated");
+  expect(migration).toContain("regexp_replace(pg_get_constraintdef(oid)");
+  expect(migration).toContain("route_operation_definition <> expected_route_operation_definition");
+  expect(migration).toContain("route_binding_definition <> expected_route_binding_definition");
+  expect(migration.match(/USING ERRCODE = '23000'/gu)).toHaveLength(2);
 });

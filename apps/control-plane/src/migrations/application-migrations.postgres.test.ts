@@ -7,6 +7,36 @@ import * as Effect from "effect/Effect";
 import { Pool } from "pg";
 
 const postgresUrl = process.env.AGENTSIN_TEST_POSTGRES_URL;
+const applicationMigrationFilenames = [
+  "0001-workspaces.sql",
+  "0002-cloud-thread-store.sql",
+  "0003-thread-integrity-locks.sql",
+  "0004-cloud-thread-lifecycle.sql",
+  "0005-worker-mtls.sql",
+  "0006-github-thread-workflow.sql",
+  "0007-provider-credential-profiles.sql",
+  "0008-thread-route-generation.sql",
+  "0009-github-worker-route-binding.sql",
+  "0010-artifact-storage.sql",
+  "0011-desktop-leases.sql",
+  "0012-user-wallets.sql",
+  "0013-cloud-thread-runtime.sql",
+  "0014-usage-ledger.sql",
+] as const;
+const expectedRouteBindingDefinition =
+  "CHECK (((used_at IS NOT NULL) OR ((environment_revision_id IS NOT NULL) AND (reservation_id IS NOT NULL) AND (worker_id IS NOT NULL) AND (provider_instance_id IS NOT NULL) AND (provider_driver IS NOT NULL) AND (process_instance_id IS NOT NULL) AND (certificate_fingerprint IS NOT NULL) AND (certificate_generation > 0) AND (worker_lease_generation > 0) AND (route_generation > 0))))";
+
+interface ApplicationMigration {
+  readonly filename: string;
+  readonly sql: string;
+}
+
+interface ConstraintState {
+  readonly conname: string;
+  readonly contype: string;
+  readonly convalidated: boolean;
+  readonly definition: string;
+}
 
 const loadApplicationMigrations = async () => {
   const migrationsDirectory = new URL("./", import.meta.url);
@@ -48,38 +78,32 @@ const withPostgres = (use: (pool: Pool) => Promise<void>) => {
   );
 };
 
-it.effect("replays every application migration without weakening route binding", () =>
-  withPostgres(async (pool) => {
-    await pool.query('CREATE TABLE "user" (id text PRIMARY KEY)');
-    const migrations = await loadApplicationMigrations();
+const applyMigrations = async (pool: Pool, migrations: ReadonlyArray<ApplicationMigration>) => {
+  for (const { sql } of migrations) await pool.query(sql);
+};
 
-    expect(migrations.map(({ filename }) => filename)).toEqual([
-      "0001-workspaces.sql",
-      "0002-cloud-thread-store.sql",
-      "0003-thread-integrity-locks.sql",
-      "0004-cloud-thread-lifecycle.sql",
-      "0005-worker-mtls.sql",
-      "0006-github-thread-workflow.sql",
-      "0007-provider-credential-profiles.sql",
-      "0008-thread-route-generation.sql",
-      "0009-github-worker-route-binding.sql",
-      "0010-artifact-storage.sql",
-      "0011-desktop-leases.sql",
-      "0012-user-wallets.sql",
-      "0013-cloud-thread-runtime.sql",
-      "0014-usage-ledger.sql",
-    ]);
+const prepareMigratedDatabase = async (pool: Pool) => {
+  await pool.query('CREATE TABLE "user" (id text PRIMARY KEY)');
+  const migrations = await loadApplicationMigrations();
+  expect(migrations.map(({ filename }) => filename)).toEqual(applicationMigrationFilenames);
+  await applyMigrations(pool, migrations);
+  const routeBindingMigration = migrations.find(
+    ({ filename }) => filename === "0009-github-worker-route-binding.sql",
+  );
+  if (routeBindingMigration === undefined) {
+    throw new Error("0009 GitHub worker route binding migration is missing");
+  }
+  return { migrations, routeBindingMigration };
+};
 
-    for (const { sql } of migrations) await pool.query(sql);
-    for (const { sql } of migrations) await pool.query(sql);
-
-    const constraints = await pool.query<{
-      readonly conname: string;
-      readonly contype: string;
-      readonly convalidated: boolean;
-      readonly definition: string;
-    }>(
-      `SELECT conname, contype, convalidated, pg_get_constraintdef(oid) AS definition
+const readRouteConstraintState = async (pool: Pool) =>
+  (
+    await pool.query<ConstraintState>(
+      `SELECT conname,
+              contype::text AS contype,
+              convalidated,
+              btrim(regexp_replace(pg_get_constraintdef(oid), '[[:space:]]+', ' ', 'g'))
+                AS definition
          FROM pg_constraint
         WHERE conrelid = 'github_worker_token_lease'::regclass
           AND conname IN (
@@ -87,30 +111,114 @@ it.effect("replays every application migration without weakening route binding",
             'github_worker_token_lease_route_binding_required'
           )
         ORDER BY conname`,
-    );
+    )
+  ).rows;
 
-    expect(constraints.rows).toHaveLength(2);
-    expect(constraints.rows).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          conname: "github_worker_token_lease_route_operation_key",
-          contype: "u",
-          convalidated: true,
-          definition: "UNIQUE (workspace_id, sandbox_id, operation_id, route_generation)",
-        }),
-        expect.objectContaining({
-          conname: "github_worker_token_lease_route_binding_required",
-          contype: "c",
-          convalidated: true,
-        }),
-      ]),
+const expectReplayRejected = async (
+  pool: Pool,
+  migration: ApplicationMigration,
+  constraintName: string,
+) => {
+  await expect(pool.query(migration.sql)).rejects.toMatchObject({
+    code: "23000",
+    message: expect.stringContaining(`${constraintName} does not match`),
+  });
+  await pool.query("ROLLBACK");
+};
+
+it.effect("replays every application migration without weakening route binding", () =>
+  withPostgres(async (pool) => {
+    const { migrations } = await prepareMigratedDatabase(pool);
+    const beforeReplay = await readRouteConstraintState(pool);
+
+    expect(beforeReplay).toEqual([
+      {
+        conname: "github_worker_token_lease_route_binding_required",
+        contype: "c",
+        convalidated: true,
+        definition: expectedRouteBindingDefinition,
+      },
+      {
+        conname: "github_worker_token_lease_route_operation_key",
+        contype: "u",
+        convalidated: true,
+        definition: "UNIQUE (workspace_id, sandbox_id, operation_id, route_generation)",
+      },
+    ]);
+
+    await applyMigrations(pool, migrations);
+    expect(await readRouteConstraintState(pool)).toEqual(beforeReplay);
+  }),
+);
+
+it.effect("fails closed for a weakened same-name route uniqueness constraint", () =>
+  withPostgres(async (pool) => {
+    const { routeBindingMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE github_worker_token_lease
+      DROP CONSTRAINT github_worker_token_lease_route_operation_key,
+      ADD CONSTRAINT github_worker_token_lease_route_operation_key
+      UNIQUE (workspace_id, sandbox_id, operation_id, route_generation, lease_ref)`);
+
+    await expectReplayRejected(
+      pool,
+      routeBindingMigration,
+      "github_worker_token_lease_route_operation_key",
     );
-    const routeBinding = constraints.rows.find(
-      ({ conname }) => conname === "github_worker_token_lease_route_binding_required",
+  }),
+);
+
+it.effect("fails closed for a different same-name route binding check", () =>
+  withPostgres(async (pool) => {
+    const { routeBindingMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE github_worker_token_lease
+      DROP CONSTRAINT github_worker_token_lease_route_binding_required,
+      ADD CONSTRAINT github_worker_token_lease_route_binding_required
+      CHECK (used_at IS NOT NULL OR route_generation > 0)`);
+
+    await expectReplayRejected(
+      pool,
+      routeBindingMigration,
+      "github_worker_token_lease_route_binding_required",
     );
-    expect(routeBinding?.definition).toContain("used_at IS NOT NULL");
-    expect(routeBinding?.definition).toContain("certificate_generation > 0");
-    expect(routeBinding?.definition).toContain("worker_lease_generation > 0");
-    expect(routeBinding?.definition).toContain("route_generation > 0");
+  }),
+);
+
+it.effect("fails closed for a same-name route binding check that is not validated", () =>
+  withPostgres(async (pool) => {
+    const { routeBindingMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE github_worker_token_lease
+      DROP CONSTRAINT github_worker_token_lease_route_binding_required,
+      ADD CONSTRAINT github_worker_token_lease_route_binding_required
+      CHECK (
+        used_at IS NOT NULL OR (
+          environment_revision_id IS NOT NULL AND reservation_id IS NOT NULL AND
+          worker_id IS NOT NULL AND provider_instance_id IS NOT NULL AND
+          provider_driver IS NOT NULL AND process_instance_id IS NOT NULL AND
+          certificate_fingerprint IS NOT NULL AND certificate_generation > 0 AND
+          worker_lease_generation > 0 AND route_generation > 0
+        )
+      ) NOT VALID`);
+
+    await expectReplayRejected(
+      pool,
+      routeBindingMigration,
+      "github_worker_token_lease_route_binding_required",
+    );
+  }),
+);
+
+it.effect("fails closed for a wrong-type same-name route binding constraint", () =>
+  withPostgres(async (pool) => {
+    const { routeBindingMigration } = await prepareMigratedDatabase(pool);
+    await pool.query(`ALTER TABLE github_worker_token_lease
+      DROP CONSTRAINT github_worker_token_lease_route_binding_required,
+      ADD CONSTRAINT github_worker_token_lease_route_binding_required
+      UNIQUE (lease_ref, route_generation)`);
+
+    await expectReplayRejected(
+      pool,
+      routeBindingMigration,
+      "github_worker_token_lease_route_binding_required",
+    );
   }),
 );

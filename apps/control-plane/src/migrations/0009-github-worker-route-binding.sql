@@ -57,24 +57,59 @@ END
 $$;
 
 DO $$
+DECLARE
+  route_operation_type text;
+  route_operation_validated boolean;
+  route_operation_definition text;
+  route_binding_type text;
+  route_binding_validated boolean;
+  route_binding_definition text;
+  expected_route_operation_definition constant text :=
+    'UNIQUE (workspace_id, sandbox_id, operation_id, route_generation)';
+  expected_route_binding_definition constant text :=
+    'CHECK (((used_at IS NOT NULL) OR ((environment_revision_id IS NOT NULL) AND (reservation_id IS NOT NULL) AND (worker_id IS NOT NULL) AND (provider_instance_id IS NOT NULL) AND (provider_driver IS NOT NULL) AND (process_instance_id IS NOT NULL) AND (certificate_fingerprint IS NOT NULL) AND (certificate_generation > 0) AND (worker_lease_generation > 0) AND (route_generation > 0))))';
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1
-      FROM pg_constraint
-     WHERE conrelid = 'github_worker_token_lease'::regclass
-       AND conname = 'github_worker_token_lease_route_operation_key'
-  ) THEN
+  SELECT contype::text,
+         convalidated,
+         btrim(regexp_replace(pg_get_constraintdef(oid), '[[:space:]]+', ' ', 'g'))
+    INTO route_operation_type,
+         route_operation_validated,
+         route_operation_definition
+    FROM pg_constraint
+   WHERE conrelid = 'github_worker_token_lease'::regclass
+     AND conname = 'github_worker_token_lease_route_operation_key';
+  IF FOUND THEN
+    IF route_operation_type <> 'u'
+       OR NOT route_operation_validated
+       OR route_operation_definition <> expected_route_operation_definition THEN
+      RAISE EXCEPTION
+        'github_worker_token_lease_route_operation_key does not match its required validated definition'
+        USING ERRCODE = '23000';
+    END IF;
+  ELSE
     ALTER TABLE github_worker_token_lease
       ADD CONSTRAINT github_worker_token_lease_route_operation_key
       UNIQUE (workspace_id, sandbox_id, operation_id, route_generation);
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-      FROM pg_constraint
-     WHERE conrelid = 'github_worker_token_lease'::regclass
-       AND conname = 'github_worker_token_lease_route_binding_required'
-  ) THEN
+  SELECT contype::text,
+         convalidated,
+         btrim(regexp_replace(pg_get_constraintdef(oid), '[[:space:]]+', ' ', 'g'))
+    INTO route_binding_type,
+         route_binding_validated,
+         route_binding_definition
+    FROM pg_constraint
+   WHERE conrelid = 'github_worker_token_lease'::regclass
+     AND conname = 'github_worker_token_lease_route_binding_required';
+  IF FOUND THEN
+    IF route_binding_type <> 'c'
+       OR NOT route_binding_validated
+       OR route_binding_definition <> expected_route_binding_definition THEN
+      RAISE EXCEPTION
+        'github_worker_token_lease_route_binding_required does not match its required validated definition'
+        USING ERRCODE = '23000';
+    END IF;
+  ELSE
     ALTER TABLE github_worker_token_lease
       ADD CONSTRAINT github_worker_token_lease_route_binding_required
       CHECK (
