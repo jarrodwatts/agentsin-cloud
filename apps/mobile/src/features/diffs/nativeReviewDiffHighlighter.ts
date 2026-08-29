@@ -97,6 +97,7 @@ export interface HighlightNativeReviewDiffVisibleRowsInput {
 const NATIVE_REVIEW_DIFF_HIGHLIGHT_CHUNK_SIZE = 500;
 const NATIVE_REVIEW_DIFF_VISIBLE_OVERSCAN_ROWS = 160;
 const NATIVE_REVIEW_DIFF_VISIBLE_MAX_ROWS = 360;
+const NATIVE_REVIEW_DIFF_TOKENIZE_MAX_LINE_LENGTH = 1_000;
 
 const NATIVE_REVIEW_DIFF_THEME_NAME_BY_SCHEME = {
   dark: "t3-pierre-dark",
@@ -226,6 +227,22 @@ function normalizeTokens(
   );
 }
 
+function tokenizeReviewDiffCode(
+  highlighter: HighlighterCore,
+  code: string,
+  options: { readonly lang: NativeReviewDiffLanguage; readonly theme: string },
+): ReadonlyArray<ReadonlyArray<NativeReviewDiffToken>> {
+  return normalizeTokens(
+    highlighter.codeToTokensBase(code, {
+      ...options,
+      // Wall-clock limits can return partial grammar state under scheduler contention.
+      // Bound work by line length so identical input always produces identical tokens.
+      tokenizeMaxLineLength: NATIVE_REVIEW_DIFF_TOKENIZE_MAX_LINE_LENGTH,
+      tokenizeTimeLimit: 0,
+    }),
+  );
+}
+
 async function createNativeReviewDiffHighlighter(): Promise<NativeReviewDiffHighlighterHandle> {
   const nativeEngineModule = await import("react-native-shiki-engine");
   if (!nativeEngineModule.isNativeEngineAvailable()) {
@@ -240,7 +257,7 @@ async function createNativeReviewDiffHighlighter(): Promise<NativeReviewDiffHigh
 
   return {
     engine: "native",
-    tokenize: (code, options) => normalizeTokens(highlighter.codeToTokensBase(code, options)),
+    tokenize: (code, options) => tokenizeReviewDiffCode(highlighter, code, options),
   };
 }
 
@@ -253,7 +270,7 @@ async function createJavascriptReviewDiffHighlighter(): Promise<NativeReviewDiff
 
   return {
     engine: "javascript",
-    tokenize: (code, options) => normalizeTokens(highlighter.codeToTokensBase(code, options)),
+    tokenize: (code, options) => tokenizeReviewDiffCode(highlighter, code, options),
   };
 }
 

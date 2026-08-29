@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import type { NativeReviewDiffRow } from "./nativeReviewDiffSurface";
 import type { NativeReviewDiffFile } from "./nativeReviewDiffTypes";
@@ -120,6 +120,50 @@ describe("highlightNativeReviewDiffVisibleRows", () => {
     ]);
 
     expect(withComment.tokensByRowId).toEqual(contiguous.tokensByRowId);
+  });
+
+  it("does not truncate grammar state when wall-clock time advances during tokenization", async () => {
+    const openingRow = makeLine({
+      id: "delayed-template-open",
+      content: "const message = `open",
+      change: "add",
+      oldLineNumber: null,
+      newLineNumber: 1,
+    });
+    const closingRow = makeLine({
+      id: "delayed-template-close",
+      content: "closed`;",
+      change: "add",
+      oldLineNumber: null,
+      newLineNumber: 2,
+    });
+    const trailingRow = makeLine({
+      id: "delayed-trailing-row",
+      content: "export const answer = 42;",
+      change: "add",
+      oldLineNumber: null,
+      newLineNumber: 3,
+    });
+    const commentRow: NativeReviewDiffRow = {
+      kind: "comment",
+      id: "delayed-comment",
+      fileId: TYPESCRIPT_FILE.id,
+      commentText: "Review note",
+    };
+    const rows = [openingRow, commentRow, closingRow, trailingRow];
+    const expected = await highlight(rows);
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 1_000;
+      return now;
+    });
+
+    try {
+      const highlighted = await highlight(rows);
+      expect(highlighted.tokensByRowId).toEqual(expected.tokensByRowId);
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("does not join unhighlighted rows across cached gaps", async () => {
