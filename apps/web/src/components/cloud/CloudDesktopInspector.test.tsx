@@ -81,6 +81,8 @@ describe("CloudDesktopInspector", () => {
     expect(markup).toContain('aria-live="polite"');
     expect(markup).toContain('data-cloud-desktop-status="live"');
     expect(markup).toContain('src="https://cloud.test/frame.webp"');
+    expect(markup).toContain("object-contain");
+    expect(markup).not.toContain("object-[center_12%]");
   });
 
   it("distinguishes agent, foreign-user, and resumable disconnected control", () => {

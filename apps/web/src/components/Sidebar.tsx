@@ -66,7 +66,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { useParams, useRouter } from "@tanstack/react-router";
+import { useLocation, useParams, useRouter } from "@tanstack/react-router";
 
 import {
   isAtomCommandInterrupted,
@@ -189,6 +189,8 @@ import {
   type ComposerThreadDraftState,
   type DraftSessionState,
 } from "../composerDraftStore";
+import { resolveDevCloudThreadVisualFixture } from "./cloud/devCloudThreadVisualFixture";
+import { DevCloudThreadSidebarRow } from "./cloud/DevCloudThreadPresentation";
 
 // Settled-tail paging: recent history is the common lookup; the deep tail
 // stays behind an explicit Show more.
@@ -1835,6 +1837,20 @@ export default function Sidebar() {
     [routeDraftThread, routeTarget],
   );
   const routeThreadKey = routeThreadRef ? scopedThreadKey(routeThreadRef) : null;
+  const visualFixtureSearch = useLocation({ select: (location) => location.searchStr });
+  const visualFixtureEnvironmentId = routeThreadRef?.environmentId ?? null;
+  const visualFixtureThreadId = routeThreadRef?.threadId ?? null;
+  const devCloudThreadPresentation = useMemo(
+    () =>
+      visualFixtureEnvironmentId === null || visualFixtureThreadId === null
+        ? null
+        : (resolveDevCloudThreadVisualFixture({
+            search: visualFixtureSearch,
+            environmentId: visualFixtureEnvironmentId,
+            threadId: visualFixtureThreadId,
+          })?.focusCanvas.presentation ?? null),
+    [visualFixtureEnvironmentId, visualFixtureSearch, visualFixtureThreadId],
+  );
   const routeTargetRef = useRef(routeTarget);
   routeTargetRef.current = routeTarget;
   // Post-settle navigation validates against the CURRENT route, not the one
@@ -3672,6 +3688,17 @@ export default function Sidebar() {
                     // not from the sidebar second-guessing what still matters.
                     const isCard = section === "active" || section === "pinned";
                     const rowVariant = isCard ? "card" : "slim";
+                    if (routeThreadKey === threadKey && devCloudThreadPresentation !== null) {
+                      return (
+                        <DevCloudThreadSidebarRow
+                          key={`${threadKey}:cloud-fixture`}
+                          presentation={devCloudThreadPresentation}
+                          onActivate={() =>
+                            navigateToThread(scopeThreadRef(thread.environmentId, thread.id))
+                          }
+                        />
+                      );
+                    }
                     return (
                       <SidebarThreadRow
                         // Keyed per variant on purpose: when a thread settles,

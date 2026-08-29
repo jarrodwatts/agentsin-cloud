@@ -1,5 +1,5 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect } from "react";
+import { createFileRoute, useLocation, useNavigate } from "@tanstack/react-router";
+import { useEffect, useMemo } from "react";
 import ChatView from "../components/ChatView";
 import {
   resolveDraftPromotionNavigationTarget,
@@ -15,6 +15,7 @@ import { SidebarInset } from "../components/ui/sidebar";
 import { waitForDraftHeroTransition } from "../components/chat/draftHeroTransition";
 import { buildThreadRouteParams } from "../threadRoutes";
 import { useThread, useThreadRefs } from "../state/entities";
+import { resolveDevCloudThreadVisualFixture } from "../components/cloud/devCloudThreadVisualFixture";
 
 function DraftChatThreadRouteView() {
   const navigate = useNavigate();
@@ -38,6 +39,20 @@ function DraftChatThreadRouteView() {
     serverThreadStarted,
     backgroundSubmissionPending,
   });
+  const visualFixtureSearch = useLocation({ select: (location) => location.searchStr });
+  const visualFixtureEnvironmentId = draftSession?.environmentId ?? null;
+  const visualFixtureThreadId = draftSession?.threadId ?? null;
+  const visualFixture = useMemo(
+    () =>
+      visualFixtureEnvironmentId === null || visualFixtureThreadId === null
+        ? null
+        : resolveDevCloudThreadVisualFixture({
+            search: visualFixtureSearch,
+            environmentId: visualFixtureEnvironmentId,
+            threadId: visualFixtureThreadId,
+          }),
+    [visualFixtureEnvironmentId, visualFixtureSearch, visualFixtureThreadId],
+  );
 
   useEffect(() => {
     if (!inferredThreadRef || draftSession?.promotedTo) {
@@ -87,6 +102,19 @@ function DraftChatThreadRouteView() {
         threadId={draftSession.threadId}
         routeKind="draft"
         forceExpandedMobileComposer
+        {...(visualFixture === null
+          ? {}
+          : {
+              cloudDesktopCapability: {
+                enabled: true as const,
+                visualFixture: visualFixture.desktop,
+              },
+              cloudThreadCapability: {
+                enabled: true as const,
+                view: visualFixture.timeline,
+              },
+              devCloudThreadFocusCanvas: visualFixture.focusCanvas,
+            })}
       />
     </SidebarInset>
   );

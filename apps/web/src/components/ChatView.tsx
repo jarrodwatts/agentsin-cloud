@@ -174,10 +174,21 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
 import { CloudDesktopInspector, cloudDesktopTabStatus } from "./cloud/CloudDesktopInspector";
+import type {
+  CloudDesktopVisualFixture,
+  DevCloudThreadFocusCanvasFixture,
+} from "./cloud/devCloudThreadVisualFixture";
 import {
   type CloudDesktopConnection,
+  type CloudDesktopSession,
   useCloudDesktopInspector,
 } from "./cloud/useCloudDesktopInspector";
+import { useDevCloudThreadVisualFixtureSession } from "./cloud/useDevCloudThreadVisualFixtureSession";
+import {
+  DevCloudThreadFocusCanvas,
+  shouldRenderDevCloudThreadFocusCanvas,
+} from "./cloud/DevCloudThreadFocusCanvas";
+import { DevCloudThreadHeaderIdentity } from "./cloud/DevCloudThreadPresentation";
 import { CloudThreadStatusBar, CloudThreadTimelineFrame } from "./cloud/CloudThreadTimeline";
 import {
   cloudComposerBlockedReason,
@@ -579,6 +590,7 @@ function formatOutgoingPrompt(params: {
 }
 const SCRIPT_TERMINAL_COLS = 120;
 const SCRIPT_TERMINAL_ROWS = 30;
+const EMPTY_COMPOSER_BANNER_ITEMS: ReadonlyArray<ComposerBannerStackItem> = [];
 
 export type CloudDesktopCapability =
   | { readonly enabled: false }
@@ -586,6 +598,13 @@ export type CloudDesktopCapability =
       /** The control plane still derives workspace and user identity from Better Auth. */
       readonly enabled: true;
       readonly connection: CloudDesktopConnection;
+      readonly visualFixture?: never;
+    }
+  | {
+      /** Development-only visual QA state; production routes never construct this branch. */
+      readonly enabled: true;
+      readonly visualFixture: CloudDesktopVisualFixture;
+      readonly connection?: never;
     };
 
 const DEFAULT_CLOUD_DESKTOP_CAPABILITY: CloudDesktopCapability = { enabled: false };
@@ -600,6 +619,7 @@ type ChatViewProps =
       threadSyncPhase?: ThreadSyncPhase | null;
       cloudDesktopCapability?: CloudDesktopCapability;
       cloudThreadCapability?: CloudThreadTimelineCapability;
+      devCloudThreadFocusCanvas?: DevCloudThreadFocusCanvasFixture;
       routeKind: "server";
       draftId?: never;
     }
@@ -612,6 +632,7 @@ type ChatViewProps =
       threadSyncPhase?: never;
       cloudDesktopCapability?: CloudDesktopCapability;
       cloudThreadCapability?: CloudThreadTimelineCapability;
+      devCloudThreadFocusCanvas?: DevCloudThreadFocusCanvasFixture;
       routeKind: "draft";
       draftId: DraftId;
     };
@@ -1303,10 +1324,19 @@ function ChatViewContent(props: ChatViewProps) {
     forceExpandedMobileComposer = false,
     cloudDesktopCapability = DEFAULT_CLOUD_DESKTOP_CAPABILITY,
     cloudThreadCapability = DISABLED_CLOUD_THREAD_TIMELINE_CAPABILITY,
+    devCloudThreadFocusCanvas = null,
   } = props;
   // This is intentionally an explicit capability input. Relay-managed is a
   // connection mode, not proof that a cloud desktop lease or stream exists.
   const cloudDesktopAvailable = cloudDesktopCapability.enabled;
+  const cloudDesktopVisualFixture =
+    cloudDesktopCapability.enabled && "visualFixture" in cloudDesktopCapability
+      ? cloudDesktopCapability.visualFixture
+      : null;
+  const cloudDesktopConnection =
+    cloudDesktopCapability.enabled && "connection" in cloudDesktopCapability
+      ? (cloudDesktopCapability.connection ?? null)
+      : null;
   const cloudThreadEvents = cloudThreadCapability.enabled
     ? cloudThreadCapability.view.events
     : null;
@@ -1320,6 +1350,12 @@ function ChatViewContent(props: ChatViewProps) {
       : cloudThreadCapability.enabled && cloudThreadCapability.view.phase === "error"
         ? (cloudThreadCapability.view.runtime ?? null)
         : null;
+  const activeDevCloudThreadFocusCanvas = shouldRenderDevCloudThreadFocusCanvas(
+    devCloudThreadFocusCanvas !== null && cloudThreadCapability.enabled,
+  )
+    ? devCloudThreadFocusCanvas
+    : null;
+  const activeDevCloudThreadPresentation = activeDevCloudThreadFocusCanvas?.presentation ?? null;
   const cloudComposerDisabledReason = cloudThreadCapability.enabled
     ? cloudThreadCapability.view.phase === "loading"
       ? "Restoring cloud thread"
@@ -1766,11 +1802,21 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
-  const cloudDesktopSession = useCloudDesktopInspector({
-    active: cloudDesktopCapability.enabled && activeRightPanelSurface?.kind === "cloud-desktop",
-    connection: cloudDesktopCapability.enabled ? cloudDesktopCapability.connection : null,
+  const liveCloudDesktopSession = useCloudDesktopInspector({
+    active:
+      cloudDesktopCapability.enabled &&
+      cloudDesktopVisualFixture === null &&
+      activeRightPanelSurface?.kind === "cloud-desktop",
+    connection: cloudDesktopConnection,
     threadId,
   });
+  const visualFixtureSession = useDevCloudThreadVisualFixtureSession({
+    environmentId,
+    threadId,
+    fixture: cloudDesktopVisualFixture,
+    compactLayout: shouldUseCompactRightPanel,
+  });
+  const cloudDesktopSession: CloudDesktopSession = visualFixtureSession ?? liveCloudDesktopSession;
   const activeCloudDesktopTabStatus = cloudDesktopCapability.enabled
     ? cloudDesktopTabStatus(cloudDesktopSession.snapshot)
     : undefined;
@@ -2772,13 +2818,15 @@ function ChatViewContent(props: ChatViewProps) {
   const [dockedDraftHeroThreadKey, setDockedDraftHeroThreadKey] = useState<string | null>(null);
   const draftHeroDockRequested =
     activeThreadKey !== null && dockedDraftHeroThreadKey === activeThreadKey;
-  const isDraftHeroState = resolveDraftHeroState({
-    isLocalDraftThread,
-    hasTimelineEntries: timelineEntries.length > 0,
-    isWorking,
-    draftHeroDockRequested,
-    backgroundSubmissionPending,
-  });
+  const isDraftHeroState =
+    activeDevCloudThreadFocusCanvas === null &&
+    resolveDraftHeroState({
+      isLocalDraftThread,
+      hasTimelineEntries: timelineEntries.length > 0,
+      isWorking,
+      draftHeroDockRequested,
+      backgroundSubmissionPending,
+    });
   const [
     attachDraftHeroTransitionGroupRef,
     attachDraftHeroComposerAnchorRef,
@@ -2936,6 +2984,8 @@ function ChatViewContent(props: ChatViewProps) {
     isGitRepo,
     showEnvironmentIndicator: showComposerEnvironmentIndicator,
   });
+  const displayComposerContextStrip =
+    activeDevCloudThreadPresentation === null && showComposerContextStrip;
   const initialDiffPanelGitScope =
     gitStatusQuery.data?.hasWorkingTreeChanges === true ? "unstaged" : "branch";
   const diffPanelGitStatusResolutionKey = gitStatusQuery.data ? "resolved" : "pending";
@@ -6852,6 +6902,7 @@ function ChatViewContent(props: ChatViewProps) {
       <CloudDesktopInspector
         snapshot={cloudDesktopSession.snapshot}
         actions={cloudDesktopSession}
+        referenceMode={cloudDesktopVisualFixture !== null}
       />
     ) : activeRightPanelSurface?.kind === "terminal" ? (
       <PersistentThreadTerminalPanel
@@ -6885,7 +6936,7 @@ function ChatViewContent(props: ChatViewProps) {
     ) : activeRightPanelSurface?.kind === "pull-request" && !supportsPullRequests ? (
       <PullRequestsUnavailableState
         title="Pull requests unavailable"
-        error="Update this environment's T3 Code server to browse pull requests."
+        error="Update this environment's Agents in Cloud server to browse pull requests."
       />
     ) : activeRightPanelSurface?.kind === "pull-request" ? (
       // No onClose: the surface tab's own X owns closing here, and a second X in the header
@@ -6955,8 +7006,13 @@ function ChatViewContent(props: ChatViewProps) {
     setDragActive: setIsWorkspaceFileDragActive,
     addFiles: (files) => composerRef.current?.addDroppedFiles(files),
   });
+  const displayedComposerBannerItems =
+    activeDevCloudThreadFocusCanvas === null ? composerBannerItems : EMPTY_COMPOSER_BANNER_ITEMS;
   const externalComposerDrawerAttached =
-    composerBannerItems.length > 0 || Boolean(threadSyncPhase && !activeEnvironmentUnavailable);
+    displayedComposerBannerItems.length > 0 ||
+    Boolean(
+      activeDevCloudThreadFocusCanvas === null && threadSyncPhase && !activeEnvironmentUnavailable,
+    );
   // Cloud delivery wraps the same canonical orchestration events. Keep one
   // virtualized timeline so plans, approvals, tools, and checkpoint diffs do
   // not acquire a second presentation model or a non-virtualized cloud path.
@@ -7027,38 +7083,42 @@ function ChatViewContent(props: ChatViewProps) {
           data-app-shell-header
         >
           {!rightPanelOpen ? panelLayoutControls : null}
-          <ChatHeader
-            {...(!supportsPullRequests || activeProjectRepository === null
-              ? {}
-              : { onOpenPullRequest: openProjectPullRequest })}
-            activeThreadEnvironmentId={activeThread.environmentId}
-            activeThreadId={activeThread.id}
-            {...(routeKind === "draft" && draftId ? { draftId } : {})}
-            activeThreadTitle={activeThread.title}
-            isServerThread={isServerThread}
-            changeRequest={activeThreadChangeRequest}
-            activeProjectName={activeProject?.title}
-            activeProjectCwd={activeProject?.workspaceRoot ?? null}
-            activeProjectFaviconPath={activeProject?.faviconPath ?? null}
-            openInCwd={gitCwd}
-            activeProjectScripts={activeProject?.scripts}
-            preferredScriptId={
-              activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-            }
-            keybindings={keybindings}
-            availableEditors={availableEditors}
-            rightPanelOpen={rightPanelOpen}
-            gitCwd={gitCwd}
-            onNewThreadInProject={handleNewThreadInActiveProject}
-            onRunProjectScript={runProjectScript}
-            onAddProjectScript={saveProjectScript}
-            onUpdateProjectScript={updateProjectScript}
-            onDeleteProjectScript={deleteProjectScript}
-          />
+          {activeDevCloudThreadPresentation !== null ? (
+            <DevCloudThreadHeaderIdentity presentation={activeDevCloudThreadPresentation} />
+          ) : (
+            <ChatHeader
+              {...(!supportsPullRequests || activeProjectRepository === null
+                ? {}
+                : { onOpenPullRequest: openProjectPullRequest })}
+              activeThreadEnvironmentId={activeThread.environmentId}
+              activeThreadId={activeThread.id}
+              {...(routeKind === "draft" && draftId ? { draftId } : {})}
+              activeThreadTitle={activeThread.title}
+              isServerThread={isServerThread}
+              changeRequest={activeThreadChangeRequest}
+              activeProjectName={activeProject?.title}
+              activeProjectCwd={activeProject?.workspaceRoot ?? null}
+              activeProjectFaviconPath={activeProject?.faviconPath ?? null}
+              openInCwd={gitCwd}
+              activeProjectScripts={activeProject?.scripts}
+              preferredScriptId={
+                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+              }
+              keybindings={keybindings}
+              availableEditors={availableEditors}
+              rightPanelOpen={rightPanelOpen}
+              gitCwd={gitCwd}
+              onNewThreadInProject={handleNewThreadInActiveProject}
+              onRunProjectScript={runProjectScript}
+              onAddProjectScript={saveProjectScript}
+              onUpdateProjectScript={updateProjectScript}
+              onDeleteProjectScript={deleteProjectScript}
+            />
+          )}
         </WorkspacePageHeader>
 
         <ThreadErrorBanner
-          error={visibleThreadError}
+          error={activeDevCloudThreadFocusCanvas === null ? visibleThreadError : null}
           onDismiss={() => {
             setThreadError(activeThread.id, null);
             dismissThreadErrorBannerForSession(threadErrorBannerKey);
@@ -7093,7 +7153,7 @@ function ChatViewContent(props: ChatViewProps) {
             {/* Provider status overlays the timeline without changing its content height. */}
             <div className="pointer-events-none absolute inset-x-0 top-0 z-20">
               <ProviderStatusBanner
-                status={visibleProviderStatus}
+                status={activeDevCloudThreadFocusCanvas === null ? visibleProviderStatus : null}
                 onDismiss={() => setDismissedProviderStatusBannerKey(providerStatusBannerKey)}
               />
             </div>
@@ -7108,14 +7168,21 @@ function ChatViewContent(props: ChatViewProps) {
                     ? { onRetry: cloudThreadCapability.onRetry }
                     : {})}
                 >
-                  {messagesTimeline}
+                  {activeDevCloudThreadFocusCanvas === null ? (
+                    messagesTimeline
+                  ) : (
+                    <DevCloudThreadFocusCanvas
+                      fixture={activeDevCloudThreadFocusCanvas}
+                      view={cloudThreadCapability.view}
+                    />
+                  )}
                 </CloudThreadTimelineFrame>
               ) : (
                 messagesTimeline
               )}
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
-              {showScrollToBottom && (
+              {activeDevCloudThreadFocusCanvas === null && showScrollToBottom && (
                 <div
                   className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
                   style={{ bottom: composerOverlayHeight + 4 }}
@@ -7166,12 +7233,20 @@ function ChatViewContent(props: ChatViewProps) {
                           activeProjectTitle={activeProject?.title ?? null}
                         />
                       </div>
-                      <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
+                      <ComposerBannerStack
+                        className="relative z-0"
+                        items={displayedComposerBannerItems}
+                      />
                     </div>
                   ) : (
-                    <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
+                    <ComposerBannerStack
+                      className="relative z-0"
+                      items={displayedComposerBannerItems}
+                    />
                   )}
-                  {threadSyncPhase && !activeEnvironmentUnavailable ? (
+                  {activeDevCloudThreadFocusCanvas === null &&
+                  threadSyncPhase &&
+                  !activeEnvironmentUnavailable ? (
                     <ThreadSyncStatusPill phase={threadSyncPhase} />
                   ) : null}
                   <div
@@ -7186,7 +7261,7 @@ function ChatViewContent(props: ChatViewProps) {
                       className={cn(
                         "chat-composer-glass-shell relative mx-auto w-full max-w-3xl",
                         externalComposerDrawerAttached && "chat-composer-glass-shell-attached",
-                        showComposerContextStrip && "chat-composer-glass-shell-with-context",
+                        displayComposerContextStrip && "chat-composer-glass-shell-with-context",
                       )}
                     >
                       <div className="chat-composer-glass-host relative z-10 w-full rounded-[22px]">
@@ -7206,20 +7281,36 @@ function ChatViewContent(props: ChatViewProps) {
                             isServerThread={isServerThread}
                             isLocalDraftThread={isLocalDraftThread}
                             forceExpandedOnMobile={forceExpandedMobileComposer && isDraftHeroState}
-                            projectSelectionRequired={isLocalDraftThread && activeProject === null}
-                            phase={phase}
-                            isConnecting={isConnecting}
-                            isSendBusy={isSendBusy}
-                            sendDisabledReason={
-                              feedbackUploading
-                                ? "Sending feedback"
-                                : threadDetailLoading
-                                  ? "Messages loading"
-                                  : cloudComposerDisabledReason
+                            projectSelectionRequired={
+                              activeDevCloudThreadFocusCanvas === null &&
+                              isLocalDraftThread &&
+                              activeProject === null
                             }
-                            isPreparingWorktree={isPreparingWorktree}
+                            phase={activeDevCloudThreadFocusCanvas === null ? phase : "ready"}
+                            isConnecting={
+                              activeDevCloudThreadFocusCanvas === null ? isConnecting : false
+                            }
+                            isSendBusy={
+                              activeDevCloudThreadFocusCanvas === null ? isSendBusy : false
+                            }
+                            sendDisabledReason={
+                              activeDevCloudThreadFocusCanvas === null
+                                ? feedbackUploading
+                                  ? "Sending feedback"
+                                  : threadDetailLoading
+                                    ? "Messages loading"
+                                    : cloudComposerDisabledReason
+                                : null
+                            }
+                            isPreparingWorktree={
+                              activeDevCloudThreadFocusCanvas === null ? isPreparingWorktree : false
+                            }
                             externalDrawerAttached={externalComposerDrawerAttached}
-                            environmentUnavailable={activeEnvironmentUnavailableState}
+                            environmentUnavailable={
+                              activeDevCloudThreadFocusCanvas === null
+                                ? activeEnvironmentUnavailableState
+                                : null
+                            }
                             activePendingApproval={activePendingApproval}
                             pendingApprovals={pendingApprovals}
                             pendingUserInputs={pendingUserInputs}
@@ -7235,6 +7326,7 @@ function ChatViewContent(props: ChatViewProps) {
                             activeTaskSteps={activeComposerTaskSteps}
                             runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
+                            devCloudThreadPresentation={activeDevCloudThreadPresentation}
                             lockedProvider={lockedProvider}
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={
@@ -7284,7 +7376,7 @@ function ChatViewContent(props: ChatViewProps) {
                           data-terminal-open={terminalUiState.terminalOpen ? "true" : undefined}
                           className="relative z-0"
                         >
-                          {showComposerContextStrip && (
+                          {displayComposerContextStrip && (
                             <div className="pointer-events-auto">
                               <BranchToolbar
                                 environmentId={activeThread.environmentId}
@@ -7329,7 +7421,9 @@ function ChatViewContent(props: ChatViewProps) {
               </div>
             </div>
 
-            {activeThreadRef && activePreviewMiniPlayer ? (
+            {activeDevCloudThreadFocusCanvas === null &&
+            activeThreadRef &&
+            activePreviewMiniPlayer ? (
               <ThreadPreviewMiniPlayer
                 key={`${activeThreadKey}:${activePreviewMiniPlayer.tabId}`}
                 threadRef={activeThreadRef}

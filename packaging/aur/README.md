@@ -2,7 +2,10 @@
 
 This directory maintains the [`t3code-bin`](https://aur.archlinux.org/packages/t3code-bin) and
 [`t3code-nightly-bin`](https://aur.archlinux.org/packages/t3code-nightly-bin) packages. Both
-repackage the official x86_64 AppImage from GitHub Releases.
+repackage the official Agents in Cloud x86_64 AppImage from GitHub Releases. The AUR package,
+launcher, protocol, and install-path names retain `t3code` for technical compatibility and T3
+attribution; release assets and metadata come only from `jarrodwatts/agentsin-cloud`, never from
+the upstream `pingdotgg/t3code` release feed.
 
 ## Publishing
 
